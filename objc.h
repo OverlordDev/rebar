@@ -604,6 +604,14 @@ H(h_CFRunLoopTimerCreate) { uint8_t t[40]; c->x[5] = imp_wrap(c->x[5]); wrap_ctx
 // vfork: the child would run the interpreter on the parent's CPU structure and stack (shared memory) until its exec, and the parent's host frame would be returned through twice.
 // A fork is what the program asked for at the level it can see (the child execs or exits at once): the child gets its own copy.
 H(h_vfork) { host_call(c, HOSTFN("fork"), false); }
+// ARC's return-value handshake. The host's versions decide by looking at the x86_64 bytes after the call (a `mov %rax,%rdi` marks a caller that takes the +1 object without the
+// autorelease/retain pair) and keep the answer in a thread-local flag. What follows a call in rebar's own C code often looks like that marker, so a host method called from rebar can skip
+// its autorelease and leave the flag set, and the guest's next objc_retainAutoreleasedReturnValue then sees "already +1", skips its retain and over-releases (Gemini: an object freed
+// before its autorelease pool pops). The guest side never uses the shortcut: the callee autoreleases, the caller retains.
+H(h_objc_autoreleaseReturnValue)    { id (*f)(id) = HOSTFN("objc_autorelease"); if (c->x[0]) f((id)c->x[0]); }
+H(h_objc_retainAutoreleasedReturnValue) { id (*f)(id) = HOSTFN("objc_retain"); if (c->x[0]) f((id)c->x[0]); }
+H(h_objc_claimAutoreleasedReturnValue) { id (*f)(id) = HOSTFN("objc_retain"); if (c->x[0]) f((id)c->x[0]); }
+H(h_objc_unsafeClaimAutoreleasedReturnValue) { }   // (the object stays in its pool: nothing to take, nothing to give back)
 H(h_SSLSetIOFuncs) { c->x[1] = imp_wrap_any(c->x[1], true); c->x[2] = imp_wrap_any(c->x[2], true); host_call(c, HOSTFN("SSLSetIOFuncs"), false); }   // SecureTransport calls the guest's read / write functions (.NET's System.Net.Security)
 // CGGetActiveDisplayList is empty on this Mac (the display is online but not "active" for Quartz), while the main display has valid bounds and a mode: GTK and others that count the
 // active displays found no monitor. Answer with the main display when the host has none.
