@@ -610,8 +610,17 @@ H(h_pthread_sigmask) {
 
 // Crash reporters (Crashpad in Chromium) register Mach exception ports, which would receive our
 // instruction-fetch faults before the BSD signal handler does; refuse silently.
-H(h_set_exception_ports) { c->x[0] = 0; }
-H(h_swap_exception_ports) { if (c->x[6]) *(uint32_t *)c->x[6] = 0; c->x[0] = 0; }
+// A guest that handles hardware faults through a Mach exception port (CoreCLR: its SIGSEGV handler only covers stack overflow, the rest arrives as a Mach message on the handler
+// thread's port) registers the port here. A guest memory fault is then delivered as the kernel would: a mach_exception_raise request to the port (the faulting thread's port and the
+// task port in it), the guest's handler thread reads and changes the thread's registers with thread_get_state / thread_set_state (answered from the guest CPU, see below) and replies;
+// the faulting thread then goes on at the pc the handler left. Ports that only report crashes (Crashpad) are accepted and ignored: they ask for other exceptions or cannot be messaged.
+static uint32_t g_mach_exc_port, g_mach_exc_mask, g_mach_exc_behavior;
+static void mach_exc_note(CPU *c) {   // (thread / task, exception mask, port, behavior, flavor)
+    uint32_t mask = (uint32_t)c->x[1], port = (uint32_t)c->x[2], behavior = (uint32_t)c->x[3];
+    if (port && (mask & 2) && (behavior & ~0x80000000u) != 0 && !getenv("REBAR_NO_MACH_EXC")) { g_mach_exc_port = port; g_mach_exc_mask = mask; g_mach_exc_behavior = behavior; }   // 2 = 1 << EXC_BAD_ACCESS
+}
+H(h_set_exception_ports) { mach_exc_note(c); c->x[0] = 0; }
+H(h_swap_exception_ports) { mach_exc_note(c); if (c->x[6]) *(uint32_t *)c->x[6] = 0; c->x[0] = 0; }
 
 // ---- malloc zones
 // Chromium's allocator shim replaces the function pointers of the process' default malloc zone (after
@@ -1010,7 +1019,9 @@ H(h_clear_cache) { jit_invalidate(c->x[0], c->x[1]); }   // __clear_cache(begin,
 // A guest that suspends another thread (Chromium's sampling profiler suspends the browser's main thread every few seconds) must not freeze it inside the
 // translator: the suspender translates blocks too and would wait for the lock that the frozen thread holds, for ever. With the lock held across the
 // suspension the target cannot be inside jit_compile / jit_invalidate when it stops.
+static CPU *mach_faulting_cpu(uint32_t port, uint64_t *far);
 H(h_thread_suspend) {
+    if (mach_faulting_cpu((uint32_t)c->x[0], NULL)) { c->x[0] = 0; return; }   // (a thread that waits for its exception reply is stopped already)
     pthread_mutex_lock(&g_jit_mu);
     c->x[0] = (uint32_t)thread_suspend((thread_act_t)c->x[0]);
     pthread_mutex_unlock(&g_jit_mu);
@@ -1283,7 +1294,7 @@ static uint64_t tlv_thunk(void) {
 H(h_Unwind_Resume);
 H(h_Unwind_GetCFA); H(h_Unwind_SetGR); H(h_Unwind_SetIP); H(h_Unwind_GetIP); H(h_Unwind_GetGR);
 H(h_objc_getProtocol); H(h_NSProtocolFromString); H(h_objc_alloc_init); H(h_objc_alloc); H(h_objc_opt_new); H(h_objc_allocWithZone);
-H(h_vfork); H(h_posix_spawnattr_setbinpref_np); H(h_SSLSetIOFuncs); H(h_CGGetActiveDisplayList); H(h_CVDisplayLinkCreateWithActiveCGDisplays); H(h_CGDisplayIsActive); H(h_unw_getcontext); H(h_unw_init_local); H(h_unw_step); H(h_unw_get_reg); H(h_unw_set_reg); H(h_unw_get_fpreg); H(h_unw_set_fpreg); H(h_unw_is_signal_frame);
+H(h_vfork); H(h_thread_get_state); H(h_thread_set_state); H(h_thread_resume); H(h_posix_spawnattr_setbinpref_np); H(h_SSLSetIOFuncs); H(h_CGGetActiveDisplayList); H(h_CVDisplayLinkCreateWithActiveCGDisplays); H(h_CGDisplayIsActive); H(h_unw_getcontext); H(h_unw_init_local); H(h_unw_step); H(h_unw_get_reg); H(h_unw_set_reg); H(h_unw_get_fpreg); H(h_unw_set_fpreg); H(h_unw_is_signal_frame);
 H(h_dlopen); H(h_dlsym); H(h_dlclose); H(h_dladdr); H(h_dlerror);
 H(h_dyld_image_count); H(h_dyld_get_image_name); H(h_dyld_get_image_header);
 H(h_dyld_get_image_vmaddr_slide); H(h_dyld_register_func_for_add_image);
@@ -1317,7 +1328,7 @@ static const Special k_special[] = {
     {"_SSLGetEnabledCiphers", h_SSLGetEnabledCiphers}, {"_SSLGetSupportedCiphers", h_SSLGetSupportedCiphers}, {"_SSLSetEnabledCiphers", h_SSLSetEnabledCiphers}, {"_SSLGetNegotiatedCipher", h_SSLGetNegotiatedCipher}, {"_munmap", h_munmap}, {"_mprotect", h_mprotect}, {"_madvise", h_madvise},
     {"_vm_protect", h_vm_protect}, {"_mach_vm_protect", h_vm_protect}, {"_vm_allocate", h_vm_allocate},
     {"_mach_vm_allocate", h_vm_allocate}, {"_vm_deallocate", h_vm_deallocate}, {"_mach_vm_deallocate", h_vm_deallocate},
-    {"_vfork", h_vfork}, {"_posix_spawnattr_setbinpref_np", h_posix_spawnattr_setbinpref_np}, {"_SSLSetIOFuncs", h_SSLSetIOFuncs}, {"_CGGetActiveDisplayList", h_CGGetActiveDisplayList}, {"_CVDisplayLinkCreateWithActiveCGDisplays", h_CVDisplayLinkCreateWithActiveCGDisplays}, {"_CGDisplayIsActive", h_CGDisplayIsActive}, {"_unw_getcontext", h_unw_getcontext}, {"_unw_init_local", h_unw_init_local}, {"_unw_step", h_unw_step}, {"_unw_get_reg", h_unw_get_reg}, {"_unw_set_reg", h_unw_set_reg}, {"_unw_get_fpreg", h_unw_get_fpreg}, {"_unw_set_fpreg", h_unw_set_fpreg}, {"_unw_is_signal_frame", h_unw_is_signal_frame}, {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
+    {"_vfork", h_vfork}, {"_thread_get_state", h_thread_get_state}, {"_thread_set_state", h_thread_set_state}, {"_thread_resume", h_thread_resume}, {"_posix_spawnattr_setbinpref_np", h_posix_spawnattr_setbinpref_np}, {"_SSLSetIOFuncs", h_SSLSetIOFuncs}, {"_CGGetActiveDisplayList", h_CGGetActiveDisplayList}, {"_CVDisplayLinkCreateWithActiveCGDisplays", h_CVDisplayLinkCreateWithActiveCGDisplays}, {"_CGDisplayIsActive", h_CGDisplayIsActive}, {"_unw_getcontext", h_unw_getcontext}, {"_unw_init_local", h_unw_init_local}, {"_unw_step", h_unw_step}, {"_unw_get_reg", h_unw_get_reg}, {"_unw_set_reg", h_unw_set_reg}, {"_unw_get_fpreg", h_unw_get_fpreg}, {"_unw_set_fpreg", h_unw_set_fpreg}, {"_unw_is_signal_frame", h_unw_is_signal_frame}, {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
     {"_open$NOCANCEL", h_open}, {"_openat$NOCANCEL", h_openat}, {"_fcntl$NOCANCEL", h_fcntl},   // (the mode / argument of these variadic functions is on the stack on arm64, not in x2 / x3: Bun, Zig and Rust call the $NOCANCEL forms directly)
     {"_exit", h_exit}, {"_atexit", h_atexit}, {"___cxa_atexit", h_cxa_atexit}, {"___cxa_finalize", h_nop},
     {"_qsort", h_qsort}, {"_qsort_r", h_qsort_r}, {"_bsearch", h_bsearch}, {"__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv", h_dir_deref}, {"__ZNKSt3__14__fs10filesystem28recursive_directory_iterator13__dereferenceEv", h_rdir_deref}, {"_tsearch", h_tsearch}, {"_tfind", h_tfind}, {"_tdelete", h_tdelete}, {"_twalk", h_twalk}, {"_lfind", h_lfind}, {"_lsearch", h_lsearch},
@@ -1401,6 +1412,68 @@ static void *entstats_thread(void *arg) {
 // Runs the guest's handler for a synchronous fault of interpreted code (a memory access that faulted, an instruction that traps: HotSpot's implicit null checks, safepoint polls and
 // deoptimization instruction, V8's and wasmtime's traps) with a siginfo and a ucontext in the arm64 layout, takes the registers and the pc back from the ucontext and continues
 // the interpreter from there. Does not return. The caller has checked that there is a handler (g_guest_fault_handler) and that t_fault_jb is set.
+// ---- Mach thread state of the guest threads that are waiting for an exception reply
+static struct { uint32_t port; CPU *cpu; uint64_t far; } g_mach_faulting[32];
+static pthread_mutex_t g_mach_fmu = PTHREAD_MUTEX_INITIALIZER;
+static CPU *mach_faulting_cpu(uint32_t port, uint64_t *far) {
+    CPU *r = NULL; pthread_mutex_lock(&g_mach_fmu);
+    for (int k = 0; k < 32; k++) if (g_mach_faulting[k].port == port && g_mach_faulting[k].cpu) { r = g_mach_faulting[k].cpu; if (far) *far = g_mach_faulting[k].far; }
+    pthread_mutex_unlock(&g_mach_fmu); return r;
+}
+enum { MFL_ARM_THREAD_STATE64 = 6, MFL_ARM_EXCEPTION_STATE64 = 7, MFL_ARM_NEON_STATE64 = 17 };
+H(h_thread_get_state) {   // (thread, flavor, state*, count*)
+    uint64_t far = 0; CPU *t = mach_faulting_cpu((uint32_t)c->x[0], &far);
+    if (!t) { host_call(c, HOSTFN("thread_get_state"), false); return; }
+    int fl = (int)c->x[1]; uint64_t *st = (uint64_t *)c->x[2]; uint32_t *cnt = (uint32_t *)c->x[3];
+    if (fl == MFL_ARM_THREAD_STATE64) {
+        for (int k = 0; k < 29; k++) st[k] = t->x[k];
+        st[29] = t->x[29]; st[30] = t->x[30]; st[31] = t->sp; st[32] = t->pc;
+        ((uint32_t *)st)[66] = (t->n ? 1u << 31 : 0) | (t->z ? 1u << 30 : 0) | (t->c ? 1u << 29 : 0) | (t->v ? 1u << 28 : 0); ((uint32_t *)st)[67] = 0;
+        *cnt = 68; c->x[0] = 0;
+    } else if (fl == MFL_ARM_EXCEPTION_STATE64) { st[0] = far; ((uint32_t *)st)[2] = 0x92000045; ((uint32_t *)st)[3] = 0; *cnt = 4; c->x[0] = 0; }
+    else if (fl == MFL_ARM_NEON_STATE64) { for (int k = 0; k < 32; k++) { st[2 * k] = t->vr[k].d[0]; st[2 * k + 1] = t->vr[k].d[1]; } ((uint32_t *)st)[64] = t->fpsr; ((uint32_t *)st)[65] = t->fpcr; *cnt = 68; c->x[0] = 0; }
+    else if (fl == 15) { memset(st, 0, 520); *cnt = 130; c->x[0] = 0; }   // ARM_DEBUG_STATE64: no breakpoints, no watchpoints
+    else c->x[0] = 4;   // KERN_INVALID_ARGUMENT
+}
+H(h_thread_set_state) {   // (thread, flavor, state*, count)
+    CPU *t = mach_faulting_cpu((uint32_t)c->x[0], NULL);
+    if (!t) { host_call(c, HOSTFN("thread_set_state"), false); return; }
+    int fl = (int)c->x[1]; const uint64_t *st = (const uint64_t *)c->x[2];
+    if (fl == MFL_ARM_THREAD_STATE64) {
+        for (int k = 0; k < 31; k++) t->x[k] = st[k];
+        t->sp = st[31]; t->pc = st[32]; uint32_t f = ((const uint32_t *)st)[66]; t->n = f >> 31 & 1; t->z = f >> 30 & 1; t->c = f >> 29 & 1; t->v = f >> 28 & 1;
+    } else if (fl == MFL_ARM_NEON_STATE64) { for (int k = 0; k < 32; k++) { t->vr[k].d[0] = st[2 * k]; t->vr[k].d[1] = st[2 * k + 1]; } t->fpsr = ((const uint32_t *)st)[64]; t->fpcr = ((const uint32_t *)st)[65]; }
+    c->x[0] = 0;
+}
+H(h_thread_resume)  { if (mach_faulting_cpu((uint32_t)c->x[0], NULL)) { c->x[0] = 0; return; } host_call(c, HOSTFN("thread_resume"), false); }
+
+// Sends the exception request and waits for the reply; on success the guest CPU has been changed by the handler and the interpreter goes on from it (does not return).
+static void deliver_mach_exception(CPU *c, int sig, uint64_t addr) {
+    struct { mach_msg_header_t h; mach_msg_body_t body; mach_msg_port_descriptor_t thread, task; NDR_record_t ndr; int32_t exception; uint32_t codeCnt; int64_t code[2]; } req;
+    struct { mach_msg_header_t h; NDR_record_t ndr; int32_t ret; char pad[64]; } rep;
+    mach_port_t reply = MACH_PORT_NULL, me = mach_thread_self();
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply) != KERN_SUCCESS) return;
+    memset(&req, 0, sizeof req);
+    req.h.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+    req.h.msgh_size = sizeof req; req.h.msgh_remote_port = g_mach_exc_port; req.h.msgh_local_port = reply; req.h.msgh_id = 2405;   // mach_exception_raise
+    req.body.msgh_descriptor_count = 2;
+    req.thread.name = me; req.thread.disposition = MACH_MSG_TYPE_COPY_SEND; req.thread.type = MACH_MSG_PORT_DESCRIPTOR;
+    req.task.name = mach_task_self(); req.task.disposition = MACH_MSG_TYPE_COPY_SEND; req.task.type = MACH_MSG_PORT_DESCRIPTOR;
+    req.ndr = NDR_record; req.exception = 1; req.codeCnt = 2; req.code[0] = 1; req.code[1] = (int64_t)addr;   // EXC_BAD_ACCESS, KERN_INVALID_ADDRESS, the address
+    if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[mach exception: EXC_BAD_ACCESS at %llx, pc %llx, to port %u]\n", (unsigned long long)addr, (unsigned long long)c->pc, g_mach_exc_port);
+    int slot = -1; pthread_mutex_lock(&g_mach_fmu);
+    for (int k = 0; k < 32; k++) if (!g_mach_faulting[k].cpu) { slot = k; g_mach_faulting[k].port = me; g_mach_faulting[k].cpu = c; g_mach_faulting[k].far = addr; break; }
+    pthread_mutex_unlock(&g_mach_fmu);
+    bool had = gil_release();
+    kern_return_t kr = mach_msg(&req.h, MACH_SEND_MSG, sizeof req, 0, MACH_PORT_NULL, 2000, MACH_PORT_NULL);
+    if (kr == KERN_SUCCESS) kr = mach_msg(&rep.h, MACH_RCV_MSG, 0, sizeof rep, reply, 5000, MACH_PORT_NULL);
+    if (had) gil_acquire();
+    if (slot >= 0) { pthread_mutex_lock(&g_mach_fmu); g_mach_faulting[slot].cpu = NULL; pthread_mutex_unlock(&g_mach_fmu); }
+    mach_port_mod_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1); mach_port_deallocate(mach_task_self(), me);
+    if (kr != KERN_SUCCESS || rep.ret != 0) { if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[mach exception: no usable reply (kr %d, ret %d)]\n", (int)kr, (int)rep.ret); return; }
+    if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[mach exception: handled, continuing at pc %llx sp %llx]\n", (unsigned long long)c->pc, (unsigned long long)c->sp);
+    _longjmp(*t_fault_jb, 1);
+}
 __thread int t_in_deliver;
 static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
     t_in_deliver = 1;
@@ -1476,6 +1549,8 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
             return;
         }
     }
+    if (g_mach_exc_port && t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise) && t_cpu->pc - g_stub_base >= g_stub_size)
+        deliver_mach_exception(t_cpu, sig, (uint64_t)si->si_addr);   // (returns only when nothing could be delivered)
     if (t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && g_guest_fault_handler[sig == SIGSEGV ? 0 : 1] && !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise) && t_cpu->pc - g_stub_base >= g_stub_size)   // (not in a stub's host handler: a fault there is rebar's own and must not run guest code with its locks held)
         deliver_guest_signal(t_cpu, sig, si->si_code, (uint64_t)si->si_addr);   // (does not return: it continues at the pc the guest's handler chose)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }  // REBAR_FAULT_LOG=<file>: fault reports of helper processes whose stderr is lost
