@@ -1631,6 +1631,7 @@ int main(int argc, char **argv) {
         struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = usr2_backtrace; sigaction(SIGUSR2, &sa, NULL);
     }
     g_no_simd_fast = getenv("REBAR_NO_SIMD_FAST") != NULL;
+    g_no_async_tail = getenv("REBAR_NO_ASYNC_TAIL") != NULL;
     if (getenv("REBAR_STATS")) atexit(print_stats);  // instructions executed, and the speed
     if (ai < argc && !strcmp(argv[ai], "-t")) { g_trace = true; ai++; }
     if (ai < argc && !strcmp(argv[ai], "--jit-selftest")) {

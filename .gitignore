@@ -12,6 +12,7 @@
 !/samples/*.cpp
 !/samples/*.m
 !/samples/*.mm
+!/samples/*.swift
 !/samples/*.h
 !/samples/*.S
 

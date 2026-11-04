@@ -126,7 +126,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing; uint8_t heapret; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -140,6 +140,7 @@ static inline uint64_t stub_addr(int idx) { return g_stub_base + 16 * (uint64_t)
 
 // The imports that translated code calls itself (jit.h: emit_leaf_call): plain host functions of up to six integer arguments that never throw,
 // never block (the thread may hold the interpreter lock, which the generic path drops around a host call) and never call back into the guest.
+static bool g_no_async_tail;   // REBAR_NO_ASYNC_TAIL (set at start)
 static bool g_zone_cloned;       // the guest asked for the default zone (to patch it, as Chromium's allocator shim does): its malloc and free must go through the handlers from now on
 static bool g_leaf_malloc_used;  // translated code calls the host's malloc and free directly
 static bool jit_leaf_import(uint64_t target, void **fn, int *nargs, int *zext8) {
@@ -184,6 +185,7 @@ extern char **environ;
 extern void rebar_host_call(void *fn, const uint64_t *ints, const uint64_t *dbls, uint64_t *out,
                               const uint64_t *stack, uint64_t nstack);
 extern void *rebar_host_landing_addr(void);
+extern void *rebar_hc_after_call_addr(void);   // the instruction after `call *%r11` in rebar_host_call: the return address a host function finds on its stack
 // The CFI below names rebar_personality (unwind.h): C++/ObjC exceptions that propagate out of
 // host code into this frame are searched for in the guest frames that made the call. When the
 // unwinder lands at Lhc_landing (rax = exception, rdx = 1 for the handler frame), rebar_arrive
@@ -214,6 +216,7 @@ __asm__(
     "  movq 8(%rbx), %rax\n"        // out[1]: %al = the vector registers of a variadic C function (8), or the address of the indirect result of a Swift function
     "  xorl %r12d, %r12d\n"         // swifterror starts out clear
     "  call *%r11\n"
+    "Lhc_after_call:\n"
     "  movq %rax, 0(%rbx)\n  movq %xmm0, 8(%rbx)\n  movq %rdx, 16(%rbx)\n  movq %xmm1, 24(%rbx)\n"
     "  movq %r12, 32(%rbx)\n  movq %rcx, 40(%rbx)\n  movq %r8, 48(%rbx)\n"   // the error, and the 3rd and 4th result registers of Swift
     "Lhc_epilogue:\n"
@@ -225,8 +228,25 @@ __asm__(
     "  movq %r13, %rdi\n  call __Unwind_Resume\n"
     ".cfi_endproc\n"
     ".globl _rebar_host_landing_addr\n"
-    "_rebar_host_landing_addr:\n  leaq Lhc_landing(%rip), %rax\n  ret\n");
+    "_rebar_host_landing_addr:\n  leaq Lhc_landing(%rip), %rax\n  ret\n"
+    ".globl _rebar_hc_after_call_addr\n"
+    "_rebar_hc_after_call_addr:\n  leaq Lhc_after_call(%rip), %rax\n  ret\n");
 
+// A Swift async function of the host ends by a tail jump (jmp) to the continuation it was given, which is a guest function (arm64 code). The exec-fault redirect would run that
+// continuation nested inside the host call, and every await of a recursive async function would add a few KB of host stack until the thread's stack (512 KB on a dispatch thread)
+// is gone. For a jump made straight from the function the stub called (its return address is the one rebar_host_call pushed), the host call is abandoned instead and the guest goes on
+// at the continuation with the async context (r14 -> x22): a real tail call. REBAR_NO_ASYNC_TAIL=1 turns it off.
+static __thread bool t_async_call, t_async_tailed;
+static __thread jmp_buf *t_async_jb;
+static __thread uint64_t t_tail_regs[8];   // rdi, rsi, rdx, rcx, r8, r9, r12 (the error), r13 at the jump
+[[noreturn]] static void rebar_tail_to_guest(uint64_t target, uint64_t ctx) {
+    CPU *c = t_cpu; c->pc = target; c->x[22] = ctx; t_async_tailed = true;
+    for (int k = 0; k < 6; k++) c->x[k] = t_tail_regs[k];   // the continuation's other arguments: results in x0.., a thrown error in x21 (r12), self / context in x20 (r13)
+    if (t_tail_regs[6]) c->x[21] = t_tail_regs[6];
+    c->x[20] = t_tail_regs[7];
+    if (getenv("REBAR_TRACE_ASYNC")) fprintf(stderr, "[async tail] -> guest %llx ctx %llx rdi %llx rsi %llx rdx %llx r12 %llx r13(x20) %llx\n", (unsigned long long)target, (unsigned long long)ctx, (unsigned long long)t_tail_regs[0], (unsigned long long)t_tail_regs[1], (unsigned long long)t_tail_regs[2], (unsigned long long)t_tail_regs[6], (unsigned long long)t_tail_regs[7]);
+    _longjmp(*t_async_jb, 1);
+}
 // Calls a host function with a call record so exceptions can find the calling guest frames.
 static void host_invoke(CPU *c, void *fn, const uint64_t *ints, const uint64_t *dbls,
                         const uint64_t *stack, uint64_t nstack, uint64_t *out) {
@@ -235,7 +255,12 @@ static void host_invoke(CPU *c, void *fn, const uint64_t *ints, const uint64_t *
     uframe_from_cpu(c, &rec.f);
     t_hc = &rec;
     bool had_gil = gil_release();            // the host call may block; other guest threads run meanwhile
-    rebar_host_call(fn, ints, dbls, out, stack, nstack);
+    bool async_call = t_async_call; t_async_call = false; jmp_buf *prev_jb = t_async_jb;
+    if (async_call) {   // a Swift async host function (swift_task_switch, an `async` method) ends by jumping to the guest's continuation: see rebar_tail_to_guest
+        jmp_buf jb; t_async_jb = &jb;
+        if (_setjmp(jb) == 0) rebar_host_call(fn, ints, dbls, out, stack, nstack);
+    } else { t_async_jb = NULL; rebar_host_call(fn, ints, dbls, out, stack, nstack); }
+    t_async_jb = prev_jb;
     if (had_gil) gil_acquire();
     t_hc = rec.prev;
 }
@@ -250,6 +275,7 @@ static void host_call_full(CPU *c, void *fn, const uint64_t *ints, const uint64_
     bool swift = t_swift; t_swift = false;
     if (swift) { out[0] = c->x[20]; out[1] = c->x[8]; }
     host_invoke(c, fn, ints, dbls, stack, nstack, out);
+    if (t_async_tailed) { t_async_tailed = false; return; }   // the guest goes on at the continuation the host jumped to
     if (t_landed) return;  // an exception was delivered to a guest handler; stub_call finishes the hand-off
     c->x[0] = out[0];  // rax:rdx and xmm0:xmm1 carry two-register results (NSRange, NSPoint, ...)
     c->x[1] = out[2];
@@ -1570,6 +1596,12 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
     if (dbg) { sigset_t cur; pthread_sigmask(SIG_BLOCK, NULL, &cur); char b[200]; int n = snprintf(b, sizeof b, "[sig %d code=%d si_addr=%p rip=%llx rsp=%llx mask=%x thr=%p]\n", sig, si->si_code, si->si_addr, (unsigned long long)rip, (unsigned long long)uc->uc_mcontext->__ss.__rsp, (unsigned)cur, (void *)pthread_self()); write(2, b, n); }
     if ((uint64_t)si->si_addr == rip) {
         if (rip - g_guest_lo < g_guest_size || guest_owned_code(rip)) {  // host code jumped to a guest function
+            if (t_async_jb && *(uint64_t *)uc->uc_mcontext->__ss.__rsp == (uint64_t)rebar_hc_after_call_addr()) {   // a tail jump out of the async host function the stub called
+                { const _STRUCT_X86_THREAD_STATE64 *r = &uc->uc_mcontext->__ss; t_tail_regs[0] = r->__rdi; t_tail_regs[1] = r->__rsi; t_tail_regs[2] = r->__rdx; t_tail_regs[3] = r->__rcx; t_tail_regs[4] = r->__r8; t_tail_regs[5] = r->__r9; t_tail_regs[6] = r->__r12; t_tail_regs[7] = r->__r13; }
+                uc->uc_mcontext->__ss.__rdi = rip; uc->uc_mcontext->__ss.__rsi = uc->uc_mcontext->__ss.__r14;
+                uc->uc_mcontext->__ss.__rip = (uint64_t)rebar_tail_to_guest;
+                return;
+            }
             { uint64_t ra = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; if (g_sigtramp_ra && ra - (g_sigtramp_ra - 0x80) < 0x100) t_sig_entry = (int)uc->uc_mcontext->__ss.__rdi; }   // called by the host's signal trampoline: a signal handler
             { static int chk = -1; if (chk < 0) chk = getenv("REBAR_CHECK_ALIGN") != NULL;
               if (chk && (uc->uc_mcontext->__ss.__rsp & 15) != 8) { static int n; if (n++ < 8) { uint64_t ra = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; Dl_info di; const char *nm = dladdr((void *)ra, &di) && di.dli_sname ? di.dli_sname : "?";
@@ -2205,10 +2237,10 @@ static void stub_call_inner(CPU *c) {
         if (c->pc < 0x10000) die(c, "branch to invalid address", 0);
         void *fn = (void *)c->pc;
         // (dladdr is slow, a few microseconds: the answer for a host function is remembered, per thread)
-        static __thread struct { uint64_t fn; bool returns_string; const char *enc; } t_hostfn_cache[256];
+        static __thread struct { uint64_t fn; bool returns_string; const char *enc; bool swift; } t_hostfn_cache[256];
         unsigned hci = (unsigned)(c->pc >> 4) & 255;
-        bool fn_returns_string; const char *fn_enc;
-        if (t_hostfn_cache[hci].fn == c->pc) { fn_returns_string = t_hostfn_cache[hci].returns_string; fn_enc = t_hostfn_cache[hci].enc; }
+        bool fn_returns_string, fn_swift; const char *fn_enc;
+        if (t_hostfn_cache[hci].fn == c->pc) { fn_returns_string = t_hostfn_cache[hci].returns_string; fn_enc = t_hostfn_cache[hci].enc; fn_swift = t_hostfn_cache[hci].swift; }
         else {
             Dl_info di;
             if (!dladdr(fn, &di)) {  // not inside any host image either: a stray pointer, report where it came from
@@ -2220,9 +2252,12 @@ static void stub_call_inner(CPU *c) {
                 exit(127);
             }
             fn_returns_string = di.dli_sname && host_fn_returns_string(di.dli_sname);
+            // a Swift closure or witness called by the guest (Combine's promise handed to Future's closure, a SwiftUI body): it takes its context in r13, a thrown error comes back in r12.
+            // Its symbol is a mangled Swift name, or none at all (the dyld cache has no local symbols for the thunks)
+            fn_swift = !di.dli_sname || di.dli_sname[0] == '$' || (di.dli_sname[0] == '_' && di.dli_sname[1] == '$') || (di.dli_fname && strstr(di.dli_fname, "libswift")) || !strncmp(di.dli_sname, "swift_", 6) || !strncmp(di.dli_sname, "_ZN5swift", 9);   // (the runtime's completion and resume functions take the error in the swiftself register)
             fn_enc = host_fn_enc(di.dli_sname);
             if (g_trace_stubs) fprintf(stderr, "[host fn by pointer] %p %s\n", fn, di.dli_sname ? di.dli_sname : "?");
-            t_hostfn_cache[hci].fn = c->pc; t_hostfn_cache[hci].returns_string = fn_returns_string; t_hostfn_cache[hci].enc = fn_enc;
+            t_hostfn_cache[hci].fn = c->pc; t_hostfn_cache[hci].returns_string = fn_returns_string; t_hostfn_cache[hci].enc = fn_enc; t_hostfn_cache[hci].swift = fn_swift;
         }
         if (g_trace) fprintf(stderr, "  [host fn %p]\n", fn);
         c->pc = c->x[30];
@@ -2244,6 +2279,7 @@ static void stub_call_inner(CPU *c) {
             if (zc && (uint64_t)fn == zc->orig[2]) fn = HOSTFN("malloc_size"), c->x[0] = c->x[1];  // (the zone's own size() does not know every pointer)
             else if (zc) c->x[0] = (uint64_t)zc->real;
         }
+        t_swift = fn_swift && !getenv("REBAR_NO_SWIFT_PTR_CC");
         host_call(c, fn, false);
         apply_landing(c);
         return;
@@ -2306,7 +2342,7 @@ static void stub_call_inner(CPU *c) {
     else if (s->host) {
         uint64_t addr_ptr = c->x[1], size = c->x[2];
         if (s->maps && ((uint32_t)c->x[4] & 1)) c->x[3] |= 0x3fff;  // VM_FLAGS_ANYWHERE: arm64 macOS places mappings on 16KB boundaries
-        t_stk = s->stk; t_swift = s->swift; host_call(c, s->host, s->sret); t_stk = NULL;
+        t_stk = s->stk; t_swift = s->swift; t_async_call = s->async_host && !g_no_async_tail; host_call(c, s->host, s->sret); t_stk = NULL;
         if (s->maps && (uint32_t)c->x[0] == 0 && !t_landed) own_add(*(uint64_t *)addr_ptr, size);  // vm_map & co.: the guest owns what came back
     }
     else {
@@ -2517,6 +2553,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
         fprintf(stderr, "rebar: warning: %s takes libc++ objects whose arm64 layout rebar does not convert; expect it to misbehave\n", name);
     if (host && !h) g_stubs[idx].thisret = returns_this(name);
     if (host && !h) g_stubs[idx].throwing = !strcmp(name, "___cxa_throw");
+    g_stubs[idx].async_host = host && name && (!strcmp(name, "_swift_task_switch") || !strcmp(name, "_swift_continuation_await") || !strcmp(name, "_swift_task_future_wait") || !strcmp(name, "_swift_task_future_wait_throwing") || !strcmp(name, "_swift_task_group_wait_next_throwing") || !strcmp(name, "_swift_asyncLet_get") || !strcmp(name, "_swift_asyncLet_get_throwing") || !strcmp(name, "_swift_asyncLet_finish") || !strcmp(name, "_swift_task_run_inline") || (name[0] == '_' && name[1] == '$' && strstr(name, "Ya") && (strstr(name, "YaF") || strstr(name, "YaKF") || strstr(name, "Yacig") || strstr(name, "YaKcfC"))));
     g_stubs[idx].heapret = !strncmp(name, "_realpath", 9) || !strcmp(name, "_strdup") || !strcmp(name, "_strndup") || !strcmp(name, "_getcwd") ? 1 : (!strcmp(name, "_asprintf") || !strcmp(name, "_vasprintf") ? 2 : 0);   // host functions that return memory from the system's malloc (see heapret_fix)
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;
     if (host && !h) g_stubs[idx].swift = (name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S')) || !strcmp(name, "_swift_getAtKeyPath") || !strcmp(name, "_swift_setAtWritableKeyPath") || !strcmp(name, "_swift_modifyAtWritableKeyPath") || !strcmp(name, "_swift_getAtAnyKeyPath") || !strcmp(name, "_swift_getAtPartialKeyPath");   // a Swift symbol: Swift's calling convention (also the key path runtime functions: swiftcc with an indirect result in x8)

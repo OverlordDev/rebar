@@ -174,5 +174,18 @@ if [ -f "$NVT" ]; then
         cat $T/b $T/b.err | grep -v '^nvrm' > $T/b2; if cmp -s $T/a $T/b2; then echo "PASS nvim_luajit_errors"; pass=$((pass + 1)); else echo "FAIL nvim_luajit_errors"; cat $T/b $T/b.err | head -6; fail=$((fail + 1)); fi
     fi
 fi
+# Framework tests (samples/fw_*.swift): built for arm64 and x86_64 with swiftc, output of the arm64 build under rebar must equal the native x86_64 one
+for src in fw_*.swift; do
+    fwn=${src%.swift}
+    flags=""; [ "$fwn" = fw_swift_concurrency ] && flags="-parse-as-library"
+    for a in arm64 x86_64; do
+        sfx=arm; [ $a = x86_64 ] && sfx=x86
+        [ -x ${fwn}_$sfx ] && [ ${fwn}_$sfx -nt $src ] || swiftc $flags -O -target $a-apple-macos15.0 -o ${fwn}_$sfx $src 2>/dev/null
+    done
+    if [ -x ${fwn}_arm ] && [ -x ${fwn}_x86 ]; then
+        run_to 60 $T/a ./${fwn}_x86; run_to 120 $T/b $R ${fwn}_arm; grep -v '^nvrm' $T/b | grep -v '^rebar: warning' > $T/b2; check $fwn $T/a $T/b2
+    else echo "SKIP $fwn (no swiftc?)"; fi
+done
+
 echo "passed $pass, failed $fail"
 [ $fail = 0 ]
