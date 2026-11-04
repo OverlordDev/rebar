@@ -197,7 +197,7 @@ __asm__(
     "  pushq %rbx\n  .cfi_offset %rbx, -24\n"
     "  pushq %r12\n  .cfi_offset %r12, -32\n"
     "  pushq %r13\n  .cfi_offset %r13, -40\n"
-    "  subq $8, %rsp\n"
+    "  pushq %r14\n  .cfi_offset %r14, -48\n"
     "  movq %rcx, %rbx\n  movq %rdi, %r11\n  movq %rsi, %r10\n  movq %rdx, %r12\n"
     "  movq %r9, %rax\n"
     "1:\n  testq %rax, %rax\n  jz 2f\n  decq %rax\n  pushq (%r8,%rax,8)\n  jmp 1b\n"
@@ -206,6 +206,7 @@ __asm__(
     "  movq 24(%r10), %rcx\n  movq 32(%r10), %r8\n  movq 40(%r10), %r9\n"
     "  movsd 0(%r12), %xmm0\n  movsd 8(%r12), %xmm1\n  movsd 16(%r12), %xmm2\n  movsd 24(%r12), %xmm3\n"
     "  movsd 32(%r12), %xmm4\n  movsd 40(%r12), %xmm5\n  movsd 48(%r12), %xmm6\n  movsd 56(%r12), %xmm7\n"
+    "  movq 56(%rbx), %r14\n"       // out[7]: the async context of a Swift async function (x22 of the arm64 caller; callee-saved for any other callee)
     "  movq 0(%rbx), %r13\n"        // out[0]: swiftself (x20 of a Swift caller; callee-saved, so a C function does not mind)
     "  movq 8(%rbx), %rax\n"        // out[1]: %al = the vector registers of a variadic C function (8), or the address of the indirect result of a Swift function
     "  xorl %r12d, %r12d\n"         // swifterror starts out clear
@@ -213,7 +214,7 @@ __asm__(
     "  movq %rax, 0(%rbx)\n  movq %xmm0, 8(%rbx)\n  movq %rdx, 16(%rbx)\n  movq %xmm1, 24(%rbx)\n"
     "  movq %r12, 32(%rbx)\n  movq %rcx, 40(%rbx)\n  movq %r8, 48(%rbx)\n"   // the error, and the 3rd and 4th result registers of Swift
     "Lhc_epilogue:\n"
-    "  leaq -24(%rbp), %rsp\n  popq %r13\n  popq %r12\n  popq %rbx\n  popq %rbp\n  ret\n"
+    "  leaq -32(%rbp), %rsp\n  popq %r14\n  popq %r13\n  popq %r12\n  popq %rbx\n  popq %rbp\n  ret\n"
     "Lhc_landing:\n"
     "  movq %rax, %r13\n  movq %rax, %rdi\n  movq %rdx, %rsi\n  call _rebar_arrive\n"
     "  testl %eax, %eax\n  jnz Lhc_epilogue\n"
@@ -242,6 +243,7 @@ static __thread bool t_swift;
 static void host_call_full(CPU *c, void *fn, const uint64_t *ints, const uint64_t *dbls,
                            const uint64_t *stack, uint64_t nstack) {
     uint64_t out[8] = {0, 8};
+    out[7] = c->x[22];
     bool swift = t_swift; t_swift = false;
     if (swift) { out[0] = c->x[20]; out[1] = c->x[8]; }
     host_invoke(c, fn, ints, dbls, stack, nstack, out);
@@ -372,7 +374,7 @@ __asm__(
     ".cfi_personality 155, _rebar_entry_personality\n"
     "  pushq %rbp\n  .cfi_def_cfa_offset 16\n  .cfi_offset %rbp, -16\n"
     "  movq %rsp, %rbp\n  .cfi_def_cfa_register %rbp\n  subq $208, %rsp\n"
-    "  movq %rax, 160(%rsp)\n  movq %r13, 168(%rsp)\n  movq %r12, 176(%rsp)\n"
+    "  movq %rax, 160(%rsp)\n  movq %r13, 168(%rsp)\n  movq %r12, 176(%rsp)\n  movq %r14, 200(%rsp)\n"
     "  movq %rdi, 0(%rsp)\n  movq %rsi, 8(%rsp)\n  movq %rdx, 16(%rsp)\n"
     "  movq %rcx, 24(%rsp)\n  movq %r8, 32(%rsp)\n  movq %r9, 40(%rsp)\n"
     "  movsd %xmm0, 48(%rsp)\n  movsd %xmm1, 56(%rsp)\n  movsd %xmm2, 64(%rsp)\n  movsd %xmm3, 72(%rsp)\n"
@@ -465,7 +467,7 @@ void rebar_bridge_enter(uint64_t *f) {
         // copy below sp broke Bionic (Electron) at start, for a reason not found yet. Eight slots above the caller's own are safe to read.
         if (t_cb_stackargs > 0) { c->sp = (c->sp - 64) & ~0xfull; memcpy((void *)c->sp, stk + 2, 64); }
         for (int k = 0; k < 8; k++) { memset(&c->vr[k], 0, 16); c->vr[k].d[0] = f[6 + k]; }
-        c->x[8] = f[20]; c->x[20] = f[21]; c->x[21] = f[22];   // Swift: indirect result address, context, error (all but the error are discarded when the CPU is restored below)
+        c->x[8] = f[20]; c->x[20] = f[21]; c->x[21] = f[22]; c->x[22] = f[25];   // Swift: indirect result address, context, error (all but the error are discarded when the CPU is restored below)
     }
     if (sigent > 0 && sigent < 32 && ((g_sig_onstack >> sigent) & 1) && t_gss_on && !(c->sp > t_gss_sp && c->sp <= t_gss_sp + t_gss_size)) c->sp = (t_gss_sp + t_gss_size) & ~0xfull;
     c->x[30] = stub_addr(STUB_RET);
