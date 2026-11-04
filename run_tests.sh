@@ -187,5 +187,20 @@ for src in fw_*.swift; do
     else echo "SKIP $fwn (no swiftc?)"; fi
 done
 
+printf '8e4da1bc9fdc589d01010101c6c6c6c6\nroundtrip ok\n' > $T/a; run_to 30 $T/b $R t92_arm; grep -v '^nvrm' $T/b > $T/b2; check t92_aesmc_rd $T/a $T/b2
+run_to 30 $T/a ./t93_x86; run_to 30 $T/b $R t93_arm; grep -v '^nvrm' $T/b > $T/b2; check t93_environ_live $T/a $T/b2
+
+# Homebrew arm64 bottles (tools/rebrew.py install jq sqlite lua ripgrep tmux): checked when the prefix exists
+HB=${REBREW_PREFIX:-$HOME/Desktop/arm64-apps/homebrew}
+hbcheck() {  # name, expected, tool, args...
+    nm=$1; ex=$2; shift 2; tool=$1; shift
+    [ -x "$HB/bin/$tool" ] || { echo "SKIP $nm (not installed)"; return; }
+    printf '%s\n' "$ex" > $T/a; run_to 30 $T/b $R "$HB/bin/$tool" "$@"; grep -v '^nvrm' $T/b | head -1 > $T/b2; check $nm $T/a $T/b2
+}
+hbcheck brew_sqlite 42 sqlite3 :memory: "select 6*7"
+hbcheck brew_lua 42 lua -e 'print(6*7)'
+[ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
+hbcheck brew_tmux "tmux 3.8" tmux -V
+
 echo "passed $pass, failed $fail"
 [ $fail = 0 ]

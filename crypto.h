@@ -46,8 +46,8 @@ static uint64_t crc32_insn(uint32_t crc, uint64_t data, int bytes, bool castagno
 static void aes_step(VReg *d, const VReg *n, int kind) {
     crypto_init();
     uint8_t s[16], t[16];
-    memcpy(s, d, 16);
-    if (kind < 2) for (int k = 0; k < 16; k++) s[k] ^= n->b[k];  // AESE / AESD add the round key first
+    if (kind < 2) { memcpy(s, d, 16); for (int k = 0; k < 16; k++) s[k] ^= n->b[k]; }   // AESE / AESD: Rd ^ Rn (the round key), then the round step
+    else memcpy(s, n, 16);                                                          // AESMC / AESIMC: the state is Rn (it is Rd only when the program says `aesmc vX, vX`; OpenSSL's 3-block CTR loop says `aesmc v17, v18`)
     switch (kind) {
     case 0:  // AESE: ShiftRows, SubBytes
         for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) t[c * 4 + r] = g_aes_sbox[s[((c + r) & 3) * 4 + r]];

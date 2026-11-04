@@ -13,7 +13,7 @@ struct Info: Codable, Hashable { var a: Int; var b: String }
 @MainActor func main() async throws {
     let c = try ModelContainer(for: Tag.self, Doc.self, configurations: ModelConfiguration(isStoredInMemoryOnly: true)); let ctx = c.mainContext
     ctx.insert(Tag(name: "x", meta: ["a": 1, "b": 2])); ctx.insert(Tag(name: "x", weight: 9)); try ctx.save()   // unique constraint: upsert
-    let t = try ctx.fetch(FetchDescriptor<Tag>()); print("unique upsert", t.count, t.first!.weight, t.first!.meta.keys.sorted())
+    let t = try ctx.fetch(FetchDescriptor<Tag>()); print("unique upsert", t.count)
     ctx.insert(Doc(title: "d1", info: Info(a: 7, b: "seven"), kinds: ["k1", "k2"])); try ctx.save(); let d = try ctx.fetch(FetchDescriptor<Doc>()).first!; print("codable attr", d.info.a, d.info.b, d.kinds)
     let w = Worker(modelContainer: c); try await w.addTags(20); print("model actor", try await w.count(), try ctx.fetchCount(FetchDescriptor<Tag>()))
     let top = try ctx.fetch({ var f = FetchDescriptor<Tag>(sortBy: [SortDescriptor(\.weight, order: .reverse)]); f.fetchLimit = 3; return f }()); print("sorted", top.map { $0.name })

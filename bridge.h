@@ -751,8 +751,20 @@ ZONE_FN(h_malloc_zone_realloc, 7, 2, "malloc_zone_realloc")
 H(h_malloc)  { uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(3) && zone_slot_call(c, g_def_zone.clone, 3, 1, a)) return; host_call(c, HOSTFN("malloc"), false); }
 H(h_calloc)  { uint64_t a[3] = {c->x[0], c->x[1], 0}; if (def_patched(4) && zone_slot_call(c, g_def_zone.clone, 4, 2, a)) return; host_call(c, HOSTFN("calloc"), false); }
 H(h_valloc)  { uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(5) && zone_slot_call(c, g_def_zone.clone, 5, 1, a)) return; host_call(c, HOSTFN("valloc"), false); }
-H(h_free)    { uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(6) && zone_slot_call(c, g_def_zone.clone, 6, 1, a)) return; host_call(c, HOSTFN("free"), false); }
-H(h_realloc) { uint64_t a[3] = {c->x[0], c->x[1], 0}; if (def_patched(7) && zone_slot_call(c, g_def_zone.clone, 7, 2, a)) return; host_call(c, HOSTFN("realloc"), false); }
+// A block that came from an allocator of the guest (jemalloc's zone: tmux; the host's strdup / realpath results copied into it, see heapret_fix) and is freed with the system's free: the
+// guest zone that knows the block frees it, as libmalloc would find the zone by asking each one for the size.
+static bool guest_zone_free(CPU *c, uint64_t p, uint64_t newsize, bool is_realloc) {
+    if (!g_nguest_zones || !p || !own_check(p, 1)) return false;
+    for (int k = 0; k < g_nguest_zones; k++) {
+        uint64_t z = g_guest_zones[k], szfn = *(uint64_t *)(z + 16);
+        if (!szfn || !call_guest(c, szfn, z, p, 0, 0)) continue;
+        if (is_realloc) { uint64_t fn = *(uint64_t *)(z + 56); if (!fn) return false; c->x[0] = call_guest(c, fn, z, p, newsize, 0); return true; }
+        uint64_t fn = *(uint64_t *)(z + 48); if (!fn) return false; call_guest(c, fn, z, p, 0, 0); c->x[0] = 0; return true;
+    }
+    return false;
+}
+H(h_free)    { if (guest_zone_free(c, c->x[0], 0, false)) return; uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(6) && zone_slot_call(c, g_def_zone.clone, 6, 1, a)) return; host_call(c, HOSTFN("free"), false); }
+H(h_realloc) { if (guest_zone_free(c, c->x[0], c->x[1], true)) return; uint64_t a[3] = {c->x[0], c->x[1], 0}; if (def_patched(7) && zone_slot_call(c, g_def_zone.clone, 7, 2, a)) return; host_call(c, HOSTFN("realloc"), false); }
 H(h_malloc_size) {
     for (int k = 0; k < g_nguest_zones; k++) {   // a guest allocator that registered its own zone (Firefox's mozjemalloc) knows the sizes of its blocks: ask it, as libmalloc would
         uint64_t z = g_guest_zones[k], fn = *(uint64_t *)(z + 16);
@@ -2604,7 +2616,7 @@ static void *data_addr(const char *name) {
     if (!strcmp(name, "_NXArgc")) return &g_argc;
     if (!strcmp(name, "_NXArgv")) return &g_argv;
     if (!strcmp(name, "___progname")) return &g_progname;
-    if (!strcmp(name, "_environ")) return &g_environ;
+    if (!strcmp(name, "_environ")) return _NSGetEnviron();   // the host's own variable: setenv / putenv reallocate the array, a copy of the pointer goes stale (tmux's client read freed memory)
     return dlsym(RTLD_DEFAULT, name + 1);
 }
 
