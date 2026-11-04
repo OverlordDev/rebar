@@ -612,6 +612,21 @@ H(h_objc_autoreleaseReturnValue)    { id (*f)(id) = HOSTFN("objc_autorelease"); 
 H(h_objc_retainAutoreleasedReturnValue) { id (*f)(id) = HOSTFN("objc_retain"); if (c->x[0]) f((id)c->x[0]); }
 H(h_objc_claimAutoreleasedReturnValue) { id (*f)(id) = HOSTFN("objc_retain"); if (c->x[0]) f((id)c->x[0]); }
 H(h_objc_unsafeClaimAutoreleasedReturnValue) { }   // (the object stays in its pool: nothing to take, nothing to give back)
+// A query naming a file keychain of the app's own (Gemini: "Gemini Keys", never created here) makes Security ask the user in a dialog ("keychain not found"). Such a query is run
+// against the default keychains instead: the keys naming a keychain (kSecUseKeychain, kSecMatchSearchList) are taken out of a copy of the dictionary. REBAR_KEEP_KEYCHAIN=1 keeps them.
+static void sec_query_without_keychain(CPU *c) {
+    if (getenv("REBAR_KEEP_KEYCHAIN") || !c->x[0]) return;
+    void *(*copy)(void *, long, const void *) = HOSTFN("CFDictionaryCreateMutableCopy"); void (*rm)(void *, const void *) = HOSTFN("CFDictionaryRemoveValue");
+    const void **k1 = (const void **)dlsym(RTLD_DEFAULT, "kSecUseKeychain"), **k2 = (const void **)dlsym(RTLD_DEFAULT, "kSecMatchSearchList");
+    if (!copy || !rm) return;
+    void *m = copy(NULL, 0, (const void *)c->x[0]); if (!m) return;
+    if (k1) rm(m, *k1); if (k2) rm(m, *k2);
+    c->x[0] = (uint64_t)m;   // (the copy is leaked: a few per call)
+}
+H(h_SecItemAdd) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemAdd"), false); }
+H(h_SecItemCopyMatching) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemCopyMatching"), false); }
+H(h_SecItemUpdate) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemUpdate"), false); }
+H(h_SecItemDelete) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemDelete"), false); }
 H(h_SSLSetIOFuncs) { c->x[1] = imp_wrap_any(c->x[1], true); c->x[2] = imp_wrap_any(c->x[2], true); host_call(c, HOSTFN("SSLSetIOFuncs"), false); }   // SecureTransport calls the guest's read / write functions (.NET's System.Net.Security)
 // CGGetActiveDisplayList is empty on this Mac (the display is online but not "active" for Quartz), while the main display has valid bounds and a mode: GTK and others that count the
 // active displays found no monitor. Answer with the main display when the host has none.
