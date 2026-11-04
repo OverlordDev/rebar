@@ -9,6 +9,7 @@
 //   - binds resolve against the exports of the guest images first, then the host.
 
 #include <limits.h>
+#include <mach-o/nlist.h>
 #include <sys/stat.h>
 
 // ------------------------------------------------------------------------ file helpers
@@ -121,6 +122,7 @@ static void parse_load_commands(GImage *img) {
             if (img->nrpath < 16) img->rpath[img->nrpath++] = strdup((const char *)rc + rc->path.offset);
             break;
         }
+        case LC_SYMTAB: { const struct symtab_command *st = (const void *)lc; img->symoff = st->symoff; img->nsyms = st->nsyms; img->stroff = st->stroff; img->strsize = st->strsize; break; }
         case LC_DYLD_CHAINED_FIXUPS: img->chained = (const void *)lc; break;
         case LC_DYLD_EXPORTS_TRIE: {
             const struct linkedit_data_command *ld = (const void *)lc;
@@ -261,7 +263,17 @@ static uint64_t uleb(const uint8_t **p);
 
 // Looks a symbol up in one image's export trie. Returns the runtime address or 0.
 static uint64_t image_export_lookup(const GImage *img, const char *name) {
-    if (!img->export_trie) return 0;
+    if (!img->export_trie) {   // no export trie (a dylib made only of data and code, like a Dart AOT snapshot): the external symbols of the symbol table
+        if (!img->nsyms || !img->symoff) return 0;
+        const struct nlist_64 *nl = (const struct nlist_64 *)(img->slice + img->symoff);
+        uint64_t text_vm = 0; const struct load_command *lc = (const void *)(img->mh + 1);
+        for (uint32_t k = 0; k < img->mh->ncmds; k++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize))
+            if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__TEXT")) { text_vm = ((const struct segment_command_64 *)lc)->vmaddr; break; }
+        for (uint32_t k = 0; k < img->nsyms; k++)
+            if ((nl[k].n_type & N_EXT) && (nl[k].n_type & N_TYPE) == N_SECT && nl[k].n_un.n_strx < img->strsize && !strcmp((const char *)(img->slice + img->stroff + nl[k].n_un.n_strx), name))
+                return img->base + (nl[k].n_value - text_vm);
+        return 0;
+    }
     const uint8_t *node = img->export_trie, *end = img->export_trie + img->export_size;
     const char *rest = name;
     for (;;) {
@@ -473,6 +485,7 @@ H(h_dlsym) {
         if (!a) a = host_data_addr(name);        // a host variable: its address, as the guest will read it
         if (!a) a = stub_for(name, NULL, true);  // a host function: through our stub so special handlers apply
     }
+    if (!a && getenv("REBAR_TRACE_DLSYM")) fprintf(stderr, "[dlsym miss: handle %llx img %p path %s trie %p size %u main %d]\n", (unsigned long long)handle, (void *)img, img ? img->path : "-", img ? (void *)img->export_trie : NULL, img ? (unsigned)img->export_size : 0, img ? (int)img->is_main : 0);
     if (!a) { snprintf(g_dlerr, sizeof g_dlerr, "dlsym(%p, %s): symbol not found", (void *)handle, S(1)); g_dlerr_pending = true; }   // callers decide whether a symbol exists by asking dlerror (GTK 3 looking for GTK 2)
     if (g_trace_stubs && trace_stub_wanted("_dlsym")) { GImage *in = a ? image_by_addr(a) : NULL; fprintf(stderr, "   -> %llx%s%s\n", (unsigned long long)a, in ? " in " : (a >= g_stub_base && a - g_stub_base < g_stub_size ? " (stub " : ""), in ? in->path : (a >= g_stub_base && a - g_stub_base < g_stub_size ? g_stubs[(a - g_stub_base) / 16].name : "")); }
     c->x[0] = a;

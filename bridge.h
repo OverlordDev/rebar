@@ -39,6 +39,7 @@ typedef struct GImage {
     bool is_main, fixed, objc_mapped, inited, have_entry;
     uint64_t entryoff;
     const uint8_t *export_trie; uint32_t export_size;
+    uint32_t symoff, nsyms, stroff, strsize;   // LC_SYMTAB: the lookup of exported names for an image without an export trie (Dart's AOT snapshot dylibs)
     const uint8_t *unwind_info;
     uint64_t eh_frame, eh_size;                 // __TEXT,__eh_frame (runtime address): the FDEs that DWARF-mode compact unwind entries point to
     const struct linkedit_data_command *chained;
