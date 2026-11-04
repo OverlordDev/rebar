@@ -563,8 +563,11 @@ static uint8_t *g_thunk_page, *g_thunk_top, *g_thunk_end;
 static pthread_mutex_t g_thunk_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool is_thunk(uint64_t a) { return g_thunk_page && a >= (uint64_t)g_thunk_page && a < (uint64_t)g_thunk_end && ((a - (uint64_t)g_thunk_page) & 31) == 0; }
 static uint64_t imp_unwrap(uint64_t imp) { return is_thunk(imp) ? *(uint64_t *)(imp + 2) : imp; }
-static uint64_t imp_wrap(uint64_t imp) {
-    if (!imp || !in_guest(imp)) return imp;
+static uint64_t imp_wrap_any(uint64_t imp, bool any);
+static uint64_t imp_wrap(uint64_t imp) { return imp_wrap_any(imp, false); }
+// any: also an address outside the guest's image range (a stub that a JIT made in memory of its own: CoreCLR's native-callable thunks)
+static uint64_t imp_wrap_any(uint64_t imp, bool any) {
+    if (!imp || (!in_guest(imp) && !(any && imp >= 0x10000 && imp < 0x100000000ull))) return imp;
     pthread_mutex_lock(&g_thunk_mu);
     unsigned h = (unsigned)((imp >> 2) * 0x9e3779b97f4a7c15ull >> 51);
     for (int k = 0; k < 8192; k++) {
@@ -598,6 +601,7 @@ static void wrap_ctx(CPU *c, int arg, size_t bytes, uint8_t *tmp) {
 }
 H(h_CFRunLoopObserverCreate) { uint8_t t[40]; c->x[4] = imp_wrap(c->x[4]); wrap_ctx(c, 5, 40, t); host_call(c, HOSTFN("CFRunLoopObserverCreate"), false); }
 H(h_CFRunLoopTimerCreate) { uint8_t t[40]; c->x[5] = imp_wrap(c->x[5]); wrap_ctx(c, 6, 40, t); host_call(c, HOSTFN("CFRunLoopTimerCreate"), false); }
+H(h_SSLSetIOFuncs) { c->x[1] = imp_wrap_any(c->x[1], true); c->x[2] = imp_wrap_any(c->x[2], true); host_call(c, HOSTFN("SSLSetIOFuncs"), false); }   // SecureTransport calls the guest's read / write functions (.NET's System.Net.Security)
 H(h_CFRunLoopSourceCreate) { uint8_t t[80]; wrap_ctx(c, 2, 80, t); host_call(c, HOSTFN("CFRunLoopSourceCreate"), false); }
 // REBAR_DISPLAY_HZ=<n>: the display link of the guest ticks at n Hz instead of the display's own rate.  A translated browser needs ~15-17 ms for the frame of
 // a scroll; on a 144 Hz display (ticks 6.9 ms apart) a frame that takes 14 ms waits for the third tick (20.8 ms, 48 fps), at a steady 60 Hz it fits in one tick.

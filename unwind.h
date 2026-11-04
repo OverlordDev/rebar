@@ -626,3 +626,40 @@ static void unwind_setup_image(GImage *img) {
         }
     }
 }
+
+// ------------------------------------------------------------- libunwind's local API for the guest (CoreCLR's PAL_VirtualUnwind and its stack walks)
+// The guest's unw_* imports would reach the host's libunwind, which knows nothing of arm64 registers or of the guest's frames. The context and the cursor hold a UFrame
+// (the callee-saved view this unwinder already uses) behind a marker; registers the view lacks (x0-x18) read as 0. Register numbers are libunwind's for arm64:
+// x0-x30 = 0-30, sp = 31, pc = 32, d0-d31 = 64-95, UNW_REG_IP = -1, UNW_REG_SP = -2.
+#define UNWC_MAGIC 0x756e776374783030ull
+typedef struct { uint64_t magic; UFrame f; } UnwBox;
+static void unwind_cpu_frame(CPU *c, UFrame *f) {
+    memset(f, 0, sizeof *f);
+    f->pc = c->x[30]; f->sp = c->sp; f->fp = c->x[29]; f->lr = 0;
+    for (int k = 0; k < 10; k++) f->x[k] = c->x[19 + k];
+    for (int k = 0; k < 8; k++) f->d[k] = c->vr[8 + k].d[0];
+}
+H(h_unw_getcontext) { UnwBox *b = (UnwBox *)c->x[0]; b->magic = UNWC_MAGIC; unwind_cpu_frame(c, &b->f); c->x[0] = 0; }
+H(h_unw_init_local) { UnwBox *cur = (UnwBox *)c->x[0], *ctx = (UnwBox *)c->x[1]; *cur = *ctx; cur->magic = UNWC_MAGIC; c->x[0] = 0; }
+H(h_unw_step) {
+    UnwBox *cur = (UnwBox *)c->x[0]; FuncInfo fi;
+    if (!cur->f.pc) { c->x[0] = 0; return; }
+    if (!unwind_lookup(cur->f.pc - 1, &fi)) { c->x[0] = (uint64_t)(int64_t)-6540; return; }   // UNW_ENOINFO
+    uframe_step(&cur->f, &fi);
+    c->x[0] = cur->f.pc ? 1 : 0;
+}
+H(h_unw_get_reg) {
+    UnwBox *cur = (UnwBox *)c->x[0]; int r = (int)c->x[1]; uint64_t v = 0;
+    if (r == -1 || r == 32) v = cur->f.pc; else if (r == -2 || r == 31) v = cur->f.sp; else if (r == 29) v = cur->f.fp; else if (r == 30) v = cur->f.lr ? cur->f.lr : 0;
+    else if (r >= 19 && r <= 28) v = cur->f.x[r - 19];
+    *(uint64_t *)c->x[2] = v; c->x[0] = 0;
+}
+H(h_unw_set_reg) {
+    UnwBox *cur = (UnwBox *)c->x[0]; int r = (int)c->x[1]; uint64_t v = c->x[2];
+    if (r == -1 || r == 32) cur->f.pc = v; else if (r == -2 || r == 31) cur->f.sp = v; else if (r == 29) cur->f.fp = v; else if (r == 30) cur->f.lr = v; else if (r >= 19 && r <= 28) cur->f.x[r - 19] = v;
+    c->x[0] = 0;
+}
+H(h_unw_get_fpreg) { UnwBox *cur = (UnwBox *)c->x[0]; int r = (int)c->x[1]; *(uint64_t *)c->x[2] = (r >= 72 && r <= 79) ? cur->f.d[r - 72] : 0; c->x[0] = 0; }
+H(h_unw_set_fpreg) { UnwBox *cur = (UnwBox *)c->x[0]; int r = (int)c->x[1]; if (r >= 72 && r <= 79) cur->f.d[r - 72] = c->vr[0].d[0]; c->x[0] = 0; }
+H(h_unw_is_signal_frame) { c->x[0] = 0; }
+
