@@ -356,6 +356,7 @@ static void trace_msg(CPU *c, const char *kind, id self, SEL sel) {
         p += l + (e ? 1 : 0);
     }
     if (!hit) return;
+    if (getenv("REBAR_TRACE_MSG_BT")) dump_backtrace(c);   // the guest backtrace of every traced send
     char s2[96] = "", s3[96] = "";
     trace_string_arg(c->x[2], s2, sizeof s2); trace_string_arg(c->x[3], s3, sizeof s3);
     fprintf(stderr, "[objc] %s [%s %s] self=%p x2=%llx x3=%llx d0..3=%g %g %g %g%s%s%s%s%s%s\n", kind, self ? class_getName(object_getClass(self)) : "nil", name, (void *)self,
@@ -781,7 +782,9 @@ H(h_objc_msgSend) {
         }
     }
     Class cls = object_getClass(self);
-    IMP imp = (IMP)imp_unwrap((uint64_t)class_getMethodImplementation(cls, sel));
+    // (a method lookup can run a class's +initialize and wait on libobjc's class initialization lock, which another thread may hold while it waits for the interpreter lock)
+    bool gil_held_l = gil_release(); IMP imp_raw = class_getMethodImplementation(cls, sel); if (gil_held_l) gil_acquire();
+    IMP imp = (IMP)imp_unwrap((uint64_t)imp_raw);
     if (in_guest((uint64_t)imp)) { c->pc = (uint64_t)imp; return; }  // guest -> guest: stay in the interpreter
     if ((void *)imp == p_msgForward) { host_call(c, p_msgSend, false); return; }
     if (variadic_send(c, self, sel) || valist_send(c, self, sel)) return;
@@ -833,7 +836,8 @@ H(h_objc_msgSendSuper2) {
     if (__builtin_expect(g_trace_msg != NULL, 0)) trace_msg(c, "super", self, sel);
     if (!self) { c->x[0] = c->x[1] = 0; memset(&c->vr[0], 0, 64); return; }
     Class start = class_getSuperclass(sup->cur);
-    IMP imp = (IMP)imp_unwrap((uint64_t)class_getMethodImplementation(start, sel));
+    bool gil_held_s = gil_release(); IMP imp_raw_s = class_getMethodImplementation(start, sel); if (gil_held_s) gil_acquire();
+    IMP imp = (IMP)imp_unwrap((uint64_t)imp_raw_s);
     c->x[0] = (uint64_t)self;
     if (in_guest((uint64_t)imp)) { c->pc = (uint64_t)imp; return; }
     Method m = class_getInstanceMethod(start, sel);
@@ -1196,6 +1200,10 @@ static void objc_attach_categories(GImage *img) {
             each_method(cat->classMethods, imp_register_cb, NULL);
             each_method(cat->instanceMethods, add_method_cb, cls);
             each_method(cat->classMethods, add_method_cb, object_getClass((id)cls));
+            if (cat->protocols) {   // the protocols the category adopts (J2ObjC's checks `[NSString conformsToProtocol:...]` after loading its categories)
+                const uint64_t *pl = (const uint64_t *)cat->protocols; uint64_t np = pl[0];
+                for (uint64_t k = 0; k < np && k < 64; k++) if (in_guest(pl[1 + k])) class_addProtocol(cls, (Protocol *)pl[1 + k]);
+            }
         }
 }
 

@@ -2440,7 +2440,35 @@ static bool returns_this(const char *name) {
     free(d);
     return r;
 }
+// Swift's extra inhabitants of a class reference (the bit patterns an enum borrows from a pointer field to say "no value": Optional<Class> nil is 0, Optional<Optional<Class>> nil is
+// the next one, a tuple or struct holding such a field borrows the same way) are numbered by the ABI of the machine: on arm64 the pattern for index i is the value i; on x86_64 the
+// low bit belongs to Objective-C tagged pointers, so the pattern is i << 1 and an odd value is taken for a real pointer. Code compiled for arm64 writes the first, libswiftCore of
+// this host reads the second: a "no value" read as a live reference (SwiftNIO's Optional<(Frame, Optional<Promise>)> array was destroyed as live and crashed). Both witnesses of the
+// retainable-box value witness table are patched in memory to the arm64 numbering: the reader (index = value, no low-bit test) and the writer (no doubling).
+// REBAR_NO_SWIFT_XI_PATCH=1 turns it off.
+static void patch_swift_extra_inhabitants(void) {
+    static bool done; if (done || getenv("REBAR_NO_SWIFT_XI_PATCH")) return; done = true;
+    void *sym = dlsym(RTLD_DEFAULT, "swift_retain"); Dl_info di; if (!sym || !dladdr(sym, &di) || !di.dli_fbase) return;
+    const struct mach_header_64 *mh = di.dli_fbase; const struct load_command *lc = (const void *)(mh + 1); uint64_t tb = 0, ts = 0;
+    for (uint32_t k = 0; k < mh->ncmds; k++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__TEXT")) { const struct segment_command_64 *sg = (const void *)lc; ts = sg->vmsize; tb = (uint64_t)mh; break; }
+    if (!tb) return;
+    static const uint8_t rd[] = {0x48,0x89,0xca,0x48,0xc1,0xea,0x20,0x89,0xce,0x83,0xe6,0x01,0x48,0xd1,0xe9,0xff,0xc1,0x31,0xc0,0x48,0x09,0xd6,0x0f,0x44,0xc1};   // movq %rcx,%rdx; shrq $32,%rdx; movl %ecx,%esi; andl $1,%esi; shrq %rcx; incl %ecx; xorl %eax,%eax; orq %rdx,%rsi; cmovel %ecx,%eax
+    static const uint8_t wr[] = {0xff,0xce,0x48,0x01,0xf6,0x48,0x89,0x37};   // decl %esi; addq %rsi,%rsi; movq %rsi,(%rdi)
+    int nr = 0, nw = 0;
+    for (uint64_t o = 0; o + sizeof rd < ts; o++) {
+        uint8_t *q = (uint8_t *)(tb + o);
+        int which = (q[0] == rd[0] && !memcmp(q, rd, sizeof rd)) ? 1 : (q[0] == wr[0] && !memcmp(q, wr, sizeof wr)) ? 2 : 0;
+        if (!which) continue;
+        mach_vm_address_t pg = (mach_vm_address_t)(uintptr_t)q & ~0xfffull;
+        if (mach_vm_protect(mach_task_self(), pg, 0x2000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) continue;
+        if (which == 1) { q[11] = 0x00; q[12] = 0x0f; q[13] = 0x1f; q[14] = 0x00; nr++; }   // andl $0,%esi ; nop3 (instead of shrq %rcx)
+        else { q[2] = 0x0f; q[3] = 0x1f; q[4] = 0x00; nw++; }                              // nop3 (instead of addq %rsi,%rsi)
+        mach_vm_protect(mach_task_self(), pg, 0x2000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    }
+    if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[swift extra inhabitants: %d reader(s), %d writer(s) patched to the arm64 numbering]\n", nr, nw);
+}
 static uint64_t stub_for(const char *name, const char *lib, bool weak) {
+    if (name && (!strncmp(name, "_swift_", 7) || !strncmp(name, "_$s", 3))) patch_swift_extra_inhabitants();
     for (int k = 2; k < g_nstubs; k++)
         if (!strcmp(g_stubs[k].name, name)) return stub_addr(k);
     {   // debugging aid: REBAR_NOP=_vm_protect,_madvise makes those imports do nothing and return 0
