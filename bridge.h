@@ -1282,6 +1282,19 @@ H(h_sysctlbyname) {
     }
     host_call(c, HOSTFN("sysctlbyname"), false);
 }
+// objc_retain_x0 .. objc_retain_x28 / objc_release_x0 .. objc_release_x28: libobjc's register variants (code built for iOS 16 / macOS 13 and later calls them to save the `mov x0, xN`);
+// the object is in xN, otherwise they act like objc_retain / objc_release (retain returns the object in x0)
+#define XSTUB(N) H(h_objc_retain_x##N) { c->x[0] = c->x[N]; host_call(c, HOSTFN("objc_retain"), false); } H(h_objc_release_x##N) { c->x[0] = c->x[N]; host_call(c, HOSTFN("objc_release"), false); }
+XSTUB(0) XSTUB(1) XSTUB(2) XSTUB(3) XSTUB(4) XSTUB(5) XSTUB(6) XSTUB(7) XSTUB(8) XSTUB(9) XSTUB(10) XSTUB(11) XSTUB(12) XSTUB(13) XSTUB(14) XSTUB(15) XSTUB(16) XSTUB(17) XSTUB(18) XSTUB(19)
+XSTUB(20) XSTUB(21) XSTUB(22) XSTUB(23) XSTUB(24) XSTUB(25) XSTUB(26) XSTUB(27) XSTUB(28)
+#define XREF(N) h_objc_retain_x##N, h_objc_release_x##N,
+static StubHandler const k_objc_x[] = { XREF(0) XREF(1) XREF(2) XREF(3) XREF(4) XREF(5) XREF(6) XREF(7) XREF(8) XREF(9) XREF(10) XREF(11) XREF(12) XREF(13) XREF(14) XREF(15) XREF(16) XREF(17) XREF(18) XREF(19)
+    XREF(20) XREF(21) XREF(22) XREF(23) XREF(24) XREF(25) XREF(26) XREF(27) XREF(28) };
+static StubHandler objc_x_handler(const char *name) {
+    int rel = !strncmp(name, "_objc_release_x", 15); if (!rel && strncmp(name, "_objc_retain_x", 14)) return NULL;
+    const char *d = name + (rel ? 15 : 14); char *end; long n = strtol(d, &end, 10);
+    return (*d && !*end && n >= 0 && n <= 28) ? k_objc_x[n * 2 + rel] : NULL;
+}
 // The host counts pages in 4 KiB units; an arm64 program expects the 16 KiB pages of Apple Silicon (hw.pagesize above), so the page counts of the VM statistics are divided by 4
 // (otherwise "free + cached pages << 14" is four times the memory and a program computing used = total - that underflows).
 H(h_host_page_size) { if (c->x[1]) *(uint64_t *)c->x[1] = GUEST_PAGE; RET(0); }
@@ -2581,6 +2594,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     void *host = NULL;
     if (lib_supported(lib)) {
         for (const Special *s = k_special; s->name; s++) if (!strcmp(s->name, name)) h = s->h;
+        if (!h) h = objc_x_handler(name);
         if (!h) {
             const char *sym = name + (name[0] == '_');
             char buf[512];

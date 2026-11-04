@@ -219,6 +219,13 @@ if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
         (cd $T/ipaui && zip -qr ../IosUi.ipa Payload)
         printf 'launched idiom 0 window key 1 label UIKit under rebar\nbye\n' > $T/a
         run_to 60 $T/b python3 -I ../tools/ipa.py run $T/IosUi.ipa; grep -v '^nvrm' $T/b > $T/b2; check ios_uikit_ipa $T/a $T/b2
+        # and a SwiftUI one (state, Button, List, NavigationStack)
+        rm -rf $T/ipasw && mkdir -p $T/ipasw/Payload/IosSw.app
+        xcrun -sdk iphoneos swiftc -parse-as-library -target arm64-apple-ios16.0 -O ios_swiftui.swift -o $T/ipasw/Payload/IosSw.app/IosSw 2>/dev/null
+        printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosSw</string><key>CFBundleIdentifier</key><string>dev.rebar.iossw</string><key>MinimumOSVersion</key><string>16.0</string><key>UIDeviceFamily</key><array><integer>1</integer></array></dict></plist>' > $T/ipasw/Payload/IosSw.app/Info.plist
+        (cd $T/ipasw && zip -qr ../IosSw.ipa Payload)
+        printf 'appeared count 0\nbye\n' > $T/a
+        run_to 60 $T/b python3 -I ../tools/ipa.py run $T/IosSw.ipa; grep -v '^nvrm' $T/b > $T/b2; check ios_swiftui_ipa $T/a $T/b2
     fi
 else echo "SKIP ios_cli_ipa (no iphoneos SDK)"; fi
 
