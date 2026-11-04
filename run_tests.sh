@@ -91,6 +91,8 @@ run_to 30 $T/a ./t84_x86; run_to 30 $T/b $R t84_arm; grep -v '^nvrm' $T/b > $T/b
 printf 'SIGSEGV 1 at 0x10\nrecovered after fault 1\n' > $T/a; run_to 30 $T/b $R t85_arm; grep -v '^nvrm' $T/b > $T/b2; check t85_guest_segv_handler $T/a $T/b2
 run_to 30 $T/a ./t86_x86; run_to 30 $T/b $R t86_arm; grep -v '^nvrm' $T/b > $T/b2; check t86_string_iter $T/a $T/b2
 run_to 30 $T/a ./t87_x86; run_to 30 $T/b $R t87_arm; grep -v '^nvrm' $T/b > $T/b2; check t87_nsrange_stack $T/a $T/b2
+printf '389 89 a rXaher long string 1234567890123456789z\nown allocations used\n' > $T/a; run_to 30 $T/b $R t88_arm; grep -v '^nvrm' $T/b > $T/b2; check t88_replaced_allocator_strings $T/a $T/b2
+printf '/private/tmp duplicate 1 42-formatted\nfreed ok, own allocations used\n' > $T/a; run_to 30 $T/b $R t89_arm; grep -v '^nvrm' $T/b > $T/b2; check t89_replaced_allocator_host_results $T/a $T/b2
 printf 'spawn 0\nshell said: hello, arm64\nstatus 0\n' > $T/a; run_to 60 $T/b $R t67_arm "$PWD/t2_hello"; grep -v '^nvrm' $T/b > $T/b2; check t67_shell_runs_arm64 $T/a $T/b2
 run_to 30 $T/a ./t68_x86; run_to 30 $T/b $R t68_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t68_variadic_ipc $T/a $T/b2
 run_to 30 $T/a ./t69_x86; run_to 30 $T/b $R t69_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t69_wprintf $T/a $T/b2

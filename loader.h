@@ -202,7 +202,7 @@ static GImage *load_image(const char *real_path, GImage *loader, bool is_main) {
     parse_load_commands(img);
     map_segments(img, fd, (uint64_t)(slice - file));
     close(fd);
-    if (strstr(img->path, "/libjvm.dylib") && g_jit_nskip < 16 && !getenv("REBAR_JIT_JAVA")) {   // HotSpot's generated code relies on faults (null checks, safepoint polls) that need the exact register state of the interpreter
+    if ((strstr(img->path, "/libjvm.dylib") || strstr(img->path, "/libcoreclr.dylib")) && g_jit_nskip < 16 && !getenv("REBAR_JIT_JAVA")) {   // HotSpot's generated code relies on faults (null checks, safepoint polls) that need the exact register state of the interpreter
         if (getenv("REBAR_JIT_JAVA_SKIP")) { g_jit_skip[g_jit_nskip].lo = 0x10000; g_jit_skip[g_jit_nskip].hi = 0x100000000ull; g_jit_nskip++; }   // (not translated at all)
         else { g_jit_precise_lo = 0x10000; g_jit_precise_hi = 0x100000000ull; }   // translated in the precise form
     }

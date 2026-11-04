@@ -12,7 +12,7 @@ for APP in "$@"; do
     if [ -d "$APP/Contents/Frameworks/Electron Framework.framework" ]; then ARGS="--no-sandbox --use-mock-keychain --disable-gpu-sandbox --use-angle=metal --ignore-gpu-blocklist --enable-gpu-rasterization --user-data-dir=/tmp/rp/$N"; fi
   fi
   rm -f /tmp/rp/faults_$N
-  env -i HOME="$H" CFFIXED_USER_HOME="$H" USER="$USER" LOGNAME="$USER" TMPDIR="$TMPDIR" PATH=/usr/bin:/bin:/usr/sbin:/sbin MallocNanoZone=0 ANGLE_FEATURE_OVERRIDES_DISABLED=disableMetalOnNvidia REBAR_ALL_ARM64=1 REBAR_FAULT_LOG=/tmp/rp/faults_$N \
+  env -i HOME="$H" CFFIXED_USER_HOME="$H" USER="$USER" LOGNAME="$USER" TMPDIR="$TMPDIR" PATH=/usr/bin:/bin:/usr/sbin:/sbin MallocNanoZone=0 ANGLE_FEATURE_OVERRIDES_DISABLED=disableMetalOnNvidia REBAR_ALL_ARM64=1 $REBAR_EXTRA REBAR_FAULT_LOG=/tmp/rp/faults_$N \
     perl -e 'setpgrp(0,0); exec @ARGV' "$D/rebar" "$EXE" $ARGS > /tmp/rp/out_$N 2>&1 &
   PID=$!
   t=0; first=-; wins=0; state=running

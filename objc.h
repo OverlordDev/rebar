@@ -28,7 +28,7 @@ static SEL s_stringWithFormat, s_initWithFormat, s_appendFormat, s_stringByAppen
 static SEL s_predicateWithFormat_arguments;
 static SEL s_arrayWithObjects, s_initWithObjects, s_setWithObjects, s_orderedSetWithObjects;
 static SEL s_dictionaryWithObjectsAndKeys, s_initWithObjectsAndKeys;
-static SEL s_initWithColorsAndLocations, s_initWithColors_atLocations_colorSpace;
+static SEL s_initWithColorsAndLocations, s_initWithColors_atLocations_colorSpace, s_handleFailureInFunction, s_handleFailureInMethod;
 static SEL s_withObjects_count, s_initWithObjects_count, s_dictWith_forKeys_count, s_initWith_forKeys_count;
 static SEL s_setWithObjects_count, s_orderedSetWithObjects_count;
 static SEL s_raise_format, s_raise_format_arguments;
@@ -51,6 +51,7 @@ static void objc_bridge_init(void) {
     SELN(s_setWithObjects, "setWithObjects:"); SELN(s_orderedSetWithObjects, "orderedSetWithObjects:");
     SELN(s_dictionaryWithObjectsAndKeys, "dictionaryWithObjectsAndKeys:");
     SELN(s_initWithObjectsAndKeys, "initWithObjectsAndKeys:");
+    SELN(s_handleFailureInFunction, "handleFailureInFunction:file:lineNumber:description:"); SELN(s_handleFailureInMethod, "handleFailureInMethod:object:file:lineNumber:description:");
     SELN(s_initWithColorsAndLocations, "initWithColorsAndLocations:"); SELN(s_initWithColors_atLocations_colorSpace, "initWithColors:atLocations:colorSpace:");
     SELN(s_withObjects_count, "arrayWithObjects:count:"); SELN(s_initWithObjects_count, "initWithObjects:count:");
     SELN(s_setWithObjects_count, "setWithObjects:count:"); SELN(s_orderedSetWithObjects_count, "orderedSetWithObjects:count:");
@@ -264,6 +265,19 @@ static bool variadic_send(CPU *c, id self, SEL sel) {
         SEL target = sel == s_arrayWithObjects ? s_withObjects_count : sel == s_initWithObjects ? s_initWithObjects_count
                    : sel == s_setWithObjects ? s_setWithObjects_count : s_orderedSetWithObjects_count;
         c->x[0] = (uint64_t)send(self, target, objs, (uint64_t)n);
+        return true;
+    }
+    if (sel == s_handleFailureInFunction || sel == s_handleFailureInMethod) {   // NSAssertionHandler: the description is a format string with variadic arguments (on the arm64 stack); say what failed, then raise the exception the method would
+        bool fn = sel == s_handleFailureInFunction;
+        id fmt = (id)c->x[fn ? 5 : 6];
+        id str = send(send((id)objc_getClass("NSString"), s_alloc), s_initWithFormat_arguments, fmt, ap);
+        SEL utf8 = sel_registerName("UTF8String");
+        const char *where_ = (const char *)send((id)c->x[fn ? 2 : 4], utf8), *what = (const char *)send(str, utf8);
+        fprintf(stderr, "*** Assertion failure in %s%s, line %lld: %s\n", fn ? "" : "method, file ", where_ ? where_ : "?", (long long)c->x[fn ? 4 : 5], what ? what : "?");
+        if (getenv("REBAR_ASSERT_BT")) dump_backtrace(c);
+        id nm = send((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "NSInternalInconsistencyException");
+        id f2 = send((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "%@");
+        send((id)objc_getClass("NSException"), s_raise_format, nm, f2, str);
         return true;
     }
     if (sel == s_initWithColorsAndLocations) {   // NSGradient: (color, CGFloat location) pairs ending with a nil color: the first color is in x2, then on the stack: location, color, location, ...
@@ -636,6 +650,15 @@ H(h_method_setImplementation) { imp_register_runtime(c->x[1], method_getTypeEnco
 // swift_updateClassMetadata2 (completes a class's metadata: instance size, field offsets) and swift_getInitializedObjCClass (what a metadata accessor of a plain class ends with):
 // the classes that were held back at load (swift_class_needs_runtime_init) are given to the Objective-C runtime when the Swift runtime is through with them.
 static void swift_class_ready(uint64_t cls);
+// A Swift class that ObjC-style code (an alloc / init through a class reference, a message to the class) reaches before any Swift code asked for its metadata: the Objective-C
+// runtime would call the class's metadata initializer at realization; here the class was deferred, so do it before the use.
+static int g_nswift_deferred;
+static void swift_class_ensure_ready(CPU *c, uint64_t cls);
+static inline void swift_ensure_receiver(CPU *c, uint64_t cls) { if (__builtin_expect(g_nswift_deferred != 0, 0) && in_guest(cls)) swift_class_ensure_ready(c, cls); }
+H(h_objc_alloc_init) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_alloc_init"), false); }
+H(h_objc_alloc) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_alloc"), false); }
+H(h_objc_opt_new) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_opt_new"), false); }
+H(h_objc_allocWithZone) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_allocWithZone"), false); }
 H(h_swift_updateClassMetadata2) { uint64_t cls = c->x[0]; host_call(c, HOSTFN("swift_updateClassMetadata2"), false); swift_class_ready(cls); }
 H(h_swift_getInitializedObjCClass) { swift_class_ready(c->x[0]); host_call(c, HOSTFN("swift_getInitializedObjCClass"), false); }
 H(h_class_replaceMethod) { imp_register_runtime(c->x[2], (const char *)c->x[3]); c->x[2] = imp_wrap(c->x[2]); host_call(c, HOSTFN("class_replaceMethod"), false); c->x[0] = imp_unwrap(c->x[0]); }
@@ -650,6 +673,7 @@ H(h_class_getMethodImplementation) { host_call(c, HOSTFN("class_getMethodImpleme
 H(h_objc_msgSend) {
     id self = (id)c->x[0];
     SEL sel = (SEL)c->x[1];
+    swift_ensure_receiver(c, (uint64_t)self);
     if (__builtin_expect(g_gpu_sync != 0, 0)) gpu_hook(c, self, sel);
     if (__builtin_expect(g_dump_layers != 0, 0)) layer_dump_hook(c, self, sel);
     if (__builtin_expect(g_trace_msg != NULL, 0)) trace_msg(c, "send", self, sel);
@@ -907,7 +931,6 @@ static bool class_dropped(uint64_t c) { for (int k = 0; k < g_ndropped; k++) if 
 // class by then (data -> a class_rw_t on the heap), and the runtime writes the instance size into that. Such classes are not handed to the Objective-C runtime here; it learns
 // of them from the Swift runtime and finds them unrealized, as it does on a real Mac.
 static uint64_t g_swift_deferred[1024];
-static int g_nswift_deferred;
 static bool swift_deferred(uint64_t c) { for (int k = 0; k < g_nswift_deferred; k++) if (g_swift_deferred[k] == c) return true; return false; }
 static bool swift_class_needs_runtime_init(const GClass *c) {
     if (!(c->data & 3)) return false;   // not a Swift class
@@ -918,14 +941,22 @@ static bool swift_class_needs_runtime_init(const GClass *c) {
 }
 static void register_class_now(GClass *c);   // (below)
 // The Swift runtime has set the class up: now the Objective-C runtime may know it (and realize it, from the updated class_ro_t)
+static uint64_t g_swift_done[1024]; static int g_nswift_done;
+static bool swift_class_is_done(uint64_t cls) { for (int k = 0; k < g_nswift_done; k++) if (g_swift_done[k] == cls) return true; return false; }
 static void swift_class_ready(uint64_t cls) {
     if (!cls || !swift_deferred(cls)) return;
     GClass *c = (GClass *)cls;
-    static uint64_t done[1024]; static int ndone;
-    for (int k = 0; k < ndone; k++) if (done[k] == cls) return;
-    if (ndone < 1024) done[ndone++] = cls;
+    if (swift_class_is_done(cls)) return;
+    if (g_nswift_done < 1024) g_swift_done[g_nswift_done++] = cls;
     if (in_guest(c->superclass) && swift_deferred(c->superclass)) swift_class_ready(c->superclass);
     register_class_now(c);   // (the Swift runtime has realized the class in place by now; the runtime still has to learn its name and put it in its class table)
+}
+static void swift_class_ensure_ready(CPU *c, uint64_t cls) {
+    if (!swift_deferred(cls) || swift_class_is_done(cls)) return;
+    GClass *g = (GClass *)cls;
+    const struct { uint32_t flags, istart, isize, res; uint64_t ivl, name, bm, bp, iv, wl, props, init; } *ro = (const void *)class_ro(g);
+    if ((ro->flags & 0x40) && in_guest(ro->init)) call_guest(c, ro->init, cls, 0, 0, 0);   // RO_HAS_SWIFT_INITIALIZER: Class (*)(Class, void *)
+    swift_class_ready(cls);
 }
 static void register_class(GClass *c) {
     if (seen_test_and_set((uint64_t)c)) return;
@@ -973,6 +1004,21 @@ static void call_load(CPU *c, GClass *cls) {
 static uint64_t g_cur_slide;
 #define SA(s) ((s)->addr + g_cur_slide)  // runtime address of a section
 
+// The protocols compiled into the guest's images: the host runtime has not read them (it does not know the images), so NSProtocolFromString / objc_getProtocol look here first
+// (Google's Gemini asserted "Either instanceClass or instanceProtocol must be provided" when the protocol of one of its own classes came back nil).
+static uint64_t g_guest_protos[8192]; static int g_nguest_protos;
+static uint64_t guest_protocol_named(const char *name) {
+    for (int k = 0; k < g_nguest_protos; k++) { const char *n = *(const char **)(g_guest_protos[k] + 8); if (n && !strcmp(n, name)) return g_guest_protos[k]; }
+    return 0;
+}
+H(h_objc_getProtocol) { uint64_t g = guest_protocol_named(S(0)); if (g) { c->x[0] = g; return; } host_call(c, dlsym(RTLD_DEFAULT, "objc_getProtocol"), false); }
+H(h_NSProtocolFromString) {
+    static SEL utf8; if (!utf8) utf8 = sel_registerName("UTF8String");
+    const char *n = c->x[0] ? (const char *)send_h((id)c->x[0], utf8) : NULL;
+    uint64_t g = n ? guest_protocol_named(n) : 0;
+    if (g) { c->x[0] = g; return; }
+    host_call(c, dlsym(RTLD_DEFAULT, "NSProtocolFromString"), false);
+}
 // Step 1, for every image before any class is registered: selectors, protocol isas, and the
 // compiled method lists (read now: registering a class makes the runtime replace class_t.data).
 static void objc_prepare_image(GImage *img) {
@@ -992,6 +1038,7 @@ static void objc_prepare_image(GImage *img) {
         for (uint64_t o = 0; o < s->size; o += 8) {
             uint64_t *proto = *(uint64_t **)(SA(s) + o);
             if (in_guest((uint64_t)proto) && !proto[0]) proto[0] = (uint64_t)protocol;
+            if (in_guest((uint64_t)proto) && g_nguest_protos < 8192 && proto[1] > 0x10000) g_guest_protos[g_nguest_protos++] = (uint64_t)proto;
         }
     }
     if ((s = find_section(mh, "__objc_classlist")))

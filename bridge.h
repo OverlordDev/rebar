@@ -123,7 +123,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing; uint8_t heapret; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -1273,6 +1273,7 @@ static uint64_t tlv_thunk(void) {
 
 H(h_Unwind_Resume);
 H(h_Unwind_GetCFA); H(h_Unwind_SetGR); H(h_Unwind_SetIP); H(h_Unwind_GetIP); H(h_Unwind_GetGR);
+H(h_objc_getProtocol); H(h_NSProtocolFromString); H(h_objc_alloc_init); H(h_objc_alloc); H(h_objc_opt_new); H(h_objc_allocWithZone);
 H(h_dlopen); H(h_dlsym); H(h_dlclose); H(h_dladdr); H(h_dlerror);
 H(h_dyld_image_count); H(h_dyld_get_image_name); H(h_dyld_get_image_header);
 H(h_dyld_get_image_vmaddr_slide); H(h_dyld_register_func_for_add_image);
@@ -1306,7 +1307,7 @@ static const Special k_special[] = {
     {"_SSLGetEnabledCiphers", h_SSLGetEnabledCiphers}, {"_SSLGetSupportedCiphers", h_SSLGetSupportedCiphers}, {"_SSLSetEnabledCiphers", h_SSLSetEnabledCiphers}, {"_SSLGetNegotiatedCipher", h_SSLGetNegotiatedCipher}, {"_munmap", h_munmap}, {"_mprotect", h_mprotect}, {"_madvise", h_madvise},
     {"_vm_protect", h_vm_protect}, {"_mach_vm_protect", h_vm_protect}, {"_vm_allocate", h_vm_allocate},
     {"_mach_vm_allocate", h_vm_allocate}, {"_vm_deallocate", h_vm_deallocate}, {"_mach_vm_deallocate", h_vm_deallocate},
-    {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
+    {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
     {"_open$NOCANCEL", h_open}, {"_openat$NOCANCEL", h_openat}, {"_fcntl$NOCANCEL", h_fcntl},   // (the mode / argument of these variadic functions is on the stack on arm64, not in x2 / x3: Bun, Zig and Rust call the $NOCANCEL forms directly)
     {"_exit", h_exit}, {"_atexit", h_atexit}, {"___cxa_atexit", h_cxa_atexit}, {"___cxa_finalize", h_nop},
     {"_qsort", h_qsort}, {"_qsort_r", h_qsort_r}, {"_bsearch", h_bsearch}, {"__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv", h_dir_deref}, {"__ZNKSt3__14__fs10filesystem28recursive_directory_iterator13__dereferenceEv", h_rdir_deref}, {"_tsearch", h_tsearch}, {"_tfind", h_tfind}, {"_tdelete", h_tdelete}, {"_twalk", h_twalk}, {"_lfind", h_lfind}, {"_lsearch", h_lsearch},
@@ -1392,6 +1393,7 @@ static void *entstats_thread(void *arg) {
 // the interpreter from there. Does not return. The caller has checked that there is a handler (g_guest_fault_handler) and that t_fault_jb is set.
 static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
     int hk = sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : 2;
+    if (getenv("REBAR_TRACE_SIGNALS")) { fprintf(stderr, "[signal %d at guest pc %llx, address %llx, handler %llx]\n", sig, (unsigned long long)c->pc, (unsigned long long)addr, (unsigned long long)g_guest_fault_handler[hk]); dump_backtrace(c); }
     static __thread uint8_t sinfo[128], uctx[64], mctx[1024];
     memset(sinfo, 0, sizeof sinfo); memset(uctx, 0, sizeof uctx); memset(mctx, 0, sizeof mctx);
     *(int *)(sinfo) = sig; *(int *)(sinfo + 8) = code; *(uint64_t *)(sinfo + 24) = addr;
@@ -1782,12 +1784,57 @@ static uint64_t sb_proxy_vtable(void) {
     return (uint64_t)vt;
 }
 
+// A guest whose own operator new / delete replace the system's (Firefox's mozjemalloc in libmozglue) cannot hand its string buffers to the host's libc++: the host would free them with the system
+// free, and the buffers the host allocates would later be freed by the guest's free. In that case a long string is given to the host in a copy made with the host's malloc,
+// and what comes back is copied into a buffer from the guest's malloc (the old guest buffer is kept when it is big enough, or freed with the guest's free).
+static uint64_t find_guest_symbol(const char *name);
+static uint64_t g_gmalloc, g_gfree; static int g_galloc = -1;
+static bool guest_custom_alloc(void) {
+    if (g_galloc < 0) { g_gmalloc = find_guest_symbol("__Znwm"); g_gfree = find_guest_symbol("__ZdlPv"); g_galloc = g_gmalloc && g_gfree; }   // (libc++ allocates its string buffers with operator new / delete)
+    return g_galloc == 1;
+}
+typedef struct { void *hbuf; uint64_t gptr, gcap; } StrCopy;
+static void str_to_host_copy(uint8_t *d, const uint8_t *g, bool wide, StrCopy *sc) {
+    if (!(g[23] & 0x80)) { if (wide) wstr_to_host(d, g); else str_to_host(d, g); return; }
+    uint64_t gp = *(const uint64_t *)g, sz = *(const uint64_t *)(g + 8), cap = *(const uint64_t *)(g + 16) & ~(1ull << 63);
+    unsigned es = wide ? 4 : 1;
+    if (cap < sz + 1) cap = sz + 1;
+    void *hb = malloc(cap * es);
+    memcpy(hb, (const void *)gp, (sz + 1) * es);
+    sc->hbuf = hb; sc->gptr = gp; sc->gcap = cap;
+    uint64_t o[3] = {cap | 1, sz, (uint64_t)hb};
+    memcpy(d, o, 24);
+}
+// the host's string d (host layout) back into the guest string g; returns through *hdata / *gdata where the characters were and are now (for a pointer the call returned into them)
+static void str_from_host_copy(uint8_t *g, const uint8_t *d, bool wide, StrCopy *sc, uint64_t *hdata, uint64_t *gdata) {
+    *hdata = *gdata = 0;
+    if (!(d[0] & 1)) {   // short now: the guest's long buffer, if there was one, is not needed any more
+        if (sc->gptr) { call_guest(cur_cpu(), g_gfree, sc->gptr, 0, 0, 0); }
+        if (sc->hbuf) free(sc->hbuf);
+        if (wide) wstr_to_guest(g, d); else str_to_guest(g, d);
+        return;
+    }
+    uint64_t cap = *(const uint64_t *)d & ~1ull, sz = *(const uint64_t *)(d + 8), hp = *(const uint64_t *)(d + 16);
+    unsigned es = wide ? 4 : 1;
+    uint64_t gp;
+    if (sc->gptr && hp == (uint64_t)sc->hbuf && cap <= sc->gcap) { gp = sc->gptr; cap = sc->gcap; }   // untouched capacity: back into the guest's own buffer
+    else { gp = call_guest(cur_cpu(), g_gmalloc, cap * es, 0, 0, 0); if (sc->gptr) call_guest(cur_cpu(), g_gfree, sc->gptr, 0, 0, 0); }
+    memcpy((void *)gp, (const void *)hp, (sz + 1) * es);
+    uint64_t o[3] = {gp, sz, cap | (1ull << 63)};
+    memcpy(g, o, 24);
+    *hdata = hp; *gdata = gp;
+    free((void *)hp);   // (a host buffer the host call allocated, or the copy given to it; if the host reallocated, it already freed ours)
+    sc->hbuf = NULL;
+}
+
 static void string_call(CPU *c, Stub *s) {
     const StrSpec *sp = s->str;
     uint64_t gx[9];
     memcpy(gx, c->x, sizeof gx);
     uint8_t tmp[8][24], rtmp[24] = {0};
     int own[8] = {0};
+    bool cust = guest_custom_alloc() && !sp->sb;
+    StrCopy sc[8]; memset(sc, 0, sizeof sc); uint64_t hd[8] = {0}, gd[8] = {0};
     uint8_t wb = sp->wb;
     for (int k = 0; k < 8; k++) {
         if (!(sp->mask >> k & 1)) continue;
@@ -1796,6 +1843,7 @@ static void string_call(CPU *c, Stub *s) {
             if ((sp->mask >> j & 1) && own[j] == j && gx[j] == gx[k]) { own[k] = j; if (sp->wb >> k & 1) wb |= 1 << j; break; }
         if (own[k] == k) {
             if (sp->uninit >> k & 1) memset(tmp[k], 0, 24);
+            else if (cust) str_to_host_copy(tmp[k], (const uint8_t *)gx[k], sp->wide >> k & 1, &sc[k]);
             else if (sp->wide >> k & 1) wstr_to_host(tmp[k], (const uint8_t *)gx[k]);
             else str_to_host(tmp[k], (const uint8_t *)gx[k]);
         }
@@ -1812,12 +1860,16 @@ static void string_call(CPU *c, Stub *s) {
     host_call(c, s->host, s->sret || sp->sret);
     t_stk = NULL;
     if (sbc) sb_leave((uint8_t *)gx[0]);
-    if (t_landed) return;  // an exception went to a guest handler: the guest's strings stay as they were
+    if (t_landed) { for (int k = 0; k < 8; k++) if (sc[k].hbuf && (*(uint64_t *)(tmp[k] + 16) == (uint64_t)sc[k].hbuf)) free(sc[k].hbuf); return; }  // an exception went to a guest handler: the guest's strings stay as they were
     uint64_t r = c->x[0];
+    if (cust && sp->dtor && sc[0].hbuf) { if (sc[0].gptr) call_guest(c, g_gfree, sc[0].gptr, 0, 0, 0); sc[0].hbuf = NULL; }   // a destructor: the host freed its copy, the guest's own buffer is the guest allocator's to free
     for (int k = 0; k < 8; k++) {
         if (!(sp->mask >> k & 1) || own[k] != k) continue;
         bool wide = sp->wide >> k & 1;
-        if (wb >> k & 1) { if (wide) wstr_to_guest((uint8_t *)gx[k], tmp[k]); else str_to_guest((uint8_t *)gx[k], tmp[k]); }
+        if (cust && (wb >> k & 1)) str_from_host_copy((uint8_t *)gx[k], tmp[k], wide, &sc[k], &hd[k], &gd[k]);
+        else if (cust && sc[k].hbuf) { if ((tmp[k][0] & 1) && *(uint64_t *)(tmp[k] + 16) == (uint64_t)sc[k].hbuf) free(sc[k].hbuf); sc[k].hbuf = NULL; }   // (not written back: the copy is just dropped)
+        else if (wb >> k & 1) { if (wide) wstr_to_guest((uint8_t *)gx[k], tmp[k]); else str_to_guest((uint8_t *)gx[k], tmp[k]); }
+        if (cust && hd[k] && r >= hd[k] && r <= hd[k] + (*(uint64_t *)((uint8_t *)gx[k] + 8) + 1) * (wide ? 4 : 1)) { r = gd[k] + (r - hd[k]); continue; }   // a pointer into the characters
         uint64_t t = (uint64_t)tmp[k];
         if (ik >= 0 && k == 0) {   // insert / erase return an iterator into the string: the same offset in the guest's characters (after the write-back, which may have moved them)
             const uint8_t *g = (const uint8_t *)gx[0]; uint64_t gdata = (g[23] & 0x80) ? *(const uint64_t *)g : (uint64_t)g, hdata = (tmp[0][0] & 1) ? *(const uint64_t *)(tmp[0] + 16) : (uint64_t)tmp[0] + 1;
@@ -1827,13 +1879,29 @@ static void string_call(CPU *c, Stub *s) {
         else if (r > t && r < t + 24 && !(tmp[k][0] & 1)) r = gx[k] + (r - t - (wide ? 4 : 1));  // pointer into the inline characters
     }
     if (sp->sret) {
-        if (sp->sretw) wstr_to_guest((uint8_t *)gx[8], rtmp); else str_to_guest((uint8_t *)gx[8], rtmp);
+        if (cust) { StrCopy none = {0}; uint64_t h1, g1; str_from_host_copy((uint8_t *)gx[8], rtmp, sp->sretw, &none, &h1, &g1); }
+        else if (sp->sretw) wstr_to_guest((uint8_t *)gx[8], rtmp); else str_to_guest((uint8_t *)gx[8], rtmp);
         r = gx[8];
     }
     for (int k = 2; k < 9; k++) c->x[k] = gx[k];  // (x1 may be the second half of a result, as in a string_view)
     c->x[0] = r;
 }
 
+// A guest with its own malloc and free (Firefox) frees what it gets from these host functions with its own free: copy the result into memory from the guest's allocator (operator new /
+// delete are what libc++ and the guest agree on, but `free` of strdup's result is the guest's: use the guest's malloc for these, which the guest's free matches).
+static void heapret_fix(CPU *c, Stub *s, uint64_t out_ptr) {
+    static uint64_t gm, gf; if (!gm) { gm = find_guest_symbol("_malloc"); gf = find_guest_symbol("_free"); }
+    if (!gm || !gf) return;
+    uint64_t p = s->heapret == 2 ? (uint64_t)((int)c->x[0] >= 0 ? *(uint64_t *)out_ptr : 0) : c->x[0];
+    if (s->heapret == 1 && !strcmp(s->name, "_getcwd") && out_ptr) return;   // (getcwd into the caller's own buffer returns that buffer)
+    if (!p || p < 0x10000) return;
+    size_t len = strlen((const char *)p);
+    uint64_t g = call_guest(c, gm, len + 1, 0, 0, 0);
+    if (!g) return;
+    memcpy((void *)g, (const void *)p, len + 1);
+    free((void *)p);
+    if (s->heapret == 2) *(uint64_t *)out_ptr = g; else c->x[0] = g;
+}
 static inline void apply_landing(CPU *c) {
     if (t_landed) { t_landed = false; c->x[0] = t_pend_x0; c->x[1] = t_pend_x1; }
 }
@@ -2046,8 +2114,10 @@ static void stub_call_inner(CPU *c) {
     else {
         fprintf(stderr, "rebar: unresolved import %s%s%s%s\n", s->name,
                 s->lib ? " (from " : "", s->lib ? s->lib : "", s->lib ? ")" : "");
+        dump_backtrace(c);
         exit(127);
     }
+    if (s->heapret && !t_landed && guest_custom_alloc()) heapret_fix(c, s, this0);
     if (s->thisret && !t_landed) c->x[0] = this0;  // a constructor or destructor: arm64 returns this
     switch (s->narrow) {  // x86_64 leaves the upper bits of rax undefined for a bool/char/short result
     case 'B': case 'C': c->x[0] = (uint8_t)c->x[0]; break;
@@ -2221,6 +2291,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
         fprintf(stderr, "rebar: warning: %s takes libc++ objects whose arm64 layout rebar does not convert; expect it to misbehave\n", name);
     if (host && !h) g_stubs[idx].thisret = returns_this(name);
     if (host && !h) g_stubs[idx].throwing = !strcmp(name, "___cxa_throw");
+    g_stubs[idx].heapret = !strncmp(name, "_realpath", 9) || !strcmp(name, "_strdup") || !strcmp(name, "_strndup") || !strcmp(name, "_getcwd") ? 1 : (!strcmp(name, "_asprintf") || !strcmp(name, "_vasprintf") ? 2 : 0);   // host functions that return memory from the system's malloc (see heapret_fix)
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;
     if (host && !h) g_stubs[idx].swift = name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S');   // a Swift symbol: Swift's calling convention
     if (host && !h) g_stubs[idx].maps = !strcmp(name, "_vm_map") || !strcmp(name, "_mach_vm_map") || !strcmp(name, "_vm_remap") || !strcmp(name, "_mach_vm_remap");
