@@ -602,6 +602,23 @@ static void wrap_ctx(CPU *c, int arg, size_t bytes, uint8_t *tmp) {
 H(h_CFRunLoopObserverCreate) { uint8_t t[40]; c->x[4] = imp_wrap(c->x[4]); wrap_ctx(c, 5, 40, t); host_call(c, HOSTFN("CFRunLoopObserverCreate"), false); }
 H(h_CFRunLoopTimerCreate) { uint8_t t[40]; c->x[5] = imp_wrap(c->x[5]); wrap_ctx(c, 6, 40, t); host_call(c, HOSTFN("CFRunLoopTimerCreate"), false); }
 H(h_SSLSetIOFuncs) { c->x[1] = imp_wrap_any(c->x[1], true); c->x[2] = imp_wrap_any(c->x[2], true); host_call(c, HOSTFN("SSLSetIOFuncs"), false); }   // SecureTransport calls the guest's read / write functions (.NET's System.Net.Security)
+// CGGetActiveDisplayList is empty on this Mac (the display is online but not "active" for Quartz), while the main display has valid bounds and a mode: GTK and others that count the
+// active displays found no monitor. Answer with the main display when the host has none.
+H(h_CGGetActiveDisplayList) {
+    uint32_t max = (uint32_t)c->x[0]; uint32_t *ids = (uint32_t *)c->x[1]; uint32_t *cnt = (uint32_t *)c->x[2];
+    int (*real)(uint32_t, uint32_t *, uint32_t *) = HOSTFN("CGGetActiveDisplayList");
+    uint32_t n = 0; int r = real(max, ids, &n);
+    if (r == 0 && n == 0 && max >= 1 && ids) { uint32_t (*mainid)(void) = HOSTFN("CGMainDisplayID"); ids[0] = mainid(); n = 1; }
+    if (cnt) *cnt = n;
+    c->x[0] = (uint64_t)(int64_t)r;
+}
+H(h_CVDisplayLinkCreateWithActiveCGDisplays) {   // (see above) the link of the main display when there is no active one
+    int (*real)(void *) = HOSTFN("CVDisplayLinkCreateWithActiveCGDisplays"); void *out = (void *)c->x[0];
+    int r = real(out);
+    if (r != 0) { uint32_t (*mainid)(void) = HOSTFN("CGMainDisplayID"); int (*one)(uint32_t, void *) = HOSTFN("CVDisplayLinkCreateWithCGDisplay"); r = one(mainid(), out); }
+    c->x[0] = (uint64_t)(int64_t)r;
+}
+H(h_CGDisplayIsActive) { uint32_t (*mainid)(void) = HOSTFN("CGMainDisplayID"); int (*real)(uint32_t) = HOSTFN("CGDisplayIsActive"); c->x[0] = real((uint32_t)c->x[0]) || (uint32_t)c->x[0] == mainid(); }
 H(h_CFRunLoopSourceCreate) { uint8_t t[80]; wrap_ctx(c, 2, 80, t); host_call(c, HOSTFN("CFRunLoopSourceCreate"), false); }
 // REBAR_DISPLAY_HZ=<n>: the display link of the guest ticks at n Hz instead of the display's own rate.  A translated browser needs ~15-17 ms for the frame of
 // a scroll; on a 144 Hz display (ticks 6.9 ms apart) a frame that takes 14 ms waits for the third tick (20.8 ms, 48 fps), at a steady 60 Hz it fits in one tick.
