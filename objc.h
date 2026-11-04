@@ -626,7 +626,7 @@ H(h_CGGetActiveDisplayList) {
 H(h_CVDisplayLinkCreateWithActiveCGDisplays) {   // (see above) the link of the main display when there is no active one
     int (*real)(void *) = HOSTFN("CVDisplayLinkCreateWithActiveCGDisplays"); void *out = (void *)c->x[0];
     int r = real(out);
-    if (r != 0) { uint32_t (*mainid)(void) = HOSTFN("CGMainDisplayID"); int (*one)(uint32_t, void *) = HOSTFN("CVDisplayLinkCreateWithCGDisplay"); r = one(mainid(), out); }
+    if (r != 0 && !getenv("REBAR_NO_DISPLAYLINK_FALLBACK")) { uint32_t (*mainid)(void) = HOSTFN("CGMainDisplayID"); int (*one)(uint32_t, void *) = HOSTFN("CVDisplayLinkCreateWithCGDisplay"); r = one(mainid(), out); }
     c->x[0] = (uint64_t)(int64_t)r;
 }
 H(h_CGDisplayIsActive) { uint32_t (*mainid)(void) = HOSTFN("CGMainDisplayID"); int (*real)(uint32_t) = HOSTFN("CGDisplayIsActive"); c->x[0] = real((uint32_t)c->x[0]) || (uint32_t)c->x[0] == mainid(); }

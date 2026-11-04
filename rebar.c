@@ -241,7 +241,8 @@ static uint64_t g_stub_base, g_stub_size, g_guest_lo, g_guest_size;
 static void stub_call(CPU *c);
 static bool guest_owned_code(uint64_t pc);
 static void guest_code_range(uint64_t *lo, uint64_t *len);  // the range guest_owned_code last matched  // memory the guest mapped itself: generated code (a JIT) is interpreted too
-static uint64_t g_watch_pc;   // REBAR_WATCH=<hex pc>: print the registers every time execution reaches it
+static uint64_t g_watch_pc;   // REBAR_WATCH=<hex pc>[,<hex pc>...]: print the registers every time execution reaches it
+static uint64_t g_watch_more[7];
 static uint64_t g_wmem, g_wmem_last;  // REBAR_WATCH_MEM=<hex addr>: report the instruction that changes the 8 bytes there
 static bool g_wmem_ok;
 static void watch_mem_check(CPU *c) {
@@ -703,7 +704,7 @@ fetch:
 L_dbg:  // REBAR_WATCH, REBAR_WATCH_MEM and -t: the debugging table sends every instruction through here
     c->tick++;
     if (g_wmem != 0) watch_mem_check(c);
-    if (g_watch_pc != 0 && c->pc == g_watch_pc) {
+    if (g_watch_pc != 0 && (c->pc == g_watch_pc || c->pc == g_watch_more[0] || c->pc == g_watch_more[1] || c->pc == g_watch_more[2] || c->pc == g_watch_more[3])) {
         fprintf(stderr, "[watch %llx]", (unsigned long long)c->pc);
         for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)c->x[k]);
         fprintf(stderr, " sp=%llx\n", (unsigned long long)c->sp);
@@ -1625,7 +1626,7 @@ int main(int argc, char **argv) {
     g_trace_msg = getenv("REBAR_TRACE_MSG");
     if (getenv("REBAR_TRACE_MEM")) g_trace_mem = strtoull(getenv("REBAR_TRACE_MEM"), NULL, 16);
     if (getenv("REBAR_WATCH_MEM")) g_wmem = strtoull(getenv("REBAR_WATCH_MEM"), NULL, 16);
-    if (getenv("REBAR_WATCH")) g_watch_pc = strtoull(getenv("REBAR_WATCH"), NULL, 16);
+    if (getenv("REBAR_WATCH")) { const char *w = getenv("REBAR_WATCH"); g_watch_pc = strtoull(w, NULL, 16); int n = 0; for (const char *q = strchr(w, ','); q && n < 4; q = strchr(q + 1, ',')) g_watch_more[n++] = strtoull(q + 1, NULL, 16); }
     if (getenv("REBAR_BACKTRACE_ON_USR2")) {  // debugging aid: `kill -USR2 <pid>` prints the guest backtrace of the thread that takes the signal
         struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = usr2_backtrace; sigaction(SIGUSR2, &sa, NULL);
     }
