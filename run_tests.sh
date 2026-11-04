@@ -203,31 +203,25 @@ hbcheck brew_lua 42 lua -e 'print(6*7)'
 [ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
 hbcheck brew_tmux "tmux 3.8" tmux -V
 
-# iOS: an iOS-platform arm64 command-line program, packed as an IPA and started with tools/ipa.py (needs the iphoneos SDK)
+# iOS apps from IPAs (tools/ipa.py): iOS-platform arm64 programs packed as .ipa; the UIKit and SwiftUI ones run with rebar-ios from a generated Mac Catalyst host bundle (needs a window server session)
+iosipa() {  # name, source, expected-output-file, swiftc|clang, extra args to the compiler; the app is IosApp, family iPhone, runs 60 s at most
+    nm=$1; src=$2; ex=$3; cc=$4; shift 4
+    rm -rf $T/$nm && mkdir -p $T/$nm/Payload/IosApp.app
+    if [ $cc = swiftc ]; then xcrun -sdk iphoneos swiftc -parse-as-library -target arm64-apple-ios16.0 -O "$@" $src -o $T/$nm/Payload/IosApp.app/IosApp 2>/dev/null
+    else xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios15.0 -fobjc-arc -w "$@" $src -o $T/$nm/Payload/IosApp.app/IosApp 2>/dev/null; fi
+    printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosApp</string><key>CFBundleIdentifier</key><string>dev.rebar.%s</string><key>CFBundleName</key><string>%s</string><key>MinimumOSVersion</key><string>15.0</string><key>UIDeviceFamily</key><array><integer>1</integer></array></dict></plist>' $nm $nm > $T/$nm/Payload/IosApp.app/Info.plist
+    (cd $T/$nm && zip -qr ../$nm.ipa Payload)
+    printf "$ex" > $T/a
+    run_to 60 $T/b python3 -I ../tools/ipa.py run $T/$nm.ipa x y; grep -v '^nvrm' $T/b > $T/b2; check $nm $T/a $T/b2
+}
 if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
-    rm -rf $T/ipa && mkdir -p $T/ipa/Payload/IosCli.app
-    xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios15.0 -fobjc-arc -framework Foundation ios_cli.m -o $T/ipa/Payload/IosCli.app/IosCli 2>/dev/null
-    printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosCli</string><key>CFBundleIdentifier</key><string>dev.rebar.ioscli</string><key>MinimumOSVersion</key><string>15.0</string></dict></plist>' > $T/ipa/Payload/IosCli.app/Info.plist
-    (cd $T/ipa && zip -qr ../IosCli.ipa Payload)
-    printf 'json {"k":[1,2,3]}\nbundle dev.rebar.ioscli\nhw.machine arm64\nargs 2\n' > $T/a
-    REBAR=$PWD/$R run_to 30 $T/b python3 -I ../tools/ipa.py run $T/IosCli.ipa x y; grep -v '^nvrm' $T/b > $T/b2; check ios_cli_ipa $T/a $T/b2
-    # the same for a UIKit app: runs from a generated Mac Catalyst host bundle with rebar-ios (needs a window server session)
+    iosipa ios_cli_ipa ios_cli.m 'json {"k":[1,2,3]}\nbundle dev.rebar.ios_cli_ipa\nhw.machine arm64\nargs 2\n' clang -framework Foundation
     if [ -x ../rebar-ios ]; then
-        rm -rf $T/ipaui && mkdir -p $T/ipaui/Payload/IosUi.app
-        xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios15.0 -fobjc-arc -framework UIKit -framework Foundation -w ios_ui.m -o $T/ipaui/Payload/IosUi.app/IosUi 2>/dev/null
-        printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosUi</string><key>CFBundleIdentifier</key><string>dev.rebar.iosui</string><key>MinimumOSVersion</key><string>15.0</string><key>UIDeviceFamily</key><array><integer>1</integer></array></dict></plist>' > $T/ipaui/Payload/IosUi.app/Info.plist
-        (cd $T/ipaui && zip -qr ../IosUi.ipa Payload)
-        printf 'launched idiom 0 window key 1 label UIKit under rebar\nbye\n' > $T/a
-        run_to 60 $T/b python3 -I ../tools/ipa.py run $T/IosUi.ipa; grep -v '^nvrm' $T/b > $T/b2; check ios_uikit_ipa $T/a $T/b2
-        # and a SwiftUI one (state, Button, List, NavigationStack)
-        rm -rf $T/ipasw && mkdir -p $T/ipasw/Payload/IosSw.app
-        xcrun -sdk iphoneos swiftc -parse-as-library -target arm64-apple-ios16.0 -O ios_swiftui.swift -o $T/ipasw/Payload/IosSw.app/IosSw 2>/dev/null
-        printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosSw</string><key>CFBundleIdentifier</key><string>dev.rebar.iossw</string><key>MinimumOSVersion</key><string>16.0</string><key>UIDeviceFamily</key><array><integer>1</integer></array></dict></plist>' > $T/ipasw/Payload/IosSw.app/Info.plist
-        (cd $T/ipasw && zip -qr ../IosSw.ipa Payload)
-        printf 'appeared count 0\nbye\n' > $T/a
-        run_to 60 $T/b python3 -I ../tools/ipa.py run $T/IosSw.ipa; grep -v '^nvrm' $T/b > $T/b2; check ios_swiftui_ipa $T/a $T/b2
+        iosipa ios_uikit_ipa ios_ui.m 'launched idiom 0 window key 1 label UIKit under rebar\nbye\n' clang -framework UIKit -framework Foundation
+        iosipa ios_uikit2_ipa ios_uikit2.m 'late: window {{0, 0}, {400, 800}} root.view {{0, 0}, {400, 800}} scene 1\nautolayout box {{20, 100}, {200, 100}}\nstack {{0, 300}, {100, 170}}\napp state 0 scene state 0\nnav depth 2 top TVC rows 5\ncell2 text row 2 table frame {{0, 0}, {400, 800}} visible 5\nimage 4x4 scale 1 pixel ff0000ff\ntext width ok 1 height ok 1\ndefaults v\nidiom 0\nalert actions 1\nanimation finished 1 alpha 0\n' clang -framework UIKit -framework Foundation -framework CoreGraphics
+        iosipa ios_swiftui_ipa ios_swiftui.swift 'appeared count 0\nbye\n' swiftc
     fi
-else echo "SKIP ios_cli_ipa (no iphoneos SDK)"; fi
+else echo "SKIP iOS IPA tests (no iphoneos SDK)"; fi
 
 echo "passed $pass, failed $fail"
 [ $fail = 0 ]

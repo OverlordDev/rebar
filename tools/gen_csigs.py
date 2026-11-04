@@ -112,12 +112,16 @@ UMBRELLA_ALL = UMBRELLA + ('#include <os/lock.h>\n#include <os/log.h>\n#include 
                            '#include <objc/runtime.h>\n#include <CoreFoundation/CoreFoundation.h>\n#include <Security/Security.h>\n'
                            '#include <IOKit/IOKitLib.h>\n#include <SystemConfiguration/SystemConfiguration.h>\n')
 
-def parse_tu(out, text):
+def parse_tu(out, text, catalyst=False):
     src = os.path.join(os.path.dirname(out), 'csigs_umbrella.m')
     open(src, 'w').write(text)
     sdk = subprocess.check_output(['xcrun', '--show-sdk-path']).decode().strip()
-    args = (ctypes.c_char_p * 8)(b'-x', b'objective-c', b'-arch', b'x86_64', b'-isysroot', sdk.encode(), b'-fmodules', b'-w')
-    tu = parse(createIndex(0, 0), src.encode(), args, 7, None, 0, 0)
+    a = [b'-x', b'objective-c', b'-arch', b'x86_64', b'-isysroot', sdk.encode(), b'-fmodules', b'-w']
+    if catalyst:   # UIKit of Mac Catalyst (iOS apps run on it): UIGeometry's NSStringFromCGRect & co.
+        a = [b'-x', b'objective-c', b'-target', b'x86_64-apple-ios15.0-macabi', b'-isysroot', sdk.encode(),
+             b'-iframework', (sdk + '/System/iOSSupport/System/Library/Frameworks').encode(), b'-fmodules', b'-w']
+    args = (ctypes.c_char_p * len(a))(*a)
+    tu = parse(createIndex(0, 0), src.encode(), args, len(a), None, 0, 0)
     if not tu: sys.exit('parse failed')
     return tu
 
@@ -138,6 +142,7 @@ def main(out):
             if flag: found['_' + nm] = ''.join(parts)
         return 1
     visit(tuCursor(parse_tu(out, UMBRELLA)), VISITOR(visitor), None)
+    visit(tuCursor(parse_tu(out, '#import <UIKit/UIKit.h>\n', True)), VISITOR(visitor), None)
 
     def narrow_visitor(cur, parent, _):
         if curKind(cur) == FUNCTION_DECL and storage(cur) != STATIC:
