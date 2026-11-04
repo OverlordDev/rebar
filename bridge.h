@@ -126,7 +126,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -2243,6 +2243,34 @@ static bool host_fn_returns_string(const char *sym) {   // (char only: the wide 
     if (strstr(sym, "moneypunct") && strstr(sym, "IcL")) return strstr(sym, "11do_grouping") || strstr(sym, "14do_curr_symbol") || strstr(sym, "16do_positive_sign") || strstr(sym, "16do_negative_sign");
     return false;
 }
+// REBAR_PATHMAP=<from>=<to>[:<from>=<to>...]: file names the guest passes to the system calls and library functions below that start with <from> are looked up under <to> (a program built
+// for /opt/homebrew running from another prefix, an iOS app's container). The first argument that is a path of a call is rewritten in place of its register, for the call only.
+static struct { const char *from, *to; size_t fl, tl; } g_pathmap[8]; static int g_npathmap;
+static void pathmap_init(void) {
+    static bool done; if (done) return; done = true;
+    const char *e = getenv("REBAR_PATHMAP"); if (!e) return;
+    char *copy = strdup(e); for (char *tok = strtok(copy, ":"); tok && g_npathmap < 8; tok = strtok(NULL, ":")) {
+        char *eq = strchr(tok, '='); if (!eq) continue; *eq = 0; g_pathmap[g_npathmap].from = tok; g_pathmap[g_npathmap].to = eq + 1; g_pathmap[g_npathmap].fl = strlen(tok); g_pathmap[g_npathmap].tl = strlen(eq + 1); g_npathmap++; }
+}
+static const char *pathmap_apply(const char *p) {
+    static __thread char ring[8][PATH_MAX]; static __thread int slot;
+    for (int k = 0; k < g_npathmap; k++)
+        if (!strncmp(p, g_pathmap[k].from, g_pathmap[k].fl) && (p[g_pathmap[k].fl] == '/' || !p[g_pathmap[k].fl])) {
+            char *o = ring[slot++ & 7]; snprintf(o, PATH_MAX, "%s%s", g_pathmap[k].to, p + g_pathmap[k].fl); return o; }
+    return p;
+}
+static uint8_t pathmask_for(const char *name) {   // bit k: argument k is a path
+    static const struct { const char *n; uint8_t m; } t[] = {
+        {"_open", 1}, {"_openat", 2}, {"_stat", 1}, {"_lstat", 1}, {"_fstatat", 2}, {"_access", 1}, {"_faccessat", 2}, {"_opendir", 1}, {"_fopen", 1}, {"_freopen", 1}, {"_readlink", 1}, {"_readlinkat", 2},
+        {"_realpath", 1}, {"_execve", 1}, {"_execv", 1}, {"_execvp", 1}, {"_posix_spawn", 2}, {"_posix_spawnp", 2}, {"_chdir", 1}, {"_mkdir", 1}, {"_mkdirat", 2}, {"_rmdir", 1}, {"_unlink", 1},
+        {"_unlinkat", 2}, {"_rename", 3}, {"_chmod", 1}, {"_chown", 1}, {"_lchown", 1}, {"_utimes", 1}, {"_symlink", 2}, {"_link", 3}, {"_truncate", 1}, {"_statfs", 1}, {"_pathconf", 1}, {"_scandir", 1},
+        {"_getattrlist", 1}, {"_setxattr", 1}, {"_getxattr", 1}, {"_listxattr", 1}, {"_removexattr", 1}, {"_mkfifo", 1}, {"_mknod", 1}, {"_creat", 1}, {"_dlopen", 1}, {"_glob", 1}, {"_utime", 1}, {"_lutimes", 1},
+        {"_chroot", 1}, {"_ftw", 1}, {"_nftw", 1}, {"_fts_open", 1}, {"_copyfile", 3}, {"_clonefile", 3}, {"_renamex_np", 3}, {"_exchangedata", 3}, {"_mount", 2}, {"_unmount", 1}, {"_utimensat", 2}, {"_fchmodat", 2},
+    };
+    char base[64]; size_t n = 0; while (name[n] && name[n] != '$' && n < 63) { base[n] = name[n]; n++; } base[n] = 0;
+    for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) if (!strcmp(base, t[k].n)) return t[k].m;
+    return 0;
+}
 static void stub_call_inner(CPU *c) {
     { static int chk = -1; if (chk < 0) chk = getenv("REBAR_CHECK_ALIGN") != NULL; if (chk && ((uintptr_t)__builtin_frame_address(0) & 15) != 0) { static int n; if (n++ < 6) fprintf(stderr, "[align] stub_call_inner frame %p misaligned (pc %llx, lr %llx)\n", __builtin_frame_address(0), (unsigned long long)c->pc, (unsigned long long)c->x[30]); } }
     if (c->pc - g_stub_base >= g_stub_size) {  // an x86 host function reached through a pointer
@@ -2301,6 +2329,7 @@ static void stub_call_inner(CPU *c) {
     if (idx >= g_nstubs) die(c, "jump into unallocated stub", 0);
     Stub *s = &g_stubs[idx];
     t_last_stub = s;
+    if (__builtin_expect(g_npathmap != 0, 0) && s->pathmask) for (int k = 0; k < 4; k++) if (s->pathmask >> k & 1) { uint64_t a = c->x[k]; if (a > 0x10000) { const char *np = pathmap_apply((const char *)a); if (np != (const char *)a) c->x[k] = (uint64_t)np; } }
     uint64_t this0 = c->x[0], arg1_in = c->x[1];
     RingEnt *ring_ent = &t_ring[t_ring_n++ & 127];
     *ring_ent = (RingEnt){s->name, c->x[0], c->x[1], c->x[2], c->x[30], 0};
@@ -2565,6 +2594,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
         fprintf(stderr, "rebar: warning: %s takes libc++ objects whose arm64 layout rebar does not convert; expect it to misbehave\n", name);
     if (host && !h) g_stubs[idx].thisret = returns_this(name);
     if (host && !h) g_stubs[idx].throwing = !strcmp(name, "___cxa_throw");
+    g_stubs[idx].pathmask = pathmask_for(name);
     g_stubs[idx].async_host = host && name && (!strcmp(name, "_swift_task_switch") || !strcmp(name, "_swift_continuation_await") || !strcmp(name, "_swift_task_future_wait") || !strcmp(name, "_swift_task_future_wait_throwing") || !strcmp(name, "_swift_task_group_wait_next_throwing") || !strcmp(name, "_swift_asyncLet_get") || !strcmp(name, "_swift_asyncLet_get_throwing") || !strcmp(name, "_swift_asyncLet_finish") || !strcmp(name, "_swift_task_run_inline") || (name[0] == '_' && name[1] == '$' && strstr(name, "Ya") && (strstr(name, "YaF") || strstr(name, "YaKF") || strstr(name, "Yacig") || strstr(name, "YaKcfC"))));
     g_stubs[idx].heapret = !strncmp(name, "_realpath", 9) || !strcmp(name, "_strdup") || !strcmp(name, "_strndup") || !strcmp(name, "_getcwd") ? 1 : (!strcmp(name, "_asprintf") || !strcmp(name, "_vasprintf") ? 2 : 0);   // host functions that return memory from the system's malloc (see heapret_fix)
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;

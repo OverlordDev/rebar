@@ -153,6 +153,7 @@ def rebar_env():
     e["HOMEBREW_PREFIX"] = PREFIX
     e["SSL_CERT_FILE"] = e.get("SSL_CERT_FILE", "/etc/ssl/cert.pem")
     e["MallocNanoZone"] = "0"
+    e["REBAR_PATHMAP"] = "/opt/homebrew=" + PREFIX + (":" + e["REBAR_PATHMAP"] if e.get("REBAR_PATHMAP") else "")   # bottles are built for /opt/homebrew: git's exec path, templates, openssl's certificate dir
     return e
 
 def main():

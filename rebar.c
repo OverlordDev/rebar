@@ -1632,6 +1632,7 @@ int main(int argc, char **argv) {
     }
     g_no_simd_fast = getenv("REBAR_NO_SIMD_FAST") != NULL;
     g_no_async_tail = getenv("REBAR_NO_ASYNC_TAIL") != NULL;
+    pathmap_init();
     if (getenv("REBAR_STATS")) atexit(print_stats);  // instructions executed, and the speed
     if (ai < argc && !strcmp(argv[ai], "-t")) { g_trace = true; ai++; }
     if (ai < argc && !strcmp(argv[ai], "--jit-selftest")) {
