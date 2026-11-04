@@ -88,6 +88,9 @@ run_to 30 $T/a ./t81_x86; run_to 30 $T/b $R t81_arm; grep -v '^nvrm' $T/b > $T/b
 run_to 30 $T/a ./t82_x86; run_to 30 $T/b $R t82_arm; grep -v '^nvrm' $T/b > $T/b2; check t82_any_cast $T/a $T/b2
 run_to 30 $T/a ./t83_x86; run_to 30 $T/b $R t83_arm; grep -v '^nvrm' $T/b > $T/b2; check t83_fs_current_path $T/a $T/b2
 run_to 30 $T/a ./t84_x86; run_to 30 $T/b $R t84_arm; grep -v '^nvrm' $T/b > $T/b2; check t84_exc_across_dylibs $T/a $T/b2
+printf 'SIGSEGV 1 at 0x10\nrecovered after fault 1\n' > $T/a; run_to 30 $T/b $R t85_arm; grep -v '^nvrm' $T/b > $T/b2; check t85_guest_segv_handler $T/a $T/b2
+run_to 30 $T/a ./t86_x86; run_to 30 $T/b $R t86_arm; grep -v '^nvrm' $T/b > $T/b2; check t86_string_iter $T/a $T/b2
+run_to 30 $T/a ./t87_x86; run_to 30 $T/b $R t87_arm; grep -v '^nvrm' $T/b > $T/b2; check t87_nsrange_stack $T/a $T/b2
 printf 'spawn 0\nshell said: hello, arm64\nstatus 0\n' > $T/a; run_to 60 $T/b $R t67_arm "$PWD/t2_hello"; grep -v '^nvrm' $T/b > $T/b2; check t67_shell_runs_arm64 $T/a $T/b2
 run_to 30 $T/a ./t68_x86; run_to 30 $T/b $R t68_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t68_variadic_ipc $T/a $T/b2
 run_to 30 $T/a ./t69_x86; run_to 30 $T/b $R t69_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t69_wprintf $T/a $T/b2
@@ -96,7 +99,7 @@ run_to 60 $T/a ./t71_x86; run_to 60 $T/b $R t71_arm;                            
 run_to 60 $T/b env REBAR_JIT_THRESHOLD=1 $R t71_arm;                                      grep -v '^nvrm' $T/b > $T/b2; check t71_malloc_leaf_jit1 $T/a $T/b2
 run_to 60 $T/a ./t72_x86; run_to 60 $T/b $R t72_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t72_directory_iterator $T/a $T/b2
 run_to 60 $T/a ./t73_x86; run_to 60 $T/b $R t73_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t73_numpunct_sret $T/a $T/b2
-printf 'dczid dzp=1\nctr dminline=4 iminline=4\n' > $T/a; run_to 30 $T/b $R t54_arm;                       grep -v '^nvrm' $T/b > $T/b2; check t54_sysregs $T/a $T/b2
+printf 'dczid dzp=0\nctr dminline=4 iminline=4\n' > $T/a; run_to 30 $T/b $R t54_arm;                       grep -v '^nvrm' $T/b > $T/b2; check t54_sysregs $T/a $T/b2
 printf 'child: hello, arm64\nstatus 0\n' > $T/a; run_to 60 $T/b $R t53_arm "$PWD/t2_hello";  grep -v '^nvrm' $T/b > $T/b2; check t53_nstask_arm64 $T/a $T/b2
 run_to 60 $T/b env REBAR_JIT_THRESHOLD=1 $R t50_arm;                 if grep -q "^t50 flags across calls: bad 0 sum 1200006" $T/b; then echo "PASS t50_flags_across_calls"; pass=$((pass + 1)); else echo "FAIL t50_flags_across_calls"; cat $T/b | head -3; fail=$((fail + 1)); fi
 $R --simd-selftest 60000 > $T/st 2>&1;                               if tail -1 $T/st | grep -q " 0 mismatches"; then echo "PASS simd_selftest"; pass=$((pass + 1)); else echo "FAIL simd_selftest"; tail -5 $T/st; fail=$((fail + 1)); fi

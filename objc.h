@@ -170,6 +170,7 @@ static void marshal_call(CPU *c, void *fn, const char *enc, const char *name, bo
         } else if (t.size <= 16) {
             int words = (t.size + 7) / 8;
             uint64_t w[2] = {0, 0};
+            if (a.nx + words > 8) a.nx = 8;   // (AAPCS64: a two-register struct that does not fit in the registers left goes wholly to the stack, as NSRange does after seven integer arguments)
             for (int k = 0; k < words; k++) w[k] = arm_int(&a, 8);
             if (ix + words > 6) for (int k = 0; k < words; k++) stack[ns++] = w[k];
             else for (int k = 0; k < words; k++) ints[ix++] = w[k];

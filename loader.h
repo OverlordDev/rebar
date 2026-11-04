@@ -202,6 +202,10 @@ static GImage *load_image(const char *real_path, GImage *loader, bool is_main) {
     parse_load_commands(img);
     map_segments(img, fd, (uint64_t)(slice - file));
     close(fd);
+    if (strstr(img->path, "/libjvm.dylib") && g_jit_nskip < 16 && !getenv("REBAR_JIT_JAVA")) {   // HotSpot's generated code relies on faults (null checks, safepoint polls) that need the exact register state of the interpreter
+        if (getenv("REBAR_JIT_JAVA_SKIP")) { g_jit_skip[g_jit_nskip].lo = 0x10000; g_jit_skip[g_jit_nskip].hi = 0x100000000ull; g_jit_nskip++; }   // (not translated at all)
+        else { g_jit_precise_lo = 0x10000; g_jit_precise_hi = 0x100000000ull; }   // translated in the precise form
+    }
     { static int show = -1; if (show < 0) show = getenv("REBAR_IMAGES") != NULL; if (show && !is_main) fprintf(stderr, "rebar: loaded %s base=0x%llx slide=0x%llx\n", img->path, (unsigned long long)img->base, (unsigned long long)img->slide); }   // (the images of the main program are listed at start)
 
     // thread-local template (runtime addresses)
@@ -419,6 +423,7 @@ H(h_dlopen) {
         free(gp);
     }
     void *h = dlopen(path, (int)c->x[1]);  // a system library
+    if (!h) { const char *e = dlerror(); snprintf(g_dlerr, sizeof g_dlerr, "%s", e ? e : "image not found"); g_dlerr_pending = true; }   // (kept for the guest's dlerror: the message is delivered once, and a second failed dlopen of the same name used to leave the host with none: JNA then took strlen of NULL)
     c->x[0] = (uint64_t)h;
 }
 

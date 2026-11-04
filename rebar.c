@@ -92,8 +92,12 @@ static inline int64_t sext(uint64_t v, int bits) { return (int64_t)(v << (64 - b
 static bool g_no_simd_fast;  // REBAR_NO_SIMD_FAST: use only the general AdvSIMD code (to compare, or to bisect a bug)
 static void dump_backtrace(CPU *c);
 static jmp_buf *g_die_jmp;  // set by --simd-selftest, which runs encodings the interpreter may reject
+static __thread jmp_buf *t_fault_jb;   // where a guest memory fault, once its signal handler (the guest's own) has run, continues: the wrapper of run_until below
+static uint64_t g_guest_fault_handler[3];   // the guest's SIGSEGV, SIGBUS and SIGILL handlers (0: none), see h_sigaction
+static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr);
 [[noreturn]] static void die(CPU *c, const char *why, uint32_t insn) {
     if (g_die_jmp) longjmp(*g_die_jmp, 1);
+    if (t_fault_jb && g_guest_fault_handler[2] && !strncmp(why, "unimplemented", 13)) deliver_guest_signal(c, SIGILL, 1, c->pc);   // an instruction the guest wants to trap on (HotSpot's deoptimization instruction)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }
     fprintf(stderr, "rebar: %s (insn 0x%08x at pc 0x%llx)\n", why, insn, (unsigned long long)c->pc);
     dump_backtrace(c);
@@ -212,10 +216,10 @@ static void do_syscall(CPU *c) {
 
 static uint64_t mem_ld(uint64_t a, int size) {
     switch (size) {
-    case 0: return *(uint8_t *)a;
-    case 1: return *(uint16_t *)a;
-    case 2: return *(uint32_t *)a;
-    default: return *(uint64_t *)a;
+    case 0: return *(volatile uint8_t *)a;   // (volatile: a load into the zero register is still made and faults on a bad address, which is how HotSpot's null checks and safepoint polls trap)
+    case 1: return *(volatile uint16_t *)a;
+    case 2: return *(volatile uint32_t *)a;
+    default: return *(volatile uint64_t *)a;
     }
 }
 static void mem_st(uint64_t a, int size, uint64_t v) {
@@ -327,7 +331,7 @@ static bool exec_slow(CPU *c, uint32_t i) {
             wr(c, rt, reg == 0xdf00 ? 1000000000ull : mach_absolute_time() * tb.numer / tb.denom);
             return true;
         }
-        if (read && reg == 0xd807) { wr(c, rt, 0x10); return true; }        // DCZID_EL0: DZP = 1, DC ZVA is prohibited, so memset / bzero code (opencode's, Go's, libc++'s) uses ordinary stores
+        if (read && reg == 0xd807) { wr(c, rt, getenv("REBAR_DCZID_PROHIBIT") ? 0x10 : 0x4); return true; }        // DCZID_EL0: 64-byte DC ZVA (HotSpot refuses a prohibited one); REBAR_DCZID_PROHIBIT=1: DZP = 1, DC ZVA is prohibited, so memset / bzero code (opencode's, Go's, libc++'s) uses ordinary stores
         if (read && reg == 0xd801) { wr(c, rt, 0x8444c004); return true; }  // CTR_EL0: 64-byte instruction and data cache lines (what the cache-maintenance loops of JIT engines read)
         if (reg == 0xde82) { slot = &c->tpidr; }  // TPIDR_EL0
         if (read && reg == 0xde83) { wr(c, rt, c->tpidrro); return true; }  // TPIDRRO_EL0
@@ -604,7 +608,15 @@ static void jit_invalidate_cache_line(uint64_t a) { if (!g_jit_on) return; if (a
 // indexed by the top byte of the encoding and every such handler ends by fetching and dispatching the next
 // instruction itself, so the processor's indirect-branch predictor sees one branch per handler instead of one for
 // the whole interpreter. Everything else goes through the group switch (L_group) and the chain of tests below it.
+static void run_until_inner(CPU *c, uint64_t stop_pc);
 static void run_until(CPU *c, uint64_t stop_pc) {
+    jmp_buf jb; jmp_buf *prev = t_fault_jb;
+    t_fault_jb = &jb;
+    _setjmp(jb);   // (returns again after a delivered fault: the pc and registers are the handler's, the loop starts over from them)
+    run_until_inner(c, stop_pc);
+    t_fault_jb = prev;
+}
+static void run_until_inner(CPU *c, uint64_t stop_pc) {
     static const void *tbl[256], *tbl_dbg[256];
     static bool tbl_ok;
     uint32_t i;

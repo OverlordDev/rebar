@@ -122,7 +122,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 }
 
 typedef void (*StubHandler)(CPU *);
-typedef struct { uint8_t mask, wb, uninit, wide; bool dtor, sret, sb, sretw; } StrSpec;  // which argument registers hold std::string objects (see string_call)
+typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
 typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
@@ -560,6 +560,7 @@ static bool fatal_sig(int sig) { return sig == SIGILL || sig == SIGTRAP || sig =
 // SIGURG is what Go's runtime sends itself to preempt a goroutine: its handler reads and rewrites the arm64 ucontext, which the host does not have (it would corrupt the x86 frame
 // and the program spins in signal handlers), so the handler is never installed and the signal stays ignored by default; the scheduler then preempts cooperatively.
 static bool guest_cannot_handle(int sig) { return sig == SIGURG; }
+static uint32_t g_guest_fault_flags[3];
 H(h_sigaction) {
     int sig = (int)c->x[0];
     if (guest_cannot_handle(sig)) {
@@ -567,8 +568,12 @@ H(h_sigaction) {
         RET(0);
         return;
     }
-    if (fatal_sig(sig)) {
-        if (c->x[2]) memset(P(2), 0, sizeof(struct sigaction));
+    if (fatal_sig(sig)) {   // the host keeps these (the emulator needs them); a handler the guest registers for SIGSEGV / SIGBUS is called by on_segv, for a fault of the interpreter
+        if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL) {
+            int k = sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : 2;
+            if (c->x[2]) { struct sigaction *o = P(2); memset(o, 0, sizeof *o); o->sa_sigaction = (void (*)(int, siginfo_t *, void *))g_guest_fault_handler[k]; o->sa_flags = (int)g_guest_fault_flags[k]; }
+            if (c->x[1]) { const struct sigaction *n = P(1); g_guest_fault_handler[k] = (uint64_t)n->sa_sigaction; g_guest_fault_flags[k] = (uint32_t)n->sa_flags; if (g_guest_fault_handler[k] <= 1) g_guest_fault_handler[k] = 0; }
+        } else if (c->x[2]) memset(P(2), 0, sizeof(struct sigaction));
         RET(0);
         return;
     }
@@ -992,6 +997,7 @@ H(h_sysconf) {
     host_call(c, HOSTFN("sysconf"), false);
 }
 H(h_sys_icache_invalidate) { jit_invalidate(c->x[0], c->x[0] + c->x[1]); }
+H(h_clear_cache) { jit_invalidate(c->x[0], c->x[1]); }   // __clear_cache(begin, end): HotSpot patches its generated code and calls this
 // A guest that suspends another thread (Chromium's sampling profiler suspends the browser's main thread every few seconds) must not freeze it inside the
 // translator: the suspender translates blocks too and would wait for the lock that the frozen thread holds, for ever. With the lock held across the
 // suspension the target cannot be inside jit_compile / jit_invalidate when it stops.
@@ -1296,7 +1302,7 @@ static const Special k_special[] = {
     {"_valloc", h_valloc}, {"_free", h_free}, {"_realloc", h_realloc}, {"_malloc_size", h_malloc_size}, {"_malloc_zone_malloc", h_malloc_zone_malloc},
     {"_malloc_zone_calloc", h_malloc_zone_calloc}, {"_malloc_zone_valloc", h_malloc_zone_valloc},
     {"_malloc_zone_free", h_malloc_zone_free}, {"_malloc_zone_realloc", h_malloc_zone_realloc},
-    {"_mmap", h_mmap}, {"_sys_icache_invalidate", h_sys_icache_invalidate}, {"_thread_suspend", h_thread_suspend}, {"___chkstk_darwin", h_chkstk_darwin}, {"_sysctlbyname", h_sysctlbyname},
+    {"_mmap", h_mmap}, {"_sys_icache_invalidate", h_sys_icache_invalidate}, {"___clear_cache", h_clear_cache}, {"_thread_suspend", h_thread_suspend}, {"___chkstk_darwin", h_chkstk_darwin}, {"_sysctlbyname", h_sysctlbyname},
     {"_SSLGetEnabledCiphers", h_SSLGetEnabledCiphers}, {"_SSLGetSupportedCiphers", h_SSLGetSupportedCiphers}, {"_SSLSetEnabledCiphers", h_SSLSetEnabledCiphers}, {"_SSLGetNegotiatedCipher", h_SSLGetNegotiatedCipher}, {"_munmap", h_munmap}, {"_mprotect", h_mprotect}, {"_madvise", h_madvise},
     {"_vm_protect", h_vm_protect}, {"_mach_vm_protect", h_vm_protect}, {"_vm_allocate", h_vm_allocate},
     {"_mach_vm_allocate", h_vm_allocate}, {"_vm_deallocate", h_vm_deallocate}, {"_mach_vm_deallocate", h_vm_deallocate},
@@ -1381,6 +1387,30 @@ static void *entstats_thread(void *arg) {
     }
     return NULL;
 }
+// Runs the guest's handler for a synchronous fault of interpreted code (a memory access that faulted, an instruction that traps: HotSpot's implicit null checks, safepoint polls and
+// deoptimization instruction, V8's and wasmtime's traps) with a siginfo and a ucontext in the arm64 layout, takes the registers and the pc back from the ucontext and continues
+// the interpreter from there. Does not return. The caller has checked that there is a handler (g_guest_fault_handler) and that t_fault_jb is set.
+static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
+    int hk = sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : 2;
+    static __thread uint8_t sinfo[128], uctx[64], mctx[1024];
+    memset(sinfo, 0, sizeof sinfo); memset(uctx, 0, sizeof uctx); memset(mctx, 0, sizeof mctx);
+    *(int *)(sinfo) = sig; *(int *)(sinfo + 8) = code; *(uint64_t *)(sinfo + 24) = addr;
+    *(uint64_t *)(uctx + 48) = (uint64_t)mctx; *(uint64_t *)(uctx + 40) = 816;
+    *(uint64_t *)(mctx) = addr; *(uint32_t *)(mctx + 8) = hk == 2 ? 0x02000000 : 0x92000045;
+    uint64_t *ss = (uint64_t *)(mctx + 16);
+    for (int k = 0; k < 29; k++) ss[k] = c->x[k];
+    ss[29] = c->x[29]; ss[30] = c->x[30]; ss[31] = c->sp; ss[32] = c->pc;
+    *(uint32_t *)(mctx + 16 + 33 * 8) = (c->n ? 1u << 31 : 0) | (c->z ? 1u << 30 : 0) | (c->c ? 1u << 29 : 0) | (c->v ? 1u << 28 : 0);
+    CPU before = *c;
+    c->sp = (c->sp - 512) & ~0xfull;
+    call_guest(c, g_guest_fault_handler[hk], (uint64_t)sig, (uint64_t)sinfo, (uint64_t)uctx, 0);
+    *c = before;
+    for (int k = 0; k < 29; k++) c->x[k] = ss[k];
+    c->x[29] = ss[29]; c->x[30] = ss[30]; c->sp = ss[31]; c->pc = ss[32];
+    uint32_t nz = *(uint32_t *)(mctx + 16 + 33 * 8);
+    c->n = nz >> 31 & 1; c->z = nz >> 30 & 1; c->c = nz >> 29 & 1; c->v = nz >> 28 & 1;
+    _longjmp(*t_fault_jb, 1);
+}
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
     if (sig == SIGILL || sig == SIGTRAP || sig == SIGFPE) {  // never an instruction-fetch bridge: report without touching any state
@@ -1430,10 +1460,13 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
             return;
         }
     }
+    if (t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && g_guest_fault_handler[sig == SIGSEGV ? 0 : 1] && !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise))
+        deliver_guest_signal(t_cpu, sig, si->si_code, (uint64_t)si->si_addr);   // (does not return: it continues at the pc the guest's handler chose)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }  // REBAR_FAULT_LOG=<file>: fault reports of helper processes whose stderr is lost
     { const JReg *jb = g_jit_on ? jit_block_of(rip) : NULL;
       if (jb) {
           fprintf(stderr, "rebar: the fault is in translated code of the block at guest pc 0x%llx (%u instructions), %u bytes into it\n", (unsigned long long)jb->pc, jb->n, (unsigned)(rip - (uint64_t)jb->code));
+          { fprintf(stderr, "  guest instructions of the block:"); for (uint32_t k = 0; k < jb->n && k < 40; k++) fprintf(stderr, " %08x", ((uint32_t *)jb->pc)[k]); fprintf(stderr, "\n"); }
           if (t_cpu) { fprintf(stderr, "  guest registers:"); for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)t_cpu->x[k]); fprintf(stderr, " sp=%llx\n", (unsigned long long)t_cpu->sp); }
           fprintf(stderr, "  host code at the fault:"); for (int k = -16; k < 16; k++) fprintf(stderr, " %02x", ((uint8_t *)rip)[k]); fprintf(stderr, "\n  block code:"); for (uint32_t k = 0; k < jb->len && k < 400; k++) fprintf(stderr, "%s%02x", k % 32 ? " " : "\n   ", jb->code[k]); fprintf(stderr, "\n");
           fprintf(stderr, "  host registers: rax=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx r15=%llx rsp=%llx\n", (unsigned long long)uc->uc_mcontext->__ss.__rax, (unsigned long long)uc->uc_mcontext->__ss.__rcx, (unsigned long long)uc->uc_mcontext->__ss.__rdx, (unsigned long long)uc->uc_mcontext->__ss.__rsi, (unsigned long long)uc->uc_mcontext->__ss.__rdi, (unsigned long long)uc->uc_mcontext->__ss.__r8, (unsigned long long)uc->uc_mcontext->__ss.__r9, (unsigned long long)uc->uc_mcontext->__ss.__r15, (unsigned long long)uc->uc_mcontext->__ss.__rsp);
@@ -1650,6 +1683,7 @@ static StrSpec *str_spec_for(const char *name) {
             bool cref = !strncmp(suf, "const&", 6) || !strncmp(suf, "const*", 6);
             if (argi < 8) { sp.mask |= 1 << argi; if (argw) sp.wide |= 1 << argi; if (!cref) sp.wb |= 1 << argi; }
             argi++;
+        } else if (strstr(tok, "__wrap_iter<char") && !strchr(tok, 0x26)) { if (!sp.iter && argi < 8) sp.iter = (uint8_t)(argi + 1); argi++;   // an iterator into the string: a pointer into its characters
         } else if (!strcmp(tok, "float") || !strcmp(tok, "double")) {  // a vector register, not an integer one
         } else if (!strcmp(tok, "long double") || !strcmp(tok, "...")) { bad = true; break;
         } else if (!strpbrk(tok, "&*") && (!strncmp(tok, "std::__1::basic_string_view<", 28) || !strcmp(tok, "std::__1::error_code") ||
@@ -1767,6 +1801,11 @@ static void string_call(CPU *c, Stub *s) {
         }
         c->x[k] = (uint64_t)tmp[own[k]];
     }
+    uint64_t iter_off = 0; int ik = sp->iter ? sp->iter - 1 : -1;
+    if (ik >= 0 && (sp->mask & 1)) {   // the iterator points into the guest's characters: make it point into the host copy at the same offset
+        const uint8_t *g = (const uint8_t *)gx[0]; uint64_t gdata = (g[23] & 0x80) ? *(const uint64_t *)g : (uint64_t)g, hdata = (tmp[0][0] & 1) ? *(const uint64_t *)(tmp[0] + 16) : (uint64_t)tmp[0] + 1;
+        iter_off = gx[ik] - gdata; c->x[ik] = hdata + iter_off;
+    }
     bool sbc = sp->sb && sb_enter((uint8_t *)gx[0]);
     if (sp->sret) c->x[8] = (uint64_t)rtmp;
     t_stk = s->stk;
@@ -1780,6 +1819,10 @@ static void string_call(CPU *c, Stub *s) {
         bool wide = sp->wide >> k & 1;
         if (wb >> k & 1) { if (wide) wstr_to_guest((uint8_t *)gx[k], tmp[k]); else str_to_guest((uint8_t *)gx[k], tmp[k]); }
         uint64_t t = (uint64_t)tmp[k];
+        if (ik >= 0 && k == 0) {   // insert / erase return an iterator into the string: the same offset in the guest's characters (after the write-back, which may have moved them)
+            const uint8_t *g = (const uint8_t *)gx[0]; uint64_t gdata = (g[23] & 0x80) ? *(const uint64_t *)g : (uint64_t)g, hdata = (tmp[0][0] & 1) ? *(const uint64_t *)(tmp[0] + 16) : (uint64_t)tmp[0] + 1;
+            if (r >= hdata && r <= hdata + 4096) { r = gdata + (r - hdata); continue; }
+        }
         if (r == t) r = gx[k];  // append/assign/... return *this
         else if (r > t && r < t + 24 && !(tmp[k][0] & 1)) r = gx[k] + (r - t - (wide ? 4 : 1));  // pointer into the inline characters
     }
@@ -2286,7 +2329,7 @@ static uint64_t resolve_import(GImage *img, const char *name, int ordinal, bool 
     // C++ typeinfo, inline variables); a dependency that is itself a guest image is searched directly.
     if (!strcmp(name, "__tlv_bootstrap")) return tlv_thunk();   // a thread-local variable's descriptor starts with this: see tlv_thunk
     if (dep) { uint64_t a = image_export_lookup(dep, name); if (a) return a; }
-    if (!lib || ordinal <= 0) { uint64_t a = find_guest_symbol(name); if (a) return a; }
+    if (!lib || ordinal <= 0 || lib[0] == '@') { uint64_t a = find_guest_symbol(name); if (a) return a; }   // (an @rpath / @loader_path library that did not resolve to a file may still be one that is loaded: libjava's libjvm)
     if (!strcmp(name, "__ZTVNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEEE")) {  // see sb_proxy_vtable
         uint64_t a = sb_proxy_vtable();
         if (a) return a;

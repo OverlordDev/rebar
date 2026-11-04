@@ -72,7 +72,8 @@ static uint64_t g_jr_ind, g_jr_indmiss;   // REBAR_JITCOUNT: indirect branches e
 static uint64_t g_jr_runs, g_jr_stub, g_jr_budget, g_jr_other, g_jr_found, g_jr_cold;   // REBAR_JITCOUNT: why translated code returned to the dispatcher
 static uint32_t g_jit_fb_key[1 << 12]; static uint64_t g_jit_fb_n[1 << 12];   // instructions that got a helper call instead of a template, by encoding class
 
-typedef struct { uint8_t *code; uint32_t len; uint32_t n; uint64_t pc; } JReg;
+typedef struct { uint8_t *code; uint32_t len; uint32_t n; uint64_t pc; bool precise; } JReg;   // precise: every memory access of the block leaves the CPU structure exact first (see g_jit_precise_lo)
+static uint64_t g_jit_precise_lo, g_jit_precise_hi;   // guest code in [lo, hi) is translated in the precise form: the pc and the registers are stored before each load / store, so that a fault in it can be given to the guest's signal handler
 static JReg *g_jit_reg;       // every block ever translated, in code-address order (for profiling and fault reports)
 static size_t g_jit_reg_n, g_jit_reg_cap;
 static const JReg *jit_block_of(uint64_t rip) {   // the block whose code contains the host address
@@ -1343,7 +1344,7 @@ static void jit_insert(uint64_t pc, uint8_t *code) {   // under g_jit_mu
     unsigned h = jit_hash(pc);
     for (int k = 0; k < 4096; k++) {
         JEnt *e = &g_jit_tab[(h + k) & ((1 << JIT_TAB_BITS) - 1)];
-        if (e->pc == 0) { e->code = code; __atomic_store_n(&e->pc, pc, __ATOMIC_RELEASE); return; }
+        if (e->pc == 0 || e->pc == 1) { e->code = code; __atomic_store_n(&e->pc, pc, __ATOMIC_RELEASE); return; }   // (1: the entry of a block that was invalidated, free again)
     }
 }
 static inline void jit_ic_set(uint64_t pc, uint8_t *code) { __atomic_store_n(&g_jit_ic[(pc >> 2) & ((1 << JIT_IC_BITS) - 1)], code, __ATOMIC_RELEASE); }
@@ -1411,6 +1412,7 @@ static uint8_t *jit_compile(uint64_t pc) {
     size_t blkid = g_jit_reg_n;
     if (g_jit_count && blkid < (1u << 20)) { mov_ri_nf(&j, R9, (uint64_t)&g_jit_cnt[blkid]); e1(&j, 0x49); e1(&j, 0xFF); e1(&j, 0x01); }   // inc qword [r9]
     uint64_t cur = pc; bool ended = false;
+    bool precise = pc >= g_jit_precise_lo && pc < g_jit_precise_hi;
     if (leaf) {   // the stub of a leaf import: call it and return to x30 (the three words are what the block stands for)
         emit_leaf_call_body(&j, leaf_fn, leaf_nargs, leaf_z);
         mov_rm(&j, RAX, R15, GXR(30), 1);
@@ -1419,6 +1421,10 @@ static uint8_t *jit_compile(uint64_t pc) {
     }
     while (!leaf && n < maxn) {
         j.pc = cur; j.kind_set = false; j.rc_pin = 0; j.insn_left = maxn - n - 1;
+        if (precise && (*(uint32_t *)cur & 0x0a000000) == 0x08000000) {   // a load or store: the state a signal handler would see
+            mov_ri_nf(&j, RAX, cur); mov_mr(&j, R15, (int32_t)offsetof(CPU, pc), RAX, 1);
+            rc_sync_out(&j); rc_flush(&j);
+        }
         JI r = jit_emit(&j, *(uint32_t *)cur);
         if (n < 64) g_jit_offs[n] = (uint32_t)(j.p - start);
         if (!j.kind_set) j.flagkind = 0;
@@ -1438,7 +1444,7 @@ static uint8_t *jit_compile(uint64_t pc) {
     g_jit_top = j.p;
     g_jit_nblocks++; g_jit_ninsns += n;
     if (g_jit_reg_n == g_jit_reg_cap) { g_jit_reg_cap = g_jit_reg_cap ? g_jit_reg_cap * 2 : 65536; g_jit_reg = realloc(g_jit_reg, g_jit_reg_cap * sizeof(JReg)); }
-    g_jit_reg[g_jit_reg_n++] = (JReg){start, (uint32_t)(j.p - start), (uint32_t)n, pc};
+    g_jit_reg[g_jit_reg_n++] = (JReg){start, (uint32_t)(j.p - start), (uint32_t)n, pc, precise};
     if (g_jit_map) fprintf(g_jit_map, "%llx %u %llx %d\n", (unsigned long long)start, (unsigned)(j.p - start), (unsigned long long)pc, n);
     if (g_jit_dump) {   // REBAR_JITDUMP=<file>: "pc n bytes guest-words... | x86-bytes" for every block (analysis aid)
         fprintf(g_jit_dump, "%llx %d %u", (unsigned long long)pc, n, (unsigned)(j.p - start));
