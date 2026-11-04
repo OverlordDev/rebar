@@ -1542,6 +1542,16 @@ static bool unwind_out_of_pool_pop(ucontext_t *uc) {
     }
     return false;
 }
+static void dump_metadata_chain(uint64_t em, int depth) {   // debugging aid: metadata words and every value witness with its symbol, then what an Optional wraps
+    for (int d = 0; d < 4 && em > 0x10000; d++) {
+        uint64_t mw[6] = {0}, vt = 0, vw[20] = {0}; mach_vm_size_t g = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), em, 48, (mach_vm_address_t)mw, &g) != KERN_SUCCESS) return;
+        mach_vm_read_overwrite(mach_task_self(), em - 8, 8, (mach_vm_address_t)&vt, &g); mach_vm_read_overwrite(mach_task_self(), vt, 160, (mach_vm_address_t)vw, &g);
+        fprintf(stderr, "    [chain %d.%d] metadata %llx kind %llx size %llu flags %llx xi %llu\n", depth, d, (unsigned long long)em, (unsigned long long)mw[0], (unsigned long long)vw[8], (unsigned long long)(vw[10] & 0xffffffff), (unsigned long long)(vw[10] >> 32));
+        for (int k = 0; k < 20; k++) { if (k >= 8 && k <= 10) continue; Dl_info dv; const char *sn = (vw[k] > 0x10000 && dladdr((void *)vw[k], &dv) && dv.dli_sname) ? dv.dli_sname : "?"; fprintf(stderr, "       vw[%d] = %llx %.90s\n", k, (unsigned long long)vw[k], sn); }
+        if (mw[0] == 0x202 || mw[0] == 0x201 || mw[0] == 0x200) em = mw[2]; else break;
+    }
+}
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
     if (sig == SIGSEGV && getenv("REBAR_POOL_GUARD") && (uint64_t)si->si_addr == 0 && unwind_out_of_pool_pop(uc)) return;
@@ -1614,13 +1624,31 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
             sig, si->si_addr, (void *)rip, (unsigned long long)(t_cpu ? t_cpu->pc : 0), t_last_stub ? t_last_stub->name : "-", (unsigned long long)t_last_lr);
     if (getenv("REBAR_DUMP_CODE_AT")) { uint64_t a = strtoull(getenv("REBAR_DUMP_CODE_AT"), NULL, 16); const uint8_t *q = (const uint8_t *)(a - 0x100); fprintf(stderr, "  [code from %p:", (void *)q); for (int k = 0; k < 0x180; k++) fprintf(stderr, " %02x", q[k]); fprintf(stderr, "]\n"); }
     if (getenv("REBAR_DUMP_CODE")) { const uint8_t *pc = (const uint8_t *)uc->uc_mcontext->__ss.__rip; fprintf(stderr, "  [code at host pc %p, 48 bytes before and 16 after:", (void *)pc); for (int k = -48; k < 16; k++) fprintf(stderr, " %02x", pc[k]); fprintf(stderr, "]\n"); }
+    if (getenv("REBAR_DUMP_ADDR")) { for (char *spec = strdup(getenv("REBAR_DUMP_ADDR")), *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) { uint64_t a = strtoull(tok, NULL, 16); uint64_t w[16] = {0}; mach_vm_size_t got = 0; bool ok = mach_vm_read_overwrite(mach_task_self(), a, 128, (mach_vm_address_t)w, &got) == KERN_SUCCESS; fprintf(stderr, "  [memory at %llx%s]", (unsigned long long)a, ok ? "" : " (not readable)"); if (ok) for (int k = 0; k < 16; k++) fprintf(stderr, " %llx", (unsigned long long)w[k]); fprintf(stderr, "\n"); } }
     if (getenv("REBAR_DUMP_HOTPAGE")) fprintf(stderr, "  [hotPage TLS slot 43 of this thread = %p]\n", pthread_getspecific(43));
     if (getenv("REBAR_DUMP_OBJ")) {   // REBAR_DUMP_OBJ=rbx|...: the 8 words at the address a register holds, and the class name its isa gives (debugging aid)
         const _STRUCT_X86_THREAD_STATE64 *r = &uc->uc_mcontext->__ss; const char *n = getenv("REBAR_DUMP_OBJ");
-        uint64_t a = !strcmp(n, "rbx") ? r->__rbx : !strcmp(n, "r12") ? r->__r12 : !strcmp(n, "r13") ? r->__r13 : !strcmp(n, "r14") ? r->__r14 : !strcmp(n, "r15") ? r->__r15 : !strcmp(n, "rdi") ? r->__rdi : !strcmp(n, "rax") ? r->__rax : !strcmp(n, "rcx") ? r->__rcx : r->__rsi;
-        uint64_t w[8] = {0}; mach_vm_size_t got = 0; bool ok = mach_vm_read_overwrite(mach_task_self(), a, 64, (mach_vm_address_t)w, &got) == KERN_SUCCESS;
-        fprintf(stderr, "  [object at %s = %llx%s]", n, (unsigned long long)a, ok ? "" : " (not readable)"); if (ok) { for (int k = 0; k < 8; k++) fprintf(stderr, " %llx", (unsigned long long)w[k]);
+        uint64_t a = (n[0] == 'x' && t_cpu) ? t_cpu->x[atoi(n + 1)] : !strcmp(n, "rbx") ? r->__rbx : !strcmp(n, "r12") ? r->__r12 : !strcmp(n, "r13") ? r->__r13 : !strcmp(n, "r14") ? r->__r14 : !strcmp(n, "r15") ? r->__r15 : !strcmp(n, "rdi") ? r->__rdi : !strcmp(n, "rax") ? r->__rax : !strcmp(n, "rcx") ? r->__rcx : r->__rsi;
+        uint64_t w[48] = {0}; mach_vm_size_t got = 0; bool ok = mach_vm_read_overwrite(mach_task_self(), a, 384, (mach_vm_address_t)w, &got) == KERN_SUCCESS;
+        fprintf(stderr, "  [object at %s = %llx%s]", n, (unsigned long long)a, ok ? "" : " (not readable)"); if (ok) { for (int k = 0; k < (n[0] == 'x' ? 48 : 8); k++) fprintf(stderr, " %llx", (unsigned long long)w[k]);
             Class cl = (Class)(w[0] & 0x7ffffffffff8ull); char tmp[8]; if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)cl, 8, (mach_vm_address_t)tmp, &got) == KERN_SUCCESS) fprintf(stderr, "  class %s", class_getName(cl)); } fprintf(stderr, "\n");
+        if (ok) { Class cl0 = (Class)(w[0] & 0x7ffffffffff8ull); uint64_t cw[26] = {0}; mach_vm_size_t g3 = 0; if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)cl0, 208, (mach_vm_address_t)cw, &g3) == KERN_SUCCESS) { fprintf(stderr, "    class metadata %p words:", (void *)cl0); for (int k = 0; k < 26; k++) fprintf(stderr, " %llx", (unsigned long long)cw[k]); fprintf(stderr, "\n");
+            if (getenv("REBAR_DUMP_ELEMENT")) { uint64_t em = cw[18];   // the generic argument of _ContiguousArrayStorage<T>: T's metadata, its value witness table and (for an Optional or a tuple) what it wraps
+                for (int depth = 0; depth < 3 && em > 0x10000; depth++) { uint64_t mw[14] = {0}, vt = 0, vw[16] = {0}; mach_vm_size_t g4 = 0;
+                    if (mach_vm_read_overwrite(mach_task_self(), em, 112, (mach_vm_address_t)mw, &g4) != KERN_SUCCESS) break;
+                    mach_vm_read_overwrite(mach_task_self(), em - 8, 8, (mach_vm_address_t)&vt, &g4); mach_vm_read_overwrite(mach_task_self(), vt, 128, (mach_vm_address_t)vw, &g4);
+                    fprintf(stderr, "    T%d metadata %llx words:", depth, (unsigned long long)em); for (int k = 0; k < 14; k++) fprintf(stderr, " %llx", (unsigned long long)mw[k]); fprintf(stderr, "\n      vwt %llx: size %llu stride %llu flags %llx xi %llu (", (unsigned long long)vt, (unsigned long long)vw[8], (unsigned long long)vw[9], (unsigned long long)(vw[10] & 0xffffffff), (unsigned long long)(vw[10] >> 32));
+                    for (int k = 0; k < 8; k++) { Dl_info dv; const char *sn = (vw[k] > 0x10000 && dladdr((void *)vw[k], &dv) && dv.dli_sname) ? dv.dli_sname : "?"; fprintf(stderr, "%.40s%s", sn, k < 7 ? " | " : ""); } fprintf(stderr, ")\n");
+                    if (mw[0] == 0x301) { for (int e = 0; e < (int)mw[1] && e < 4; e++) { uint64_t et = mw[3 + 2 * e], eo = mw[4 + 2 * e], ev = 0, evw[12] = {0}, ek = 0;
+                            mach_vm_read_overwrite(mach_task_self(), et, 8, (mach_vm_address_t)&ek, &g4); mach_vm_read_overwrite(mach_task_self(), et - 8, 8, (mach_vm_address_t)&ev, &g4); mach_vm_read_overwrite(mach_task_self(), ev, 96, (mach_vm_address_t)evw, &g4);
+                            fprintf(stderr, "      element %d: type %llx kind %llx offset %llu size %llu stride %llu flags %llx xi %llu\n", e, (unsigned long long)et, (unsigned long long)ek, (unsigned long long)eo, (unsigned long long)evw[8], (unsigned long long)evw[9], (unsigned long long)(evw[10] & 0xffffffff), (unsigned long long)(evw[10] >> 32)); } }
+                    { uint64_t buf[3] = {0, 0, 1}; typedef int (*gets_t)(void *, unsigned, const void *); gets_t g = (gets_t)vw[6]; if (vw[6] > 0x10000) fprintf(stderr, "      getEnumTagSinglePayload((0,0,1), 1, T%d) -> %d\n", depth, g(buf, 1, (const void *)(uintptr_t)em)); }
+                    if (mw[0] == 0x301) { for (int e = 0; e < (int)mw[1] && e < 4; e++) { uint64_t et = mw[3 + 2 * e], ev2 = 0, evw2[12] = {0}; mach_vm_read_overwrite(mach_task_self(), et - 8, 8, (mach_vm_address_t)&ev2, &g4); mach_vm_read_overwrite(mach_task_self(), ev2, 96, (mach_vm_address_t)evw2, &g4);
+                            if (e == 1) dump_metadata_chain(et, e);
+                            uint64_t b2[3] = {0, 0, 1}; typedef int (*gets_t)(void *, unsigned, const void *); if (evw2[6] > 0x10000) { Dl_info d2; const char *n2 = dladdr((void *)evw2[6], &d2) && d2.dli_sname ? d2.dli_sname : "?"; fprintf(stderr, "      element %d getEnumTagSinglePayload at offset %llu of (0,0,1) -> %d  (%.60s)\n", e, (unsigned long long)mw[4 + 2 * e], ((gets_t)evw2[6])((char *)b2 + mw[4 + 2 * e], 1, (const void *)(uintptr_t)et), n2); } } }
+                    em = (mw[0] == 0x301) ? 0 : mw[2]; } }
+        } }
+        if (ok) { uint64_t vw = 0; mach_vm_size_t g2 = 0; if (mach_vm_read_overwrite(mach_task_self(), a - 8, 8, (mach_vm_address_t)&vw, &g2) == KERN_SUCCESS && vw > 0x10000) { uint64_t t[14] = {0}; if (mach_vm_read_overwrite(mach_task_self(), vw, 112, (mach_vm_address_t)t, &g2) == KERN_SUCCESS) { fprintf(stderr, "    value witness table %llx:", (unsigned long long)vw); for (int k = 0; k < 14; k++) { Dl_info dv; const char *sn = (t[k] > 0x10000 && dladdr((void *)t[k], &dv) && dv.dli_sname) ? dv.dli_sname : ""; fprintf(stderr, " %llx%s%s", (unsigned long long)t[k], *sn ? "=" : "", sn); } fprintf(stderr, "\n"); } } }
         if (ok) for (int k = 1; k < 4; k++) { uint64_t o2 = w[k]; uint64_t v2[2] = {0}; if (o2 < 0x10000) continue; if (mach_vm_read_overwrite(mach_task_self(), o2, 16, (mach_vm_address_t)v2, &got) != KERN_SUCCESS) { fprintf(stderr, "    w[%d]=%llx not readable\n", k, (unsigned long long)o2); continue; }
             Class c2 = (Class)(v2[0] & 0x7ffffffffff8ull); char t2[8]; const char *n2 = mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)c2, 8, (mach_vm_address_t)t2, &got) == KERN_SUCCESS ? class_getName(c2) : "?";
             fprintf(stderr, "    w[%d]=%llx isa %llx -> class %s  words %llx %llx%s\n", k, (unsigned long long)o2, (unsigned long long)v2[0], n2 ? n2 : "?", (unsigned long long)v2[0], (unsigned long long)v2[1], malloc_zone_from_ptr((void *)o2) ? "" : "  [not a live malloc block]"); }

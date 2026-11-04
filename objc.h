@@ -9,6 +9,7 @@
 // to the IMP, keeping the arm64 ABI (stack varargs, x8 struct returns) intact.
 
 #include <objc/objc.h>
+#include <spawn.h>
 #include <objc/runtime.h>
 
 typedef struct { uint64_t isa, superclass, cache, vtable, data; } GClass;
@@ -717,9 +718,39 @@ H(h_class_addMethod) {
 }
 H(h_method_getImplementation) { host_call(c, HOSTFN("method_getImplementation"), false); c->x[0] = imp_unwrap(c->x[0]); }
 H(h_class_getMethodImplementation) { host_call(c, HOSTFN("class_getMethodImplementation"), false); c->x[0] = imp_unwrap(c->x[0]); }
+// An app that opens another app of its own bundle (a menu-bar helper) with NSWorkspace asks LaunchServices, which cannot start an arm64-only program on this Mac and shows "cannot be
+// opened because it is not supported by this computer". Such a launch is run through rebar instead (a child process); the completion handler is called with no app and no error.
+static bool exe_is_arm64_only(const char *path) {
+    int fd = open(path, O_RDONLY); if (fd < 0) return false; uint8_t h[4096]; ssize_t n = pread(fd, h, sizeof h, 0); close(fd); if (n < 32) return false;
+    uint32_t magic = *(uint32_t *)h;
+    if (magic == 0xbebafecau) { uint32_t na = __builtin_bswap32(*(uint32_t *)(h + 4)); bool arm = false, x86 = false;
+        for (uint32_t k = 0; k < na && 8 + 20 * (k + 1) <= (size_t)n; k++) { uint32_t ct = __builtin_bswap32(*(uint32_t *)(h + 8 + 20 * k)); if (ct == 0x0100000c) arm = true; if (ct == 0x01000007) x86 = true; }
+        return arm && !x86; }
+    if (magic == 0xfeedfacf) return *(uint32_t *)(h + 4) == 0x0100000c;
+    return false;
+}
+static bool try_open_arm64_app(CPU *c, id self, SEL sel) {
+    static SEL s_open; if (!s_open) s_open = sel_registerName("openApplicationAtURL:configuration:completionHandler:");
+    if (sel != s_open || getenv("REBAR_NO_APP_REDIRECT")) return false;
+    id url = (id)c->x[2]; if (!url) return false;
+    id pathstr = send_h(url, sel_registerName("path")); if (!pathstr) return false;
+    const char *app = (const char *)send_h(pathstr, sel_registerName("UTF8String")); if (!app) return false;
+    id bundle = send_h((id)objc_getClass("NSBundle"), sel_registerName("bundleWithPath:"), pathstr); if (!bundle) return false;
+    id exestr = send_h(bundle, sel_registerName("executablePath")); if (!exestr) return false;
+    const char *exe = (const char *)send_h(exestr, sel_registerName("UTF8String")); if (!exe || !exe_is_arm64_only(exe)) return false;
+    pid_t pid = 0; char *argv[3] = {(char *)g_self_path, (char *)exe, NULL};
+    int r = posix_spawn(&pid, g_self_path, NULL, NULL, argv, environ);
+    if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[open application %s -> started through rebar as pid %d (%d)]\n", app, (int)pid, r);
+    id running = NULL;   // the handler wants the NSRunningApplication of the new process (an async wrapper traps when it gets neither an app nor an error)
+    for (int k = 0; k < 40 && !running && r == 0; k++) { running = send_h((id)objc_getClass("NSRunningApplication"), sel_registerName("runningApplicationWithProcessIdentifier:"), (long)pid); if (!running) usleep(100000); }
+    id err = NULL; if (!running) err = send_h((id)objc_getClass("NSError"), sel_registerName("errorWithDomain:code:userInfo:"), send_h((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "NSCocoaErrorDomain"), (long)256, (id)NULL);
+    uint64_t blk = c->x[4]; if (blk && in_guest(*(uint64_t *)(blk + 16))) call_guest(c, *(uint64_t *)(blk + 16), blk, (uint64_t)running, (uint64_t)err, 0);   // completionHandler(app, error)
+    c->x[0] = 0; return true;
+}
 H(h_objc_msgSend) {
     id self = (id)c->x[0];
     SEL sel = (SEL)c->x[1];
+    if (try_open_arm64_app(c, self, sel)) return;
     swift_ensure_receiver(c, (uint64_t)self);
     if (__builtin_expect(g_gpu_sync != 0, 0)) gpu_hook(c, self, sel);
     if (__builtin_expect(g_dump_layers != 0, 0)) layer_dump_hook(c, self, sel);
