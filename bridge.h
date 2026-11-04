@@ -2463,7 +2463,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     if (host && !h) g_stubs[idx].throwing = !strcmp(name, "___cxa_throw");
     g_stubs[idx].heapret = !strncmp(name, "_realpath", 9) || !strcmp(name, "_strdup") || !strcmp(name, "_strndup") || !strcmp(name, "_getcwd") ? 1 : (!strcmp(name, "_asprintf") || !strcmp(name, "_vasprintf") ? 2 : 0);   // host functions that return memory from the system's malloc (see heapret_fix)
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;
-    if (host && !h) g_stubs[idx].swift = name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S');   // a Swift symbol: Swift's calling convention
+    if (host && !h) g_stubs[idx].swift = (name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S')) || !strcmp(name, "_swift_getAtKeyPath") || !strcmp(name, "_swift_setAtWritableKeyPath") || !strcmp(name, "_swift_modifyAtWritableKeyPath") || !strcmp(name, "_swift_getAtAnyKeyPath") || !strcmp(name, "_swift_getAtPartialKeyPath");   // a Swift symbol: Swift's calling convention (also the key path runtime functions: swiftcc with an indirect result in x8)
     if (host && !h) g_stubs[idx].maps = !strcmp(name, "_vm_map") || !strcmp(name, "_mach_vm_map") || !strcmp(name, "_vm_remap") || !strcmp(name, "_mach_vm_remap");
     if (host && !h) {
         StrSpec *sp = g_stubs[idx].str = str_spec_for(name);
