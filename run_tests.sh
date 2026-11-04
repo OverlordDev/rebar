@@ -220,6 +220,17 @@ if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
         iosipa ios_uikit_ipa ios_ui.m 'launched idiom 0 window key 1 label UIKit under rebar\nbye\n' clang -framework UIKit -framework Foundation
         iosipa ios_uikit2_ipa ios_uikit2.m 'late: window {{0, 0}, {400, 800}} root.view {{0, 0}, {400, 800}} scene 1\nautolayout box {{20, 100}, {200, 100}}\nstack {{0, 300}, {100, 170}}\napp state 0 scene state 0\nnav depth 2 top TVC rows 5\ncell2 text row 2 table frame {{0, 0}, {400, 800}} visible 5\nimage 4x4 scale 1 pixel ff0000ff\ntext width ok 1 height ok 1\ndefaults v\nidiom 0\nalert actions 1\nanimation finished 1 alpha 0\n' clang -framework UIKit -framework Foundation -framework CoreGraphics
         iosipa ios_swiftui_ipa ios_swiftui.swift 'appeared count 0\nbye\n' swiftc
+        # a store-style app: compiled storyboard, asset catalog, UIWindowSceneDelegate from the scene manifest, resources, localization
+        if xcrun -f ibtool >/dev/null 2>&1 && xcrun -f actool >/dev/null 2>&1; then
+            sb=$T/ios_sb_ipa; rm -rf $sb && mkdir -p $sb/Payload/SbApp.app
+            xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios15.0 -fobjc-arc -framework UIKit -framework Foundation -w ios_sb/main.m -o $sb/Payload/SbApp.app/SbApp 2>/dev/null
+            xcrun ibtool --compile $sb/Payload/SbApp.app/Main.storyboardc ios_sb/Main.storyboard --target-device iphone --minimum-deployment-target 15.0 >/dev/null 2>&1
+            xcrun actool ios_sb/Assets.xcassets --compile $sb/Payload/SbApp.app --platform iphoneos --minimum-deployment-target 15.0 --target-device iphone --output-partial-info-plist $T/ap.plist >/dev/null 2>&1
+            cp ios_sb/Info.plist ios_sb/data.txt $sb/Payload/SbApp.app/; cp -R ios_sb/en.lproj $sb/Payload/SbApp.app/
+            (cd $sb && zip -qr ../ios_sb.ipa Payload)
+            printf "didFinishLaunching\nscene willConnect role UIWindowSceneSessionRoleApplication config Default Configuration\nstoryboard label 'Storyboard OK' image found 16x16\nmain bundle id dev.rebar.sbapp\nresource hello from a bundle resource\n\nstring Hello strings\nbye\n" > $T/a
+            run_to 60 $T/b python3 -I ../tools/ipa.py run $T/ios_sb.ipa; grep -v '^nvrm' $T/b > $T/b2; check ios_storyboard_scene_ipa $T/a $T/b2
+        fi
     fi
 else echo "SKIP iOS IPA tests (no iphoneos SDK)"; fi
 
