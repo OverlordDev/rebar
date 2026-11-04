@@ -95,7 +95,16 @@ def needs_marshal(e, size, hfa, hc):
     return True                                       # mixed int/float aggregates
 
 UMBRELLA = ('#import <Cocoa/Cocoa.h>\n#import <CoreText/CoreText.h>\n#import <ImageIO/ImageIO.h>\n'
-            '#import <QuartzCore/QuartzCore.h>\n#include <ApplicationServices/ApplicationServices.h>\n')
+            '#import <QuartzCore/QuartzCore.h>\n#include <ApplicationServices/ApplicationServices.h>\n'
+            # media, GPU and numerics frameworks: CMTime / CMTimeRange (24 / 48 bytes: by reference on arm64, on the stack on x86_64), AudioStreamBasicDescription (40 bytes),
+            # vImage_Buffer (32), CVTime, MTLSize / MTLRegion, ...
+            '#if __has_include(<AVFoundation/AVFoundation.h>)\n#import <AVFoundation/AVFoundation.h>\n#endif\n'
+            '#import <CoreMedia/CoreMedia.h>\n#import <CoreVideo/CoreVideo.h>\n#import <AudioToolbox/AudioToolbox.h>\n#import <CoreAudio/CoreAudio.h>\n'
+            '#import <VideoToolbox/VideoToolbox.h>\n#import <Accelerate/Accelerate.h>\n#import <Metal/Metal.h>\n#import <MetalKit/MetalKit.h>\n'
+            '#import <MetalPerformanceShaders/MetalPerformanceShaders.h>\n#import <CoreImage/CoreImage.h>\n#import <IOSurface/IOSurface.h>\n'
+            '#if __has_include(<Vision/Vision.h>)\n#import <Vision/Vision.h>\n#endif\n#if __has_include(<CoreML/CoreML.h>)\n#import <CoreML/CoreML.h>\n#endif\n'
+            '#if __has_include(<SceneKit/SceneKit.h>)\n#import <SceneKit/SceneKit.h>\n#endif\n#if __has_include(<CoreMIDI/CoreMIDI.h>)\n#import <CoreMIDI/CoreMIDI.h>\n#endif\n'
+            '#if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)\n#import <ScreenCaptureKit/ScreenCaptureKit.h>\n#endif\n')
 # Narrow-result functions also come from the C library and system headers.
 UMBRELLA_ALL = UMBRELLA + ('#include <os/lock.h>\n#include <os/log.h>\n#include <pthread.h>\n#include <dispatch/dispatch.h>\n'
                            '#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <signal.h>\n#include <dlfcn.h>\n'
