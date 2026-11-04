@@ -1019,6 +1019,17 @@ H(h_NSProtocolFromString) {
     if (g) { c->x[0] = g; return; }
     host_call(c, dlsym(RTLD_DEFAULT, "NSProtocolFromString"), false);
 }
+// REBAR_NO_CORNERMASK=1: AppKit of this macOS threw NSInternalInconsistencyException ("image returned from _cornerMask must have a resizing mode of NSImageResizingModeStretch")
+// when VLC's first window was shown, although the image it checked has that mode: the window then has no corner mask, as a status bar window has none (VLC's macosx interface starts).
+static id nil_corner_mask(id self, SEL sel) { (void)self; (void)sel; return nil; }
+static void apply_no_cornermask(const char *path) {
+    static bool done; if (done || !(getenv("REBAR_NO_CORNERMASK") || (path && strstr(path, "/VLC.app/")))) return;   // (on by itself for VLC)
+    done = true;
+    dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY);
+    Class w = objc_getClass("NSWindow");
+    Method m = w ? class_getInstanceMethod(w, sel_registerName("_cornerMask")) : NULL;
+    if (m) method_setImplementation(m, (IMP)nil_corner_mask);
+}
 // Step 1, for every image before any class is registered: selectors, protocol isas, and the
 // compiled method lists (read now: registering a class makes the runtime replace class_t.data).
 static void objc_prepare_image(GImage *img) {
@@ -1027,6 +1038,7 @@ static void objc_prepare_image(GImage *img) {
     if (!imageinfo) return;
     img->objc_mapped = true;
     objc_bridge_init();
+    apply_no_cornermask(img->path);
     if (!p_readClassPair) { fprintf(stderr, "rebar: libobjc lacks objc_readClassPair\n"); exit(1); }
     g_cur_slide = img->slide;
 
