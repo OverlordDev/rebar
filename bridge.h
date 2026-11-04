@@ -1401,7 +1401,8 @@ static void *entstats_thread(void *arg) {
 // the interpreter from there. Does not return. The caller has checked that there is a handler (g_guest_fault_handler) and that t_fault_jb is set.
 static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
     int hk = sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : 2;
-    if (getenv("REBAR_TRACE_SIGNALS")) { fprintf(stderr, "[signal %d at guest pc %llx, address %llx, handler %llx]\n", sig, (unsigned long long)c->pc, (unsigned long long)addr, (unsigned long long)g_guest_fault_handler[hk]); dump_backtrace(c); }
+    if (getenv("REBAR_TRACE_SIGNALS")) { fprintf(stderr, "[signal %d at guest pc %llx, address %llx, handler %llx]\n", sig, (unsigned long long)c->pc, (unsigned long long)addr, (unsigned long long)g_guest_fault_handler[hk]); dump_backtrace(c);
+        if (c->pc > 0x10000) { fprintf(stderr, "  words at pc-16..pc+8:"); for (int k = -4; k <= 2; k++) fprintf(stderr, " %08x", *(uint32_t *)(c->pc + 4 * k)); fprintf(stderr, "\n  x0-x30:"); for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)c->x[k]); fprintf(stderr, " sp=%llx\n", (unsigned long long)c->sp); } }
     static __thread uint8_t sinfo[128], uctx[64], mctx[1024];
     memset(sinfo, 0, sizeof sinfo); memset(uctx, 0, sizeof uctx); memset(mctx, 0, sizeof mctx);
     *(int *)(sinfo) = sig; *(int *)(sinfo + 8) = code; *(uint64_t *)(sinfo + 24) = addr;
