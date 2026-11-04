@@ -378,7 +378,7 @@ __asm__(
     "  pushq %rbp\n  .cfi_def_cfa_offset 16\n  .cfi_offset %rbp, -16\n"
     "  movq %rsp, %rbp\n  .cfi_def_cfa_register %rbp\n  subq $224, %rsp\n"
     "  movq %rax, 160(%rsp)\n  movq %r13, 168(%rsp)\n  movq %r12, 176(%rsp)\n  movq %r14, 200(%rsp)\n"
-    "  movabsq $0x5ca1ab1e5ca1ab1e, %rax\n  cmpq %rax, %r10\n  sete %al\n  movzbl %al, %eax\n  movq %rax, 208(%rsp)\n"   // (r10 = the magic value: the call came from a call site that follows it with `sub $8,%rsp`, see the redirect in on_segv)
+    "  movabsq $0x5ca1ab1e5ca1ab1e, %rax\n  cmpq %rax, %r10\n  sete %al\n  movzbl %al, %eax\n  movq %rax, 208(%rsp)\n"   // (r10 = the magic value: the call came from Swift Concurrency's own code and its call site follows it with `sub $8,%rsp` - the async convention; ordinary Swift code has that instruction after calls too, see the redirect in on_segv)
     "  movq %rdi, 0(%rsp)\n  movq %rsi, 8(%rsp)\n  movq %rdx, 16(%rsp)\n"
     "  movq %rcx, 24(%rsp)\n  movq %r8, 32(%rsp)\n  movq %r9, 40(%rsp)\n"
     "  movsd %xmm0, 48(%rsp)\n  movsd %xmm1, 56(%rsp)\n  movsd %xmm2, 64(%rsp)\n  movsd %xmm3, 72(%rsp)\n"
@@ -1565,7 +1565,7 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
               if (chk && (uc->uc_mcontext->__ss.__rsp & 15) != 8) { static int n; if (n++ < 8) { uint64_t ra = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; Dl_info di; const char *nm = dladdr((void *)ra, &di) && di.dli_sname ? di.dli_sname : "?";
                 char b[300]; int k = snprintf(b, sizeof b, "[align] host jumped to guest %llx with rsp %llx (mod 16 = %d); return address %llx in %s\n", (unsigned long long)rip, (unsigned long long)uc->uc_mcontext->__ss.__rsp, (int)(uc->uc_mcontext->__ss.__rsp & 15), (unsigned long long)ra, nm); write(2, b, k); } } }
             { uint64_t ra0 = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; uint32_t after = 0; mach_vm_size_t got0 = 0; uc->uc_mcontext->__ss.__r10 = 0;
-              if (!getenv("REBAR_NO_ASYNC_RET") && mach_vm_read_overwrite(mach_task_self(), ra0, 4, (mach_vm_address_t)&after, &got0) == KERN_SUCCESS && got0 == 4 && after == 0x08ec8348u) uc->uc_mcontext->__ss.__r10 = 0x5ca1ab1e5ca1ab1eull; }   // 48 83 ec 08 = subq $8,%rsp
+              if (!getenv("REBAR_NO_ASYNC_RET") && mach_vm_read_overwrite(mach_task_self(), ra0, 4, (mach_vm_address_t)&after, &got0) == KERN_SUCCESS && got0 == 4 && after == 0x08ec8348u && ({ Dl_info dj; dladdr((void *)ra0, &dj) && dj.dli_fname && strstr(dj.dli_fname, "libswift_Concurrency"); })) { uc->uc_mcontext->__ss.__r10 = 0x5ca1ab1e5ca1ab1eull; if (getenv("REBAR_TRACE_ASYNC")) { Dl_info di; const char *nm = dladdr((void *)ra0, &di) && di.dli_sname ? di.dli_sname : "?"; char b[240]; int k = snprintf(b, sizeof b, "[async return] guest %llx called from %llx in %s\n", (unsigned long long)rip, (unsigned long long)ra0, nm); write(2, b, k); } } }   // 48 83 ec 08 = subq $8,%rsp
             uc->uc_mcontext->__ss.__r11 = rip;
             uc->uc_mcontext->__ss.__rip = (uint64_t)rebar_guest_entry;
             if (g_entry_stats) {
