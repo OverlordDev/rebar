@@ -470,11 +470,12 @@ void rebar_bridge_enter(uint64_t *f) {
         c->x[8] = f[20]; c->x[20] = f[21]; c->x[21] = f[22]; c->x[22] = f[25];   // Swift: indirect result address, context, error (all but the error are discarded when the CPU is restored below)
     }
     if (sigent > 0 && sigent < 32 && ((g_sig_onstack >> sigent) & 1) && t_gss_on && !(c->sp > t_gss_sp && c->sp <= t_gss_sp + t_gss_size)) c->sp = (t_gss_sp + t_gss_size) & ~0xfull;
+    uint64_t swifterror_in = f[22];
     c->x[30] = stub_addr(STUB_RET);
     c->pc = f[14];
     run_until(c, stub_addr(STUB_RET));
     if (enc) entry_finish(c, f, &st);
-    else { f[16] = c->x[0]; f[17] = c->x[1]; f[18] = c->vr[0].d[0]; f[19] = c->vr[1].d[0]; f[22] = c->x[21]; f[23] = c->x[2]; f[24] = c->x[3]; }
+    else { f[16] = c->x[0]; f[17] = c->x[1]; f[18] = c->vr[0].d[0]; f[19] = c->vr[1].d[0]; if (swifterror_in == 0) f[22] = c->x[21]; f[23] = c->x[2]; f[24] = c->x[3]; }   // (r12 is the swifterror register of a Swift caller, which clears it before the call; for any other caller it is callee-saved and must come back unchanged: a Swift async function leaves its own value in x21, and the job runner of Swift Concurrency keeps its autorelease pool token in r12)
     if (!enc && fpos_kind) f[16] = f[0];   // (SysV returns the result address in rax)
     t_act = act.prev;
     *c = saved;
