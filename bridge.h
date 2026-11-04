@@ -710,7 +710,12 @@ H(h_calloc)  { uint64_t a[3] = {c->x[0], c->x[1], 0}; if (def_patched(4) && zone
 H(h_valloc)  { uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(5) && zone_slot_call(c, g_def_zone.clone, 5, 1, a)) return; host_call(c, HOSTFN("valloc"), false); }
 H(h_free)    { uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(6) && zone_slot_call(c, g_def_zone.clone, 6, 1, a)) return; host_call(c, HOSTFN("free"), false); }
 H(h_realloc) { uint64_t a[3] = {c->x[0], c->x[1], 0}; if (def_patched(7) && zone_slot_call(c, g_def_zone.clone, 7, 2, a)) return; host_call(c, HOSTFN("realloc"), false); }
-H(h_malloc_size) { uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(2) && zone_slot_call(c, g_def_zone.clone, 2, 1, a)) return; host_call(c, HOSTFN("malloc_size"), false); }
+H(h_malloc_size) {
+    for (int k = 0; k < g_nguest_zones; k++) {   // a guest allocator that registered its own zone (Firefox's mozjemalloc) knows the sizes of its blocks: ask it, as libmalloc would
+        uint64_t z = g_guest_zones[k], fn = *(uint64_t *)(z + 16);
+        if (fn && c->x[0]) { uint64_t r = call_guest(c, fn, z, c->x[0], 0, 0); if (r) { c->x[0] = r; return; } }
+    }
+    uint64_t a[3] = {c->x[0], 0, 0}; if (def_patched(2) && zone_slot_call(c, g_def_zone.clone, 2, 1, a)) return; host_call(c, HOSTFN("malloc_size"), false); }
 
 H(h_malloc_get_all_zones) {  // (task, reader, **addresses, *count): the guest sees its own zones first, the default zone as its clone
     int (*real)(uint64_t, void *, uint64_t **, uint32_t *) = HOSTFN("malloc_get_all_zones");
@@ -1891,11 +1896,12 @@ static void string_call(CPU *c, Stub *s) {
 
 // A guest with its own malloc and free (Firefox) frees what it gets from these host functions with its own free: copy the result into memory from the guest's allocator (operator new /
 // delete are what libc++ and the guest agree on, but `free` of strdup's result is the guest's: use the guest's malloc for these, which the guest's free matches).
-static void heapret_fix(CPU *c, Stub *s, uint64_t out_ptr) {
+static void heapret_fix(CPU *c, Stub *s, uint64_t out_ptr, uint64_t arg1) {
     static uint64_t gm, gf; if (!gm) { gm = find_guest_symbol("_malloc"); gf = find_guest_symbol("_free"); }
     if (!gm || !gf) return;
     uint64_t p = s->heapret == 2 ? (uint64_t)((int)c->x[0] >= 0 ? *(uint64_t *)out_ptr : 0) : c->x[0];
-    if (s->heapret == 1 && !strcmp(s->name, "_getcwd") && out_ptr) return;   // (getcwd into the caller's own buffer returns that buffer)
+    if (s->heapret == 1 && !strcmp(s->name, "_getcwd") && out_ptr) return;
+    if (s->heapret == 1 && !strncmp(s->name, "_realpath", 9) && arg1) return;   // (realpath into the caller's own buffer returns that buffer)   // (getcwd into the caller's own buffer returns that buffer)
     if (!p || p < 0x10000) return;
     size_t len = strlen((const char *)p);
     uint64_t g = call_guest(c, gm, len + 1, 0, 0, 0);
@@ -2057,7 +2063,7 @@ static void stub_call_inner(CPU *c) {
     if (idx >= g_nstubs) die(c, "jump into unallocated stub", 0);
     Stub *s = &g_stubs[idx];
     t_last_stub = s;
-    uint64_t this0 = c->x[0];
+    uint64_t this0 = c->x[0], arg1_in = c->x[1];
     RingEnt *ring_ent = &t_ring[t_ring_n++ & 127];
     *ring_ent = (RingEnt){s->name, c->x[0], c->x[1], c->x[2], c->x[30], 0};
     t_last_lr = c->x[30];
@@ -2119,7 +2125,7 @@ static void stub_call_inner(CPU *c) {
         dump_backtrace(c);
         exit(127);
     }
-    if (s->heapret && !t_landed && guest_custom_alloc()) heapret_fix(c, s, this0);
+    if (s->heapret && !t_landed && guest_custom_alloc()) heapret_fix(c, s, this0, arg1_in);
     if (s->thisret && !t_landed) c->x[0] = this0;  // a constructor or destructor: arm64 returns this
     switch (s->narrow) {  // x86_64 leaves the upper bits of rax undefined for a bool/char/short result
     case 'B': case 'C': c->x[0] = (uint8_t)c->x[0]; break;
