@@ -1,3 +1,5 @@
+#include <mach-o/dyld.h>
+#include <setjmp.h>
 // Bridge between the interpreted arm64 guest and the host's x86_64 libSystem.
 //
 // Imports of the guest (chained fixups or classic bind opcodes) are resolved
@@ -1509,8 +1511,35 @@ static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
     c->n = nz >> 31 & 1; c->z = nz >> 30 & 1; c->c = nz >> 29 & 1; c->v = nz >> 28 & 1;
     _longjmp(*t_fault_jb, 1);
 }
+// Swift Concurrency's job runner closes its autorelease pool with a token that, under rebar, is sometimes not in the thread's chain of pool pages (cause not found: see the notes on
+// Gemini); libobjc then walks off the end of the chain (AutoreleasePoolPage::releaseUntil) and faults at address 0. Instead of dying, the fault is answered by unwinding the host stack
+// out of objc_autoreleasePoolPop and continuing in its caller as if the pop had returned: the pool's objects leak. Experimental and OFF by default: REBAR_POOL_GUARD=1 turns it on (the resumed job runner then returns to a bad address; the frame layout at the resume point is not understood).
+#include <libunwind.h>
+static bool unwind_out_of_pool_pop(ucontext_t *uc) {
+    Dl_info di; if (!dladdr((void *)uc->uc_mcontext->__ss.__rip, &di) || !di.dli_fname || !strstr(di.dli_fname, "libobjc")) return false;   // (a fault inside libobjc; the stack must show a pool pop)
+    unw_context_t ctx; unw_cursor_t cur; memset(&ctx, 0, sizeof ctx); memcpy(&ctx, &uc->uc_mcontext->__ss, sizeof(uc->uc_mcontext->__ss));   // (x86_64 libunwind's context starts with the same register block as the signal's thread state: the unwind begins at the faulting frame, with its registers)
+    if (unw_init_local(&cur, &ctx) != 0) return false;
+    bool seen_pop = false;
+    for (int guard = 0; guard < 40 && unw_step(&cur) > 0; guard++) {
+        char nm[256] = ""; unw_word_t off;
+        bool named = unw_get_proc_name(&cur, nm, sizeof nm, &off) == 0;
+        if (named && strstr(nm, "autoreleasePoolPop")) { seen_pop = true; continue; }
+        if (!seen_pop) continue;
+        unw_word_t ip, sp, bp, bx, r12, r13, r14, r15;
+        unw_get_reg(&cur, UNW_REG_IP, &ip); unw_get_reg(&cur, UNW_REG_SP, &sp); unw_get_reg(&cur, UNW_X86_64_RBP, &bp); unw_get_reg(&cur, UNW_X86_64_RBX, &bx);
+        unw_get_reg(&cur, UNW_X86_64_R12, &r12); unw_get_reg(&cur, UNW_X86_64_R13, &r13); unw_get_reg(&cur, UNW_X86_64_R14, &r14); unw_get_reg(&cur, UNW_X86_64_R15, &r15);
+        if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[unwind target %s: ip %llx sp %llx bp %llx bx %llx r12 %llx r13 %llx r14 %llx r15 %llx; fault sp %llx bp %llx]\n", nm, (unsigned long long)ip, (unsigned long long)sp, (unsigned long long)bp, (unsigned long long)bx, (unsigned long long)r12, (unsigned long long)r13, (unsigned long long)r14, (unsigned long long)r15, (unsigned long long)uc->uc_mcontext->__ss.__rsp, (unsigned long long)uc->uc_mcontext->__ss.__rbp);
+        if (getenv("REBAR_TRACE_SIGNALS")) { fprintf(stderr, "[stack at target sp:"); for (int q = -2; q < 14; q++) fprintf(stderr, " %llx", (unsigned long long)((uint64_t *)sp)[q]); fprintf(stderr, "]\n"); }
+        _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
+        ss->__rip = ip; ss->__rsp = sp; ss->__rbp = bp; ss->__rbx = bx; ss->__r12 = r12; ss->__r13 = r13; ss->__r14 = r14; ss->__r15 = r15; ss->__rax = 0;
+        static int n; if (n++ < 3 && getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[autorelease pool pop with a token outside the thread's pools: skipped, continuing in %s]\n", named ? nm : "?");
+        return true;
+    }
+    return false;
+}
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
+    if (sig == SIGSEGV && getenv("REBAR_POOL_GUARD") && (uint64_t)si->si_addr == 0 && unwind_out_of_pool_pop(uc)) return;
     if (sig == SIGILL || sig == SIGTRAP || sig == SIGFPE) {  // never an instruction-fetch bridge: report without touching any state
         { const JReg *jb = g_jit_on ? jit_block_of(uc->uc_mcontext->__ss.__rip) : NULL; if (jb) { char bb[160]; int nn = snprintf(bb, sizeof bb, "rebar: trap in translated code of the block at guest pc 0x%llx (%u instructions)\n", (unsigned long long)jb->pc, jb->n); write(2, bb, nn); } }
         char b[200];
