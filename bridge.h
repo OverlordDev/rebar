@@ -1401,7 +1401,9 @@ static void *entstats_thread(void *arg) {
 // Runs the guest's handler for a synchronous fault of interpreted code (a memory access that faulted, an instruction that traps: HotSpot's implicit null checks, safepoint polls and
 // deoptimization instruction, V8's and wasmtime's traps) with a siginfo and a ucontext in the arm64 layout, takes the registers and the pc back from the ucontext and continues
 // the interpreter from there. Does not return. The caller has checked that there is a handler (g_guest_fault_handler) and that t_fault_jb is set.
+__thread int t_in_deliver;
 static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
+    t_in_deliver = 1;
     int hk = sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : 2;
     if (getenv("REBAR_TRACE_SIGNALS")) { fprintf(stderr, "[signal %d at guest pc %llx, address %llx, handler %llx]\n", sig, (unsigned long long)c->pc, (unsigned long long)addr, (unsigned long long)g_guest_fault_handler[hk]); dump_backtrace(c);
         if (c->pc > 0x10000) { fprintf(stderr, "  words at pc-16..pc+8:"); for (int k = -4; k <= 2; k++) fprintf(stderr, " %08x", *(uint32_t *)(c->pc + 4 * k)); fprintf(stderr, "\n  x0-x30:"); for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)c->x[k]); fprintf(stderr, " sp=%llx\n", (unsigned long long)c->sp); } }
@@ -1420,6 +1422,7 @@ static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
     *c = before;
     for (int k = 0; k < 29; k++) c->x[k] = ss[k];
     c->x[29] = ss[29]; c->x[30] = ss[30]; c->sp = ss[31]; c->pc = ss[32];
+    if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[signal %d: guest handler returned, continuing at pc %llx sp %llx x0 %llx x30 %llx]\n", sig, (unsigned long long)c->pc, (unsigned long long)c->sp, (unsigned long long)c->x[0], (unsigned long long)c->x[30]);
     uint32_t nz = *(uint32_t *)(mctx + 16 + 33 * 8);
     c->n = nz >> 31 & 1; c->z = nz >> 30 & 1; c->c = nz >> 29 & 1; c->v = nz >> 28 & 1;
     _longjmp(*t_fault_jb, 1);
@@ -1473,7 +1476,7 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
             return;
         }
     }
-    if (t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && g_guest_fault_handler[sig == SIGSEGV ? 0 : 1] && !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise))
+    if (t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && g_guest_fault_handler[sig == SIGSEGV ? 0 : 1] && !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise) && t_cpu->pc - g_stub_base >= g_stub_size)   // (not in a stub's host handler: a fault there is rebar's own and must not run guest code with its locks held)
         deliver_guest_signal(t_cpu, sig, si->si_code, (uint64_t)si->si_addr);   // (does not return: it continues at the pc the guest's handler chose)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }  // REBAR_FAULT_LOG=<file>: fault reports of helper processes whose stderr is lost
     { const JReg *jb = g_jit_on ? jit_block_of(rip) : NULL;

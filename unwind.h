@@ -554,21 +554,42 @@ static int g_nti_vts;
 typedef struct TiName { struct TiName *next; uint64_t canon; } TiName;
 static TiName *g_ti_names[1 << 14];
 static pthread_mutex_t g_ti_mu = PTHREAD_MUTEX_INITIALIZER;
+// The typeinfo of a guest image lives in __DATA_CONST (read-only once the image is mapped): to unify its name the page is made writable for the store and put back
+static void ti_store_name(uint64_t *field, uint64_t val) {
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)field; mach_vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
+    mach_vm_address_t ra = a;
+    if (mach_vm_region(mach_task_self(), &ra, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS || ra > a) return;
+    if (info.protection & VM_PROT_WRITE) { *field = val; return; }
+    uint64_t pg = (uint64_t)a & ~0xfffull;
+    if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE) != 0) return;
+    *field = val;
+    mprotect((void *)pg, 0x1000, (info.protection & VM_PROT_EXECUTE) ? (PROT_READ | PROT_EXEC) : PROT_READ);
+}
+static pthread_t g_ti_owner; extern __thread int t_in_deliver;
 static void ti_canonical_name(uint64_t *field) {
     static int off = -1; if (off < 0) off = getenv("REBAR_NO_TI_UNIFY") != NULL;   // REBAR_NO_TI_UNIFY=1: leave every image's typeinfo names alone (to compare)
     if (off) return;
     uint64_t v = *field, tag = v & (1ull << 63);
     const char *str = (const char *)(v & ~(1ull << 63));
     if (!str || (uint64_t)str < 0x10000) return;
+    // The name is read through the kernel (a name pointer into memory that is gone, as a thrown exception of CoreCLR's JIT heap has, must not fault while the lock is held: a guest
+    // signal handler that does not return would leave it locked for ever), and only names in the images' own memory are kept as the canonical ones (they are never freed)
+    char name[256]; mach_vm_size_t got = 0;
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)str, sizeof name - 1, (mach_vm_address_t)(uintptr_t)name, &got) != KERN_SUCCESS && got == 0) {
+        for (got = 0; got < sizeof name - 1; got++) { mach_vm_size_t one = 0; if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)(str + got), 1, (mach_vm_address_t)(uintptr_t)(name + got), &one) != KERN_SUCCESS) break; if (!name[got]) break; }
+        if (got == 0) return;
+    }
+    name[got < sizeof name ? got : sizeof name - 1] = 0; name[sizeof name - 1] = 0;
     uint32_t h = 2166136261u;
-    for (const char *q = str; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
+    for (const char *q = name; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
     h &= (1 << 14) - 1;
-    pthread_mutex_lock(&g_ti_mu);
+    bool stat_name = image_by_addr((uint64_t)str) != NULL;
+    { int tries = 0; while (pthread_mutex_trylock(&g_ti_mu)) { if (++tries > 20000) { if (getenv("REBAR_TI_DEBUG")) fprintf(stderr, "rebar: typeinfo table lock is stuck (owner %p, me %p, in_signal %d), name left alone\n", (void *)g_ti_owner, (void *)pthread_self(), (int)t_in_deliver); return; } usleep(50); } }   // (never wait for ever: a thread that left while holding it would stop every throw)
+    g_ti_owner = pthread_self();
     for (TiName *t = g_ti_names[h]; t; t = t->next)
-        if (!strcmp((const char *)(t->canon & ~(1ull << 63)), str)) { *field = t->canon | tag; pthread_mutex_unlock(&g_ti_mu); return; }
-    TiName *n = malloc(sizeof *n);
-    n->canon = v; n->next = g_ti_names[h]; g_ti_names[h] = n;
-    pthread_mutex_unlock(&g_ti_mu);
+        if (!strcmp((const char *)(t->canon & ~(1ull << 63)), name)) { ti_store_name(field, t->canon | tag); g_ti_owner = 0; pthread_mutex_unlock(&g_ti_mu); return; }
+    if (stat_name) { TiName *n = malloc(sizeof *n); n->canon = v; n->next = g_ti_names[h]; g_ti_names[h] = n; }
+    g_ti_owner = 0; pthread_mutex_unlock(&g_ti_mu);
 }
 // A typeinfo made at run time (UNO's gcc3 bridge builds the ones of exceptions that no library defines, with a name it copied) is thrown with its name and those of its bases unified
 // with the static ones, so that a catch clause of the same type in a library matches it.
