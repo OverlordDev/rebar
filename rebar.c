@@ -1594,11 +1594,23 @@ static void atfork_child(void) {
 // UIKit for Mac Catalyst starts with [NSApplication _startWindowServerIfNecessary] (AppKit in macOS 26 has it; this macOS 15 does not): a process that is in a window-server session
 // already (rebar always is) needs nothing there, so the class method is added as a no-op. The scene server (FuseBoard) only accepts a client that runs from an .app bundle.
 static void ios_noop_ws(id self, SEL sel) { (void)self; (void)sel; }
+// AppKit's NSWindowSectionContentController asks the background colour of the scroll view that UIKit registers for the titlebar separator with -colorUsingColorSpace:, an NSColor method;
+// UIKit hands it a UIDualMacSystemColor (the grouped background of a SwiftUI List) which does not have it, and the layout pass throws. UIColor gets the method: its CGColor as an NSColor.
+static id ios_color_using_cs(id self, SEL sel, id cs) {
+    void *ms = dlsym(RTLD_DEFAULT, "objc_msgSend"); id (*send)(id, SEL) = (id (*)(id, SEL))ms; id (*send1)(id, SEL, id) = (id (*)(id, SEL, id))ms;
+    id cg = send(self, sel_registerName("CGColor"));
+    id ns = send1((id)objc_getClass("NSColor"), sel_registerName("colorWithCGColor:"), cg);
+    return ns ? send1(ns, sel_registerName("colorUsingColorSpace:"), cs) : nil;
+}
+static void ios_patch_uikit(void) {
+    Class ui = objc_getClass("UIColor");
+    if (ui && !class_getInstanceMethod(ui, sel_registerName("colorUsingColorSpace:"))) class_addMethod(ui, sel_registerName("colorUsingColorSpace:"), (IMP)ios_color_using_cs, "@@:@");
+}
 static void ios_prepare(void) {
     dlopen("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", RTLD_NOW | RTLD_GLOBAL);
     Class app = objc_getClass("NSApplication");
     if (app && !class_getClassMethod(app, sel_registerName("_startWindowServerIfNecessary")))
-        class_addMethod(object_getClass(app), sel_registerName("_startWindowServerIfNecessary"), (IMP)ios_noop_ws, "v@:");
+        class_addMethod((Class)object_getClass((id)app), sel_registerName("_startWindowServerIfNecessary"), (IMP)ios_noop_ws, "v@:");
 }
 
 int main(int argc, char **argv) {
@@ -1747,6 +1759,7 @@ int main(int argc, char **argv) {
     *_NSGetArgv() = g_argv;  // NSProcessInfo and NSLog read these from the host process
     *_NSGetArgc() = g_argc;
     load_host_libraries();  // after the identity patch: Foundation snapshots argv when it loads
+    if (getenv("REBAR_IOS_UI")) ios_patch_uikit();
     set_host_process_name(g_progname);
 
     size_t stack_size = 256u << 20;

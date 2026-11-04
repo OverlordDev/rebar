@@ -207,7 +207,7 @@ hbcheck brew_tmux "tmux 3.8" tmux -V
 iosipa() {  # name, source, expected-output-file, swiftc|clang, extra args to the compiler; the app is IosApp, family iPhone, runs 60 s at most
     nm=$1; src=$2; ex=$3; cc=$4; shift 4
     rm -rf $T/$nm && mkdir -p $T/$nm/Payload/IosApp.app
-    if [ $cc = swiftc ]; then xcrun -sdk iphoneos swiftc -parse-as-library -target arm64-apple-ios16.0 -O "$@" $src -o $T/$nm/Payload/IosApp.app/IosApp 2>/dev/null
+    if [ $cc = swiftc ]; then xcrun -sdk iphoneos swiftc -parse-as-library -target arm64-apple-ios17.0 -O "$@" $src -o $T/$nm/Payload/IosApp.app/IosApp 2>/dev/null
     else xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios15.0 -fobjc-arc -w "$@" $src -o $T/$nm/Payload/IosApp.app/IosApp 2>/dev/null; fi
     printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosApp</string><key>CFBundleIdentifier</key><string>dev.rebar.%s</string><key>CFBundleName</key><string>%s</string><key>MinimumOSVersion</key><string>15.0</string><key>UIDeviceFamily</key><array><integer>1</integer></array></dict></plist>' $nm $nm > $T/$nm/Payload/IosApp.app/Info.plist
     (cd $T/$nm && zip -qr ../$nm.ipa Payload)
@@ -221,6 +221,7 @@ if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
         iosipa ios_uikit2_ipa ios_uikit2.m 'late: window {{0, 0}, {400, 800}} root.view {{0, 0}, {400, 800}} scene 1\nautolayout box {{20, 100}, {200, 100}}\nstack {{0, 300}, {100, 170}}\napp state 0 scene state 0\nnav depth 2 top TVC rows 5\ncell2 text row 2 table frame {{0, 0}, {400, 800}} visible 5\nimage 4x4 scale 1 pixel ff0000ff\ntext width ok 1 height ok 1\ndefaults v\nidiom 0\nalert actions 1\nanimation finished 1 alpha 0\n' clang -framework UIKit -framework Foundation -framework CoreGraphics
         iosipa ios_frameworks_ipa ios_frameworks.m 'webkit js hi2\nmetal device yes queue 1\navaudiosession category ok 1\ncoremotion accelerometer 0\ncorelocation services 1 status 0\npasteboard pb-rebar\nkeychain add 0 get 0 value secret\ncoredata fetched 1 n=42\nurlsession local file via URLSession\n' clang -framework UIKit -framework Foundation -framework WebKit -framework Metal -framework AVFoundation -framework CoreMotion -framework CoreLocation -framework CoreData -framework Security -framework UserNotifications
         iosipa ios_swiftui_ipa ios_swiftui.swift 'appeared count 0\nbye\n' swiftc
+        iosipa ios_swiftui2_ipa ios_swiftui2.swift 'done ticks 16 items 22 tab 0 level 0.9\n' swiftc
         # a store-style app: compiled storyboard, asset catalog, UIWindowSceneDelegate from the scene manifest, resources, localization
         if xcrun -f ibtool >/dev/null 2>&1 && xcrun -f actool >/dev/null 2>&1; then
             sb=$T/ios_sb_ipa; rm -rf $sb && mkdir -p $sb/Payload/SbApp.app

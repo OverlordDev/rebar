@@ -89,7 +89,7 @@ def host_bundle(app, d):
     host = os.path.join(os.path.dirname(os.path.dirname(app)), "host", name + ".app")
     exe = os.path.join(host, "Contents", "MacOS", name)
     stamp = os.path.join(host, ".stamp")
-    want = "%s %s" % (os.path.getmtime(REBAR_IOS), os.path.realpath(app))
+    want = "%s %s %s" % (os.path.getmtime(REBAR_IOS), os.path.realpath(app), os.environ.get("REBAR_IOS_FAMILY", ""))
     if not (os.path.exists(stamp) and open(stamp).read() == want):
         shutil.rmtree(host, ignore_errors=True)
         os.makedirs(os.path.dirname(exe))
@@ -100,6 +100,7 @@ def host_bundle(app, d):
         p.pop("NSPrincipalClass", None)
         p["CFBundlePackageType"] = "APPL"
         p["LSMinimumSystemVersion"] = "12.0"
+        if os.environ.get("REBAR_IOS_FAMILY"): p["UIDeviceFamily"] = [int(x) for x in os.environ["REBAR_IOS_FAMILY"].split(",")]
         p.setdefault("CFBundleVersion", "1")
         with open(os.path.join(host, "Contents", "Info.plist"), "wb") as f: plistlib.dump(p, f)
         subprocess.run(["codesign", "--force", "--sign", "-", host], capture_output=True)
