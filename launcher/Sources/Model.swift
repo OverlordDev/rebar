@@ -102,6 +102,10 @@ final class Launcher: NSObject, ObservableObject {
             let idst = dst.deletingLastPathComponent().appendingPathComponent("rebar-ios")
             if (try? Data(contentsOf: ios)) != (try? Data(contentsOf: idst)) { try? fm.removeItem(at: idst); try? fm.copyItem(at: ios, to: idst); chmod(idst.path, 0o755); removexattr(idst.path, "com.apple.quarantine", 0) }
         }
+        if let sec = Bundle.main.url(forResource: "librebar_sec.dylib", withExtension: nil, subdirectory: "bin") {   // the keychain of iOS apps
+            let sdst = dst.deletingLastPathComponent().appendingPathComponent("librebar_sec.dylib")
+            if (try? Data(contentsOf: sec)) != (try? Data(contentsOf: sdst)) { try? fm.removeItem(at: sdst); try? fm.copyItem(at: sec, to: sdst); removexattr(sdst.path, "com.apple.quarantine", 0) }
+        }
         if let shim = Bundle.main.url(forResource: "librebar_exec.dylib", withExtension: nil, subdirectory: "bin") {   // (rebar looks for it next to itself)
             let sdst = dst.deletingLastPathComponent().appendingPathComponent("librebar_exec.dylib")
             if (try? Data(contentsOf: shim)) != (try? Data(contentsOf: sdst)) { try? fm.removeItem(at: sdst); try? fm.copyItem(at: shim, to: sdst) }
@@ -294,8 +298,9 @@ final class Launcher: NSObject, ObservableObject {
         var program = rebar, programArgs = [app.exe] + args
         if let ios = app.ios {
             if ios.encrypted { message = "“\(app.name)” is encrypted (FairPlay, from the App Store): its code cannot be read, so it cannot run. Only apps you built yourself or have the decrypted binary of work."; return }
-            env["REBAR_IOS"] = "1"
+            env["REBAR_IOS"] = "1"; env["REBAR_LIB_DIR"] = (rebar as NSString).deletingLastPathComponent
             if ios.usesUI {
+                env["REBAR_IOS_UI"] = "1"
                 guard let host = hostBundle(app) else { message = "UIKit apps need rebar-ios next to rebar (it is made by build.sh with Xcode's vtool)."; return }
                 program = host; programArgs = [app.exe] + args
                 env["CFProcessPath"] = host; env["REBAR_CFPROCESSPATH"] = host

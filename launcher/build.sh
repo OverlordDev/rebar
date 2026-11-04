@@ -13,6 +13,7 @@ if xcrun -f vtool >/dev/null 2>&1; then   # rebar as a Mac Catalyst process: the
     xcrun vtool -set-build-version maccatalyst 15.0 26.0 -replace -output "$APP/Contents/Resources/bin/rebar-ios" "$APP/Contents/Resources/bin/rebar" >/dev/null 2>&1 && codesign --force -s - "$APP/Contents/Resources/bin/rebar-ios" >/dev/null 2>&1
 fi
 clang -arch x86_64 -mmacosx-version-min=11.0 -dynamiclib -O2 -Wno-everything ../execshim.c -o "$APP/Contents/Resources/bin/librebar_exec.dylib"   # (injected into the shells and tools that guests start: see execshim.c)
+clang -arch x86_64 -mmacosx-version-min=11.0 -dynamiclib -fobjc-arc -O2 -w -framework Foundation -framework Security ../ios_sec.m -o "$APP/Contents/Resources/bin/librebar_sec.dylib"   # (the keychain of iOS apps)
 swiftc -O -swift-version 5 -parse-as-library -target x86_64-apple-macos11.0 Sources/App.swift Sources/Model.swift Sources/Support.swift Sources/FastEditor.swift -o "$APP/Contents/MacOS/$NAME"
 cp Info.plist "$APP/Contents/Info.plist"
 codesign --force --deep --sign - "$APP"

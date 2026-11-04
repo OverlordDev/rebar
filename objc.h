@@ -616,6 +616,17 @@ H(h_objc_claimAutoreleasedReturnValue) { id (*f)(id) = HOSTFN("objc_retain"); if
 H(h_objc_unsafeClaimAutoreleasedReturnValue) { }   // (the object stays in its pool: nothing to take, nothing to give back)
 // A query naming a file keychain of the app's own (Gemini: "Gemini Keys", never created here) makes Security ask the user in a dialog ("keychain not found"). Such a query is run
 // against the default keychains instead: the keys naming a keychain (kSecUseKeychain, kSecMatchSearchList) are taken out of a copy of the dictionary. REBAR_KEEP_KEYCHAIN=1 keeps them.
+// An iOS app (REBAR_IOS) keeps its secrets with SecItem* in the data-protection keychain, which needs the keychain-access-groups entitlement: a restricted one, that an ad-hoc signed host
+// bundle cannot carry (AMFI kills it), so the real calls fail with -34018 (and a file keychain is not available to a Mac Catalyst process). Such an app gets librebar_sec.dylib (ios_sec.m):
+// the four calls on a plist of its own.
+static void *ios_sec_fn(const char *name) {
+    static void *h; static int tried;
+    if (!tried) { tried = 1;
+        if (!getenv("REBAR_IOS") || getenv("REBAR_NO_IOS_KEYCHAIN")) return NULL;
+        char p[PATH_MAX]; rebar_lib_path("librebar_sec.dylib", p, sizeof p); h = dlopen(p, RTLD_NOW);
+        if (!h && getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "rebar: %s: %s\n", p, dlerror()); }
+    return h ? dlsym(h, name) : NULL;
+}
 static void sec_query_without_keychain(CPU *c) {
     if (getenv("REBAR_KEEP_KEYCHAIN") || !c->x[0]) return;
     void *(*copy)(void *, long, const void *) = HOSTFN("CFDictionaryCreateMutableCopy"); void (*rm)(void *, const void *) = HOSTFN("CFDictionaryRemoveValue");
@@ -625,10 +636,8 @@ static void sec_query_without_keychain(CPU *c) {
     if (k1) rm(m, *k1); if (k2) rm(m, *k2);
     c->x[0] = (uint64_t)m;   // (the copy is leaked: a few per call)
 }
-H(h_SecItemAdd) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemAdd"), false); }
-H(h_SecItemCopyMatching) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemCopyMatching"), false); }
-H(h_SecItemUpdate) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemUpdate"), false); }
-H(h_SecItemDelete) { sec_query_without_keychain(c); host_call(c, HOSTFN("SecItemDelete"), false); }
+#define SEC_HANDLER(Name) H(h_##Name) { void *f = ios_sec_fn("rebar_" #Name); if (f) { host_call(c, f, false); return; } sec_query_without_keychain(c); host_call(c, HOSTFN(#Name), false); }
+SEC_HANDLER(SecItemAdd) SEC_HANDLER(SecItemCopyMatching) SEC_HANDLER(SecItemUpdate) SEC_HANDLER(SecItemDelete)
 H(h_SSLSetIOFuncs) { c->x[1] = imp_wrap_any(c->x[1], true); c->x[2] = imp_wrap_any(c->x[2], true); host_call(c, HOSTFN("SSLSetIOFuncs"), false); }   // SecureTransport calls the guest's read / write functions (.NET's System.Net.Security)
 // CGGetActiveDisplayList is empty on this Mac (the display is online but not "active" for Quartz), while the main display has valid bounds and a mode: GTK and others that count the
 // active displays found no monitor. Answer with the main display when the host has none.

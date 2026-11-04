@@ -925,6 +925,13 @@ H(h_mmap) {  // (addr, len, prot, flags, fd, off)
 // asks the kernel to execute an arm64-only executable, which an x86_64 host refuses ("Bad CPU type").
 // posix_spawn / exec of such a file is turned into running it under rebar.
 static char g_self_path[PATH_MAX];
+// Where rebar's support files live (librebar_exec.dylib, librebar_sec.dylib): next to the executable, or in REBAR_LIB_DIR (an iOS app runs from a copy of rebar inside a host .app).
+static void rebar_lib_path(const char *name, char *out, size_t n) {
+    const char *d = getenv("REBAR_LIB_DIR");
+    if (d) { snprintf(out, n, "%s/%s", d, name); return; }
+    snprintf(out, n, "%s", g_self_path); char *slash = strrchr(out, '/');
+    if (slash) snprintf(slash + 1, n - (size_t)(slash + 1 - out), "%s", name); else snprintf(out, n, "%s", name);
+}
 static bool needs_rebar(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return false;

@@ -116,9 +116,9 @@ def run(path, args):
     if d["uses_ui"]:
         if not os.path.exists(REBAR_IOS): sys.exit("ipa: %s missing (run build.sh; it needs vtool from Xcode)" % REBAR_IOS)
         host = host_bundle(app, d)
-        env["REBAR_IOS"] = "1"; env["CFProcessPath"] = host; env["REBAR_CFPROCESSPATH"] = host
+        env["REBAR_IOS"] = "1"; env["REBAR_IOS_UI"] = "1"; env["CFProcessPath"] = host; env["REBAR_CFPROCESSPATH"] = host; env["REBAR_LIB_DIR"] = os.path.dirname(REBAR_IOS)
         os.execve(host, [host, exe] + args, env)
-    env["CFProcessPath"] = exe
+    env["CFProcessPath"] = exe; env["REBAR_IOS"] = "1"
     os.execve(REBAR, [REBAR, exe] + args, env)
 
 def main():

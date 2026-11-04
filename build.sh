@@ -7,3 +7,5 @@ cd "$(dirname "$0")" && clang -arch x86_64 -std=gnu2x -O2 -Wall -Wextra -Wno-unu
 if xcrun -f vtool >/dev/null 2>&1; then
     xcrun vtool -set-build-version maccatalyst 15.0 26.0 -replace -output rebar-ios rebar >/dev/null 2>&1 && codesign --force -s - rebar-ios >/dev/null 2>&1
 fi
+# the keychain iOS apps use (see ios_sec.m); rebar-ios and the host bundles find it next to rebar
+clang -arch x86_64 -dynamiclib -fobjc-arc -O2 -w -framework Foundation -framework Security ios_sec.m -o librebar_sec.dylib
