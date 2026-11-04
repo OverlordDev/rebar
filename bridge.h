@@ -1271,11 +1271,28 @@ H(h_sysctlbyname) {
             RET(0);
             return;
         }
+    if (name && (!strcmp(name, "hw.pagesize") || !strcmp(name, "vm.pagesize") || !strcmp(name, "hw.pagesize32")) && !getenv("REBAR_NO_ARCH_SPOOF")) {   // Apple Silicon has 16 KiB pages (fastfetch and htop shift page counts by it)
+        size_t *lenp = (size_t *)c->x[2]; size_t want = lenp ? *lenp : 0;
+        if (c->x[1] && lenp) { if (want >= 8) *(int64_t *)c->x[1] = GUEST_PAGE; else if (want >= 4) *(int32_t *)c->x[1] = GUEST_PAGE; }
+        if (lenp && *lenp != 4 && *lenp < 8) *lenp = 4; else if (lenp && *lenp > 8) *lenp = 8;
+        RET(0); return;
+    }
     if (name && !strcmp(name, "hw.machine") && !getenv("REBAR_NO_ARCH_SPOOF")) {   // an arm64 program is told it runs on arm64 (pip picks wheels by it; Python's platform.machine() asks uname)
         size_t *lenp = (size_t *)c->x[2]; if (c->x[1] && lenp && *lenp >= 6) memcpy((void *)c->x[1], "arm64", 6); if (lenp) *lenp = 6; RET(0); return;
     }
     host_call(c, HOSTFN("sysctlbyname"), false);
 }
+// The host counts pages in 4 KiB units; an arm64 program expects the 16 KiB pages of Apple Silicon (hw.pagesize above), so the page counts of the VM statistics are divided by 4
+// (otherwise "free + cached pages << 14" is four times the memory and a program computing used = total - that underflows).
+H(h_host_page_size) { if (c->x[1]) *(uint64_t *)c->x[1] = GUEST_PAGE; RET(0); }
+static void scale_vm_stats(CPU *c, int flavor, void *info) {
+    if ((int)c->x[0] != 0 || !info) return;
+    if (flavor == 4) { vm_statistics64_data_t *v = info; v->free_count /= 4; v->active_count /= 4; v->inactive_count /= 4; v->wire_count /= 4; v->purgeable_count /= 4; v->speculative_count /= 4;
+        v->compressor_page_count /= 4; v->throttled_count /= 4; v->external_page_count /= 4; v->internal_page_count /= 4; }
+    else if (flavor == 2) { vm_statistics_data_t *v = info; v->free_count /= 4; v->active_count /= 4; v->inactive_count /= 4; v->wire_count /= 4; v->purgeable_count /= 4; v->speculative_count /= 4; }
+}
+H(h_host_statistics64) { int fl = (int)c->x[1]; void *info = (void *)c->x[2]; host_call(c, HOSTFN("host_statistics64"), false); if (!getenv("REBAR_NO_ARCH_SPOOF")) scale_vm_stats(c, fl, info); }
+H(h_host_statistics)   { int fl = (int)c->x[1]; void *info = (void *)c->x[2]; host_call(c, HOSTFN("host_statistics"), false);   if (!getenv("REBAR_NO_ARCH_SPOOF")) scale_vm_stats(c, fl, info); }
 H(h_uname) {   // struct utsname: five fields of 256 bytes, machine is the fifth
     uint64_t buf = c->x[0];
     host_call(c, HOSTFN("uname"), false);
@@ -1378,7 +1395,7 @@ static const Special k_special[] = {
     {"_valloc", h_valloc}, {"_free", h_free}, {"_realloc", h_realloc}, {"_malloc_size", h_malloc_size}, {"_malloc_zone_malloc", h_malloc_zone_malloc},
     {"_malloc_zone_calloc", h_malloc_zone_calloc}, {"_malloc_zone_valloc", h_malloc_zone_valloc},
     {"_malloc_zone_free", h_malloc_zone_free}, {"_malloc_zone_realloc", h_malloc_zone_realloc},
-    {"_mmap", h_mmap}, {"_sys_icache_invalidate", h_sys_icache_invalidate}, {"___clear_cache", h_clear_cache}, {"_thread_suspend", h_thread_suspend}, {"___chkstk_darwin", h_chkstk_darwin}, {"_sysctlbyname", h_sysctlbyname},
+    {"_mmap", h_mmap}, {"_sys_icache_invalidate", h_sys_icache_invalidate}, {"___clear_cache", h_clear_cache}, {"_thread_suspend", h_thread_suspend}, {"___chkstk_darwin", h_chkstk_darwin}, {"_sysctlbyname", h_sysctlbyname}, {"_host_page_size", h_host_page_size}, {"_host_statistics64", h_host_statistics64}, {"_host_statistics", h_host_statistics},
     {"_SSLGetEnabledCiphers", h_SSLGetEnabledCiphers}, {"_SSLGetSupportedCiphers", h_SSLGetSupportedCiphers}, {"_SSLSetEnabledCiphers", h_SSLSetEnabledCiphers}, {"_SSLGetNegotiatedCipher", h_SSLGetNegotiatedCipher}, {"_munmap", h_munmap}, {"_mprotect", h_mprotect}, {"_madvise", h_madvise},
     {"_vm_protect", h_vm_protect}, {"_mach_vm_protect", h_vm_protect}, {"_vm_allocate", h_vm_allocate},
     {"_mach_vm_allocate", h_vm_allocate}, {"_vm_deallocate", h_vm_deallocate}, {"_mach_vm_deallocate", h_vm_deallocate},

@@ -189,6 +189,7 @@ done
 
 printf '8e4da1bc9fdc589d01010101c6c6c6c6\nroundtrip ok\n' > $T/a; run_to 30 $T/b $R t92_arm; grep -v '^nvrm' $T/b > $T/b2; check t92_aesmc_rd $T/a $T/b2
 run_to 30 $T/a ./t93_x86; run_to 30 $T/b $R t93_arm; grep -v '^nvrm' $T/b > $T/b2; check t93_environ_live $T/a $T/b2
+[ -x t94_arm ] || clang -arch arm64 -o t94_arm t94_pagesize.c; printf 'same 1\npages fit in memory 1\n' > $T/a; run_to 30 $T/b $R t94_arm; grep -v '^nvrm' $T/b > $T/b2; check t94_pagesize $T/a $T/b2
 
 # Homebrew arm64 bottles (tools/rebrew.py install jq sqlite lua ripgrep tmux): checked when the prefix exists
 HB=${REBREW_PREFIX:-$HOME/Desktop/arm64-apps/homebrew}
@@ -210,6 +211,15 @@ if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
     (cd $T/ipa && zip -qr ../IosCli.ipa Payload)
     printf 'json {"k":[1,2,3]}\nbundle dev.rebar.ioscli\nhw.machine arm64\nargs 2\n' > $T/a
     REBAR=$PWD/$R run_to 30 $T/b python3 -I ../tools/ipa.py run $T/IosCli.ipa x y; grep -v '^nvrm' $T/b > $T/b2; check ios_cli_ipa $T/a $T/b2
+    # the same for a UIKit app: runs from a generated Mac Catalyst host bundle with rebar-ios (needs a window server session)
+    if [ -x ../rebar-ios ]; then
+        rm -rf $T/ipaui && mkdir -p $T/ipaui/Payload/IosUi.app
+        xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios15.0 -fobjc-arc -framework UIKit -framework Foundation -w ios_ui.m -o $T/ipaui/Payload/IosUi.app/IosUi 2>/dev/null
+        printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosUi</string><key>CFBundleIdentifier</key><string>dev.rebar.iosui</string><key>MinimumOSVersion</key><string>15.0</string><key>UIDeviceFamily</key><array><integer>1</integer></array></dict></plist>' > $T/ipaui/Payload/IosUi.app/Info.plist
+        (cd $T/ipaui && zip -qr ../IosUi.ipa Payload)
+        printf 'launched idiom 0 window key 1 label UIKit under rebar\nbye\n' > $T/a
+        run_to 60 $T/b python3 -I ../tools/ipa.py run $T/IosUi.ipa; grep -v '^nvrm' $T/b > $T/b2; check ios_uikit_ipa $T/a $T/b2
+    fi
 else echo "SKIP ios_cli_ipa (no iphoneos SDK)"; fi
 
 echo "passed $pass, failed $fail"

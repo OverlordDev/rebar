@@ -6,10 +6,11 @@
   ipa.py run <app.ipa|App.app> [args...]  unpack if needed and start the executable under rebar (rebar-ios when it needs UIKit)
 
 What runs: iOS arm64 command-line style code (Foundation, libSystem, Network, CoreData, ... the frameworks macOS shares with iOS) runs as is. Anything that links UIKit needs
-the Mac Catalyst copy of UIKit, which only loads into a process built for the macCatalyst platform: that is `rebar-ios` (built by build.sh from rebar with vtool).
+the Mac Catalyst copy of UIKit, which only loads into a process built for the macCatalyst platform and living in an .app: that is `rebar-ios` (build.sh makes it from rebar with vtool)
+inside a generated host bundle (cache dir, see host_bundle).
 Apps from the App Store are FairPlay-encrypted (LC_ENCRYPTION_INFO cryptid=1): the code is not readable and nothing here decrypts it; use an IPA you built or own the decrypted binary of.
 """
-import hashlib, os, plistlib, subprocess, sys, zipfile
+import hashlib, os, plistlib, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -78,17 +79,47 @@ def show(d):
     print("  frameworks   %s" % ", ".join(sorted({l.split("/")[4].replace(".framework", "") for l in sysfw})))
     if d["embedded"]: print("  embedded     %s" % ", ".join(d["embedded"]))
 
+LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+
+def host_bundle(app, d):
+    """UIKit (Mac Catalyst) only runs a process that lives in an .app: its scene server looks the client up by bundle. So the iOS app is run from a small host bundle
+    <cache>/host/<Name>.app: Contents/MacOS/<Name> is rebar-ios, Contents/Resources is the iOS .app folder (nibs, assets, Info.plist), Contents/Info.plist is the app's with the
+    executable renamed. rebar-ios then loads the arm64 iOS executable from the original folder."""
+    name = os.path.basename(d["executable"])
+    host = os.path.join(os.path.dirname(os.path.dirname(app)), "host", name + ".app")
+    exe = os.path.join(host, "Contents", "MacOS", name)
+    stamp = os.path.join(host, ".stamp")
+    want = "%s %s" % (os.path.getmtime(REBAR_IOS), os.path.realpath(app))
+    if not (os.path.exists(stamp) and open(stamp).read() == want):
+        shutil.rmtree(host, ignore_errors=True)
+        os.makedirs(os.path.dirname(exe))
+        shutil.copy2(REBAR_IOS, exe)
+        os.symlink(app, os.path.join(host, "Contents", "Resources"))
+        with open(os.path.join(app, "Info.plist"), "rb") as f: p = plistlib.load(f)
+        p["CFBundleExecutable"] = name
+        p.pop("NSPrincipalClass", None)
+        p["CFBundlePackageType"] = "APPL"
+        p["LSMinimumSystemVersion"] = "12.0"
+        p.setdefault("CFBundleVersion", "1")
+        with open(os.path.join(host, "Contents", "Info.plist"), "wb") as f: plistlib.dump(p, f)
+        subprocess.run(["codesign", "--force", "--sign", "-", host], capture_output=True)
+        subprocess.run([LSREGISTER, "-f", host], capture_output=True)
+        with open(stamp, "w") as f: f.write(want)
+    return exe
+
 def run(path, args):
     app = find_app(path); d = info(app)
     if "arm64" not in d["archs"] and "arm64e" not in d["archs"]: sys.exit("ipa: no arm64 slice (%s)" % ",".join(d["archs"]))
     if d["encrypted"]: sys.exit("ipa: the binary is FairPlay-encrypted (cryptid 1); it has to be decrypted first")
     exe = d["executable"]
+    env = dict(os.environ); env["MallocNanoZone"] = "0"
     if d["uses_ui"]:
-        rb = REBAR_IOS
-        if not os.path.exists(rb): sys.exit("ipa: %s missing (run build.sh; it needs vtool from Xcode)" % rb)
-    else: rb = REBAR
-    env = dict(os.environ); env["CFProcessPath"] = exe; env["REBAR_IOS"] = "1"; env["MallocNanoZone"] = "0"
-    os.execve(rb, [rb, exe] + args, env)
+        if not os.path.exists(REBAR_IOS): sys.exit("ipa: %s missing (run build.sh; it needs vtool from Xcode)" % REBAR_IOS)
+        host = host_bundle(app, d)
+        env["REBAR_IOS"] = "1"; env["CFProcessPath"] = host; env["REBAR_CFPROCESSPATH"] = host
+        os.execve(host, [host, exe] + args, env)
+    env["CFProcessPath"] = exe
+    os.execve(REBAR, [REBAR, exe] + args, env)
 
 def main():
     a = sys.argv[1:]

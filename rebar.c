@@ -1591,6 +1591,16 @@ static void atfork_child(void) {
     pthread_sigmask(SIG_SETMASK, &t_fork_oldmask, NULL);
 }
 
+// UIKit for Mac Catalyst starts with [NSApplication _startWindowServerIfNecessary] (AppKit in macOS 26 has it; this macOS 15 does not): a process that is in a window-server session
+// already (rebar always is) needs nothing there, so the class method is added as a no-op. The scene server (FuseBoard) only accepts a client that runs from an .app bundle.
+static void ios_noop_ws(id self, SEL sel) { (void)self; (void)sel; }
+static void ios_prepare(void) {
+    dlopen("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", RTLD_NOW | RTLD_GLOBAL);
+    Class app = objc_getClass("NSApplication");
+    if (app && !class_getClassMethod(app, sel_registerName("_startWindowServerIfNecessary")))
+        class_addMethod(object_getClass(app), sel_registerName("_startWindowServerIfNecessary"), (IMP)ios_noop_ws, "v@:");
+}
+
 int main(int argc, char **argv) {
     int ai = 1;
     // libmalloc's nano zone (the default for small blocks) aborts a guest that runs Chromium or Node ("Non-aligned pointer being freed (2)" while Foundation's
@@ -1685,13 +1695,14 @@ int main(int argc, char **argv) {
     char real[PATH_MAX];
     if (!realpath(argv[ai], real)) { perror(argv[ai]); return 1; }
     snprintf(g_exe_path, sizeof g_exe_path, "%s", real);
-    setenv("CFProcessPath", g_exe_path, 1);   // before anything loads AppKit: once something asks for the main bundle, CoreFoundation keeps the answer (it was the folder of rebar for VLC)
+    setenv("CFProcessPath", getenv("REBAR_CFPROCESSPATH") ? getenv("REBAR_CFPROCESSPATH") : g_exe_path, 1);   // (REBAR_CFPROCESSPATH: an iOS app run from its host bundle, see tools/ipa.py) before anything loads AppKit: once something asks for the main bundle, CoreFoundation keeps the answer (it was the folder of rebar for VLC)
     proc_pidpath(getpid(), g_self_path, sizeof g_self_path);  // helper processes are started as `rebar <program>`
     if (!getenv("REBAR_NO_EXECSHIM")) {   // librebar_exec.dylib lives next to rebar
         char shim[PATH_MAX]; snprintf(shim, sizeof shim, "%s", g_self_path);
         char *slash = strrchr(shim, '/');
         if (slash) { snprintf(slash + 1, sizeof shim - (size_t)(slash + 1 - shim), "librebar_exec.dylib"); if (access(shim, R_OK) == 0) snprintf(g_shim_path, sizeof g_shim_path, "%s", shim); }
     }
+    if (getenv("REBAR_IOS")) ios_prepare();   // an iOS app: UIKit (Mac Catalyst) asks AppKit for something this macOS does not have
     GImage *mainimg = load_image(real, NULL, true);  // maps the executable and, recursively, its guest dylibs
     if (!mainimg->have_entry) { fprintf(stderr, "rebar: no LC_MAIN (LC_UNIXTHREAD not supported yet)\n"); return 1; }
 
@@ -1717,7 +1728,7 @@ int main(int argc, char **argv) {
     g_progname = strrchr(g_argv[0], '/') ? strrchr(g_argv[0], '/') + 1 : g_argv[0];
     g_environ = environ;
     setprogname(g_progname);
-    setenv("CFProcessPath", g_exe_path, 1);  // CoreFoundation derives the main bundle from this
+    setenv("CFProcessPath", getenv("REBAR_CFPROCESSPATH") ? getenv("REBAR_CFPROCESSPATH") : g_exe_path, 1);  // CoreFoundation derives the main bundle from this
     // argv, the environment and the apple strings in one array, the way the kernel lays them out: Go's runtime finds the environment as argv[argc + 1 ...]
     static char apple0[1100];
     snprintf(apple0, sizeof apple0, "executable_path=%s", g_exe_path);
