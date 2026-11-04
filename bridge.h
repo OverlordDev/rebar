@@ -123,7 +123,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide; bool dtor, sret, sb, sretw; } StrSpec;  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -1051,6 +1051,29 @@ VARIADIC_FWD(h_curl_multi_setopt, "curl_multi_setopt", 2, 1)
 VARIADIC_FWD(h_curl_share_setopt, "curl_share_setopt", 2, 1)
 VARIADIC_FWD(h_sqlite3_db_config, "sqlite3_db_config", 2, 3)
 VARIADIC_FWD(h_sqlite3_config, "sqlite3_config", 1, 3)
+// libxml2's printf-style writer functions (and xmlStrPrintf): the variadic arguments are on the guest's stack, so they go to the host's v-variant with a va_list that points there. `nf` is the
+// number of fixed pointer arguments including the format.
+#define XML_VFWD(handler, vname, nf) \
+    H(handler) { VA_INIT(ap, c->sp); void *f = HOSTFN(vname); \
+        switch (nf) { \
+        case 2: RET(((int (*)(void *, const void *, va_list))f)(P(0), P(1), ap)); break; \
+        case 3: RET(((int (*)(void *, const void *, const void *, va_list))f)(P(0), P(1), P(2), ap)); break; \
+        case 4: RET(((int (*)(void *, const void *, const void *, const void *, va_list))f)(P(0), P(1), P(2), P(3), ap)); break; \
+        default: RET(((int (*)(void *, const void *, const void *, const void *, const void *, va_list))f)(P(0), P(1), P(2), P(3), P(4), ap)); break; } }
+XML_VFWD(h_xmlw_fmt_string, "xmlTextWriterWriteVFormatString", 2)
+XML_VFWD(h_xmlw_fmt_raw, "xmlTextWriterWriteVFormatRaw", 2)
+XML_VFWD(h_xmlw_fmt_comment, "xmlTextWriterWriteVFormatComment", 2)
+XML_VFWD(h_xmlw_fmt_cdata, "xmlTextWriterWriteVFormatCDATA", 2)
+XML_VFWD(h_xmlw_fmt_element, "xmlTextWriterWriteVFormatElement", 3)
+XML_VFWD(h_xmlw_fmt_attribute, "xmlTextWriterWriteVFormatAttribute", 3)
+XML_VFWD(h_xmlw_fmt_pi, "xmlTextWriterWriteVFormatPI", 3)
+XML_VFWD(h_xmlw_fmt_element_ns, "xmlTextWriterWriteVFormatElementNS", 5)
+XML_VFWD(h_xmlw_fmt_attribute_ns, "xmlTextWriterWriteVFormatAttributeNS", 5)
+XML_VFWD(h_xmlw_fmt_dtd, "xmlTextWriterWriteVFormatDTD", 5)
+XML_VFWD(h_xmlw_fmt_dtd_element, "xmlTextWriterWriteVFormatDTDElement", 3)
+XML_VFWD(h_xmlw_fmt_dtd_attlist, "xmlTextWriterWriteVFormatDTDAttlist", 3)
+XML_VFWD(h_xmlw_fmt_dtd_entity, "xmlTextWriterWriteVFormatDTDInternalEntity", 4)
+H(h_xmlStrPrintf) { VA_INIT(ap, c->sp); int (*f)(void *, int, const void *, va_list) = HOSTFN("xmlStrVPrintf"); RET(f(P(0), (int)c->x[1], P(2), ap)); }
 H(h_execl)   { exec_list(c, false, false); }
 H(h_execlp)  { exec_list(c, true, false); }
 H(h_execle)  { exec_list(c, false, true); }
@@ -1277,7 +1300,7 @@ static const Special k_special[] = {
     {"_SSLGetEnabledCiphers", h_SSLGetEnabledCiphers}, {"_SSLGetSupportedCiphers", h_SSLGetSupportedCiphers}, {"_SSLSetEnabledCiphers", h_SSLSetEnabledCiphers}, {"_SSLGetNegotiatedCipher", h_SSLGetNegotiatedCipher}, {"_munmap", h_munmap}, {"_mprotect", h_mprotect}, {"_madvise", h_madvise},
     {"_vm_protect", h_vm_protect}, {"_mach_vm_protect", h_vm_protect}, {"_vm_allocate", h_vm_allocate},
     {"_mach_vm_allocate", h_vm_allocate}, {"_vm_deallocate", h_vm_deallocate}, {"_mach_vm_deallocate", h_vm_deallocate},
-    {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_execl", h_execl}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
+    {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
     {"_open$NOCANCEL", h_open}, {"_openat$NOCANCEL", h_openat}, {"_fcntl$NOCANCEL", h_fcntl},   // (the mode / argument of these variadic functions is on the stack on arm64, not in x2 / x3: Bun, Zig and Rust call the $NOCANCEL forms directly)
     {"_exit", h_exit}, {"_atexit", h_atexit}, {"___cxa_atexit", h_cxa_atexit}, {"___cxa_finalize", h_nop},
     {"_qsort", h_qsort}, {"_qsort_r", h_qsort_r}, {"_bsearch", h_bsearch}, {"__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv", h_dir_deref}, {"__ZNKSt3__14__fs10filesystem28recursive_directory_iterator13__dereferenceEv", h_rdir_deref}, {"_tsearch", h_tsearch}, {"_tfind", h_tfind}, {"_tdelete", h_tdelete}, {"_twalk", h_twalk}, {"_lfind", h_lfind}, {"_lsearch", h_lsearch},
@@ -1773,6 +1796,7 @@ static inline void apply_landing(CPU *c) {
 }
 
 static void stub_call_inner(CPU *c);
+static void ti_canonicalize_tree(uint64_t ti, int depth);
 static bool trace_stub_wanted(const char *name);
 // Handlers share the bridge's data and run one at a time; imports that only forward to a host function do not take the lock.
 // REBAR_STUBPROF=<file>: calls and time (TSC ticks, GIL waits included) per import, written to <file>.<pid> every 2 s
@@ -1936,6 +1960,12 @@ static void stub_call_inner(CPU *c) {
       if (bt_stub && !strcmp(s->name, bt_stub)) { fprintf(stderr, "[bt] %s(0x%llx, 0x%llx, 0x%llx)\n", s->name, (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2]); dump_backtrace(c);
         if (getenv("REBAR_DUMP_X0") && c->x[0] > 0x10000 && (in_guest(c->x[0]) || c->x[0] < 0x800000000000ull)) { int nw = atoi(getenv("REBAR_DUMP_X0")); fprintf(stderr, "  x0 words:"); for (int k = 0; k < nw; k++) fprintf(stderr, " %llx", (unsigned long long)((uint64_t *)c->x[0])[k]); fprintf(stderr, "\n");
           uint64_t isa = ((uint64_t *)c->x[0])[0]; if (in_guest(isa)) { fprintf(stderr, "  isa words:"); for (int k = 0; k < nw; k++) fprintf(stderr, " %llx", (unsigned long long)((uint64_t *)isa)[k]); fprintf(stderr, "\n"); } } } }
+    if (__builtin_expect(s->throwing, 0) && c->x[1] > 0x10000) ti_canonicalize_tree(c->x[1], 0);
+    static int trace_throw = -1; if (__builtin_expect(trace_throw < 0, 0)) trace_throw = getenv("REBAR_TRACE_THROW") != NULL;   // REBAR_TRACE_THROW=1: the type of every C++ exception the guest throws
+    if (__builtin_expect(trace_throw, 0) && !strcmp(s->name, "___cxa_throw") && c->x[1] > 0x10000) {
+        const char *nm = (const char *)(*(uint64_t *)(c->x[1] + 8) & ~(1ull << 63));
+        fprintf(stderr, "[throw] %s (typeinfo %llx) from guest %llx\n", nm && (uint64_t)nm > 0x10000 ? nm : "?", (unsigned long long)c->x[1], (unsigned long long)c->x[30]);
+    }
     static int trace_catch = -1; if (__builtin_expect(trace_catch < 0, 0)) trace_catch = getenv("REBAR_TRACE_CATCH") != NULL;   // (getenv takes the process-wide environment lock: not on every call)
     if (__builtin_expect(trace_catch, 0) && !strcmp(s->name, "_objc_begin_catch") && c->x[0] > 0x10000) {   // what the guest's @catch got: the exception's description
         void *(*send)(void *, void *) = HOSTFN("objc_msgSend"); void *(*selreg)(const char *) = HOSTFN("sel_registerName");
@@ -2147,6 +2177,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     if (host && !h && stl_layout_dependent(name))
         fprintf(stderr, "rebar: warning: %s takes libc++ objects whose arm64 layout rebar does not convert; expect it to misbehave\n", name);
     if (host && !h) g_stubs[idx].thisret = returns_this(name);
+    if (host && !h) g_stubs[idx].throwing = !strcmp(name, "___cxa_throw");
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;
     if (host && !h) g_stubs[idx].swift = name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S');   // a Swift symbol: Swift's calling convention
     if (host && !h) g_stubs[idx].maps = !strcmp(name, "_vm_map") || !strcmp(name, "_mach_vm_map") || !strcmp(name, "_vm_remap") || !strcmp(name, "_mach_vm_remap");

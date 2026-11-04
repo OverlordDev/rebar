@@ -548,6 +548,38 @@ _Unwind_Reason_Code rebar_entry_personality(int version, _Unwind_Action actions,
 // REBAR_CLEAR_TI_TAG=1 brings the old behaviour (clear it in every guest typeinfo at load) back.
 static uint64_t g_ti_vts[16];
 static int g_nti_vts;
+// On macOS dyld coalesces the weak definitions of a type's typeinfo across images; rebar does not, so the same type has one typeinfo (and one name string) per image, and the host's
+// libc++abi, which compares typeinfos by their name pointer, would take them for different types: an exception thrown in one library never matched a catch clause in another
+// (LibreOffice's NoSuchElementException). Every typeinfo's name pointer is therefore replaced by the first one seen for that name.
+typedef struct TiName { struct TiName *next; uint64_t canon; } TiName;
+static TiName *g_ti_names[1 << 14];
+static pthread_mutex_t g_ti_mu = PTHREAD_MUTEX_INITIALIZER;
+static void ti_canonical_name(uint64_t *field) {
+    static int off = -1; if (off < 0) off = getenv("REBAR_NO_TI_UNIFY") != NULL;   // REBAR_NO_TI_UNIFY=1: leave every image's typeinfo names alone (to compare)
+    if (off) return;
+    uint64_t v = *field, tag = v & (1ull << 63);
+    const char *str = (const char *)(v & ~(1ull << 63));
+    if (!str || (uint64_t)str < 0x10000) return;
+    uint32_t h = 2166136261u;
+    for (const char *q = str; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
+    h &= (1 << 14) - 1;
+    pthread_mutex_lock(&g_ti_mu);
+    for (TiName *t = g_ti_names[h]; t; t = t->next)
+        if (!strcmp((const char *)(t->canon & ~(1ull << 63)), str)) { *field = t->canon | tag; pthread_mutex_unlock(&g_ti_mu); return; }
+    TiName *n = malloc(sizeof *n);
+    n->canon = v; n->next = g_ti_names[h]; g_ti_names[h] = n;
+    pthread_mutex_unlock(&g_ti_mu);
+}
+// A typeinfo made at run time (UNO's gcc3 bridge builds the ones of exceptions that no library defines, with a name it copied) is thrown with its name and those of its bases unified
+// with the static ones, so that a catch clause of the same type in a library matches it.
+static uint64_t g_ti_vt_si, g_ti_vt_vmi;
+static void ti_canonicalize_tree(uint64_t ti, int depth) {
+    if (ti < 0x100000000ull || ti >= 0x7ff800000000ull || (ti & 7) || depth > 16) return;   // only the guest's own typeinfos (and those made on its heap): the host's are read-only and stay as they are
+    uint64_t vt = rd64(ti);
+    ti_canonical_name((uint64_t *)(ti + 8));
+    if (vt == g_ti_vt_si) ti_canonicalize_tree(rd64(ti + 16), depth + 1);
+    else if (vt == g_ti_vt_vmi) { uint32_t nb = rd32(ti + 20); for (uint32_t k = 0; k < nb && k < 32; k++) ti_canonicalize_tree(rd64(ti + 24 + 16 * (uint64_t)k), depth + 1); }
+}
 static void unwind_setup_image(GImage *img) {
     const struct mach_header_64 *mh = img->mh;
     const struct section_64 *ui = NULL;
@@ -573,8 +605,10 @@ static void unwind_setup_image(GImage *img) {
             "_ZTVN10__cxxabiv117__array_type_infoE", "_ZTVN10__cxxabiv120__function_type_infoE",
             "_ZTVN10__cxxabiv129__pointer_to_member_type_infoE", NULL};
         for (int k = 0; vt_names[k]; k++) { void *p = dlsym(RTLD_DEFAULT, vt_names[k]); if (p) g_ti_vts[g_nti_vts++] = (uint64_t)p + 16; }
+        { void *a = dlsym(RTLD_DEFAULT, "_ZTVN10__cxxabiv120__si_class_type_infoE"), *b = dlsym(RTLD_DEFAULT, "_ZTVN10__cxxabiv121__vmi_class_type_infoE"); if (a) g_ti_vt_si = (uint64_t)a + 16; if (b) g_ti_vt_vmi = (uint64_t)b + 16; }
     }
-    if (!g_nti_vts || !getenv("REBAR_CLEAR_TI_TAG")) return;
+    if (!g_nti_vts) return;
+    bool clear_tag = getenv("REBAR_CLEAR_TI_TAG") != NULL;
     lc = (const void *)(mh + 1);
     for (uint32_t k = 0; k < mh->ncmds; k++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) {
         if (lc->cmd != LC_SEGMENT_64) continue;
@@ -584,7 +618,11 @@ static void unwind_setup_image(GImage *img) {
         for (uint64_t a = lo; a + 16 <= lo + sg->filesize; a += 8) {
             uint64_t w = rd64(a);
             for (int v = 0; v < g_nti_vts; v++)
-                if (w == g_ti_vts[v] && (rd64(a + 8) >> 63)) { *(uint64_t *)(a + 8) &= ~(1ull << 63); break; }
+                if (w == g_ti_vts[v]) {
+                    if (clear_tag && (rd64(a + 8) >> 63)) *(uint64_t *)(a + 8) &= ~(1ull << 63);
+                    ti_canonical_name((uint64_t *)(a + 8));
+                    break;
+                }
         }
     }
 }

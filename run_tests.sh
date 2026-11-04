@@ -87,6 +87,7 @@ run_to 30 $T/a ./t79_x86; run_to 30 $T/b $R t79_arm; grep -v '^nvrm' $T/b > $T/b
 run_to 30 $T/a ./t81_x86; run_to 30 $T/b $R t81_arm; grep -v '^nvrm' $T/b > $T/b2; check t81_ifstream_seek $T/a $T/b2
 run_to 30 $T/a ./t82_x86; run_to 30 $T/b $R t82_arm; grep -v '^nvrm' $T/b > $T/b2; check t82_any_cast $T/a $T/b2
 run_to 30 $T/a ./t83_x86; run_to 30 $T/b $R t83_arm; grep -v '^nvrm' $T/b > $T/b2; check t83_fs_current_path $T/a $T/b2
+run_to 30 $T/a ./t84_x86; run_to 30 $T/b $R t84_arm; grep -v '^nvrm' $T/b > $T/b2; check t84_exc_across_dylibs $T/a $T/b2
 printf 'spawn 0\nshell said: hello, arm64\nstatus 0\n' > $T/a; run_to 60 $T/b $R t67_arm "$PWD/t2_hello"; grep -v '^nvrm' $T/b > $T/b2; check t67_shell_runs_arm64 $T/a $T/b2
 run_to 30 $T/a ./t68_x86; run_to 30 $T/b $R t68_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t68_variadic_ipc $T/a $T/b2
 run_to 30 $T/a ./t69_x86; run_to 30 $T/b $R t69_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t69_wprintf $T/a $T/b2
