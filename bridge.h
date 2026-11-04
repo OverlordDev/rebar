@@ -413,9 +413,9 @@ static void find_sigtramp(void) {
 static uint64_t g_fpos_cb_seekoff[8], g_fpos_cb_seekpos[8];
 static int g_fpos_cb_n_off, g_fpos_cb_n_pos, g_fpos_ready;
 static void fpos_cb_init(void) {
-    static const char *off[] = {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5tellgEv", "__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgExNS_8ios_base8seekdirE",
-        "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5tellpEv", "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5seekpExNS_8ios_base8seekdirE",
-        "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE10pubseekoffExNS_8ios_base8seekdirEj", NULL};
+    static const char *off[] = {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5tellgEv", "__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgExNS_8ios_base7seekdirE",
+        "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5tellpEv", "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5seekpExNS_8ios_base7seekdirE",
+        "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE10pubseekoffExNS_8ios_base7seekdirEj", NULL};
     static const char *pos[] = {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgENS_4fposI11__mbstate_tEE", "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5seekpENS_4fposI11__mbstate_tEE",
         "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE10pubseekposENS_4fposI11__mbstate_tEEj", NULL};
     for (int k = 0; off[k]; k++) { void *a = dlsym(RTLD_DEFAULT, off[k] + 1); if (a) g_fpos_cb_seekoff[g_fpos_cb_n_off++] = (uint64_t)a; }
@@ -1539,6 +1539,7 @@ static bool returns_string_by_value(const char *n) {
         static const char *fns[] = {"__absolute", "__canonical", "__read_symlink", "__temp_directory_path", "__weakly_canonical",
                                     "lexically_normal", "lexically_relative", NULL};
         for (const char **f = fns; *f; f++) if (strstr(n, *f)) return true;
+        if (strstr(n, "14__current_pathEPNS_10error_codeE")) return true;   // current_path() (the setter, __current_path(const path&, error_code&), returns nothing)
     }
     return false;
 }
@@ -1844,6 +1845,21 @@ static void stub_call(CPU *c) {
     stub_call_inner(c);
     if (!had && t_have_gil) gil_release();  // (also when an exception that arrived from the host took the lock meanwhile)
 }
+// The host's seekoff / seekpos of a stream buffer (reached through the vtable of a buffer the host created, such as an ofstream's filebuf: tellp() ends there) return a 136-byte
+// std::fpos by value and seekpos takes one; the type encodings let forward_enc do the sret and by-value conversions.
+static const char *host_fn_enc(const char *sym) {
+    static const struct { const char *name, *enc; } t[] = {
+        {"_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE7seekoffExNS_8ios_base7seekdirEj", "{fpos=q[16q]}^vqiI"},
+        {"_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE7seekposENS_4fposI11__mbstate_tEEj", "{fpos=q[16q]}^v{fpos=q[16q]}I"},
+        {"_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7seekoffExNS_8ios_base7seekdirEj", "{fpos=q[16q]}^vqiI"},
+        {"_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7seekposENS_4fposI11__mbstate_tEEj", "{fpos=q[16q]}^v{fpos=q[16q]}I"},
+        {"_ZNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE7seekoffExNS_8ios_base7seekdirEj", "{fpos=q[16q]}^vqiI"},
+        {"_ZNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE7seekposENS_4fposI11__mbstate_tEEj", "{fpos=q[16q]}^v{fpos=q[16q]}I"},
+    };
+    if (!sym) return NULL;
+    for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) if (!strcmp(sym, t[k].name)) return t[k].enc;
+    return NULL;
+}
 static void str_to_guest(uint8_t *g, const uint8_t *d);
 static bool host_fn_returns_string(const char *sym) {   // (char only: the wide strings have their own layout conversion)
     if (strncmp(sym, "_ZNKSt3__1", 10)) return false;
@@ -1856,10 +1872,10 @@ static void stub_call_inner(CPU *c) {
         if (c->pc < 0x10000) die(c, "branch to invalid address", 0);
         void *fn = (void *)c->pc;
         // (dladdr is slow, a few microseconds: the answer for a host function is remembered, per thread)
-        static __thread struct { uint64_t fn; bool returns_string; } t_hostfn_cache[256];
+        static __thread struct { uint64_t fn; bool returns_string; const char *enc; } t_hostfn_cache[256];
         unsigned hci = (unsigned)(c->pc >> 4) & 255;
-        bool fn_returns_string;
-        if (t_hostfn_cache[hci].fn == c->pc) fn_returns_string = t_hostfn_cache[hci].returns_string;
+        bool fn_returns_string; const char *fn_enc;
+        if (t_hostfn_cache[hci].fn == c->pc) { fn_returns_string = t_hostfn_cache[hci].returns_string; fn_enc = t_hostfn_cache[hci].enc; }
         else {
             Dl_info di;
             if (!dladdr(fn, &di)) {  // not inside any host image either: a stray pointer, report where it came from
@@ -1871,10 +1887,13 @@ static void stub_call_inner(CPU *c) {
                 exit(127);
             }
             fn_returns_string = di.dli_sname && host_fn_returns_string(di.dli_sname);
-            t_hostfn_cache[hci].fn = c->pc; t_hostfn_cache[hci].returns_string = fn_returns_string;
+            fn_enc = host_fn_enc(di.dli_sname);
+            if (g_trace_stubs) fprintf(stderr, "[host fn by pointer] %p %s\n", fn, di.dli_sname ? di.dli_sname : "?");
+            t_hostfn_cache[hci].fn = c->pc; t_hostfn_cache[hci].returns_string = fn_returns_string; t_hostfn_cache[hci].enc = fn_enc;
         }
         if (g_trace) fprintf(stderr, "  [host fn %p]\n", fn);
         c->pc = c->x[30];
+        if (fn_enc) { forward_enc(c, fn, fn, fn_enc, "stream buffer seek"); apply_landing(c); return; }
         {   // a host virtual function that returns a std::string by value (a facet's grouping or sign strings, called through its vtable): the result is in memory at x8 here and in the
             // host's string layout there, and `this` shifts by one register
             if (fn_returns_string) {
@@ -2151,7 +2170,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
             {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5seekpENS_4fposI11__mbstate_tEE", "^v^v{fpos=q[16q]}"},
             {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5tellpEv", "{fpos=q[16q]}^v"},
             {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE10pubseekposENS_4fposI11__mbstate_tEEj", "{fpos=q[16q]}^v{fpos=q[16q]}I"},
-            {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE10pubseekoffExNS_8ios_base8seekdirEj", "{fpos=q[16q]}^vqiI"},
+            {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE10pubseekoffExNS_8ios_base7seekdirEj", "{fpos=q[16q]}^vqiI"},
         };
         (void)F;
         for (size_t k = 0; k < sizeof cxx / sizeof cxx[0]; k++) if (!strcmp(name, cxx[k].name)) { g_stubs[idx].enc = cxx[k].enc; break; }

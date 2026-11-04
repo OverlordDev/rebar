@@ -84,8 +84,9 @@ printf 'ulock32 ok 0\nulock64 ok 0\n' > $T/a; run_to 60 $T/b $R t76_arm; grep -v
 printf 'read 17: through the fifo\ndone\n' > $T/a; run_to 30 $T/b $R t77_arm; grep -v '^nvrm' $T/b > $T/b2; check t77_fifo_open $T/a $T/b2
 run_to 30 $T/a ./t78_x86; run_to 30 $T/b $R t78_arm; grep -v '^nvrm' $T/b > $T/b2; check t78_sigaltstack $T/a $T/b2
 run_to 30 $T/a ./t79_x86; run_to 30 $T/b $R t79_arm; grep -v '^nvrm' $T/b > $T/b2; check t79_spawnp_path $T/a $T/b2
-printf 'size 20\nread 56789 at 5\nagain 567 now 8\nall 20\n' > $T/a; run_to 30 $T/b $R t81_arm; grep -v '^nvrm' $T/b > $T/b2; check t81_ifstream_seek $T/a $T/b2
+run_to 30 $T/a ./t81_x86; run_to 30 $T/b $R t81_arm; grep -v '^nvrm' $T/b > $T/b2; check t81_ifstream_seek $T/a $T/b2
 run_to 30 $T/a ./t82_x86; run_to 30 $T/b $R t82_arm; grep -v '^nvrm' $T/b > $T/b2; check t82_any_cast $T/a $T/b2
+run_to 30 $T/a ./t83_x86; run_to 30 $T/b $R t83_arm; grep -v '^nvrm' $T/b > $T/b2; check t83_fs_current_path $T/a $T/b2
 printf 'spawn 0\nshell said: hello, arm64\nstatus 0\n' > $T/a; run_to 60 $T/b $R t67_arm "$PWD/t2_hello"; grep -v '^nvrm' $T/b > $T/b2; check t67_shell_runs_arm64 $T/a $T/b2
 run_to 30 $T/a ./t68_x86; run_to 30 $T/b $R t68_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t68_variadic_ipc $T/a $T/b2
 run_to 30 $T/a ./t69_x86; run_to 30 $T/b $R t69_arm;                                  grep -v '^nvrm' $T/b > $T/b2; check t69_wprintf $T/a $T/b2
