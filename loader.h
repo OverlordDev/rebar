@@ -395,6 +395,15 @@ H(h_dlopen) {
             if (realpath(cand, real)) gp = strdup(real);
         }
     }
+    if (!gp && !strncmp(path, "@rpath/", 7)) {   // dlopen("@rpath/x") searches the rpaths of the images that are loaded (the caller's, and the executable's): the caller is not known here, so all of them
+        char cand[PATH_MAX], real[PATH_MAX];
+        for (int k = 0; k < g_nimages && !gp; k++)
+            for (int r = 0; r < g_images[k]->nrpath && !gp; r++) {
+                char *rp = expand_origin(g_images[k]->rpath[r], g_images[k]);
+                snprintf(cand, sizeof cand, "%s/%s", rp, path + 7); free(rp);
+                if (realpath(cand, real)) gp = strdup(real);
+            }
+    }
     if (gp) {
         const uint8_t *f; size_t l; int fd = open(gp, O_RDONLY); bool arm = false;
         if (fd >= 0) {
@@ -427,14 +436,20 @@ H(h_dlopen) {
     c->x[0] = (uint64_t)h;
 }
 
+static bool host_libsystem_symbol(const char *sym) {
+    void *p = dlsym(RTLD_DEFAULT, sym); Dl_info di;
+    return p && dladdr(p, &di) && di.dli_fname && (!strncmp(di.dli_fname, "/usr/lib/system/", 16) || !strcmp(di.dli_fname, "/usr/lib/libSystem.B.dylib") || !strcmp(di.dli_fname, "/usr/lib/libc++.1.dylib"));
+}
 H(h_dlsym) {
     uint64_t handle = c->x[0];
     char name[512];
     snprintf(name, sizeof name, "_%s", S(1));
     GImage *img = image_from_handle(handle);
     uint64_t a = img ? image_export_lookup(img, name) : 0;
-    if (!a && (!img || img->is_main)) {       // RTLD_DEFAULT / RTLD_NEXT / the executable: every guest image, then the host
-        a = find_guest_symbol(name);
+    bool deps = false;   // dlsym(handle of a guest library, name) also finds what the library's dependencies export (Julia asks libjulia-internal for strlen): the libraries here are the host's
+    if (!a && img && !img->is_main && name[1] && !strchr(name + 1, '$') && host_libsystem_symbol(name + 1)) deps = true;   // (only what libSystem really has: every guest library depends on it)
+    if (!a && (!img || img->is_main || deps)) {       // RTLD_DEFAULT / RTLD_NEXT / the executable: every guest image, then the host
+        a = deps ? 0 : find_guest_symbol(name);   // (a library's dependencies that are guest images are not searched: lbt asks OpenBLAS for names it does not have)
         if (!a) a = host_data_addr(name);        // a host variable: its address, as the guest will read it
         if (!a) a = stub_for(name, NULL, true);  // a host function: through our stub so special handlers apply
     }
