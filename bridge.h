@@ -376,8 +376,9 @@ __asm__(
     ".cfi_startproc\n"
     ".cfi_personality 155, _rebar_entry_personality\n"
     "  pushq %rbp\n  .cfi_def_cfa_offset 16\n  .cfi_offset %rbp, -16\n"
-    "  movq %rsp, %rbp\n  .cfi_def_cfa_register %rbp\n  subq $208, %rsp\n"
+    "  movq %rsp, %rbp\n  .cfi_def_cfa_register %rbp\n  subq $224, %rsp\n"
     "  movq %rax, 160(%rsp)\n  movq %r13, 168(%rsp)\n  movq %r12, 176(%rsp)\n  movq %r14, 200(%rsp)\n"
+    "  movabsq $0x5ca1ab1e5ca1ab1e, %rax\n  cmpq %rax, %r10\n  sete %al\n  movzbl %al, %eax\n  movq %rax, 208(%rsp)\n"   // (r10 = the magic value: the call came from a call site that follows it with `sub $8,%rsp`, see the redirect in on_segv)
     "  movq %rdi, 0(%rsp)\n  movq %rsi, 8(%rsp)\n  movq %rdx, 16(%rsp)\n"
     "  movq %rcx, 24(%rsp)\n  movq %r8, 32(%rsp)\n  movq %r9, 40(%rsp)\n"
     "  movsd %xmm0, 48(%rsp)\n  movsd %xmm1, 56(%rsp)\n  movsd %xmm2, 64(%rsp)\n  movsd %xmm3, 72(%rsp)\n"
@@ -388,7 +389,9 @@ __asm__(
     "  call _rebar_bridge_enter\n"
     "  movq 128(%rsp), %rax\n  movq 136(%rsp), %rdx\n  movsd 144(%rsp), %xmm0\n  movsd 152(%rsp), %xmm1\n"
     "  movq 176(%rsp), %r12\n  movq 184(%rsp), %rcx\n  movq 192(%rsp), %r8\n"
-    "  leave\n  .cfi_def_cfa %rsp, 8\n  ret\n"
+    "  movq 208(%rsp), %r10\n"
+    "  leave\n  .cfi_def_cfa %rsp, 8\n  testq %r10, %r10\n  jnz 1f\n  ret\n"
+    "1:\n  ret $8\n"   // a Swift async function is entered with a `call` that the caller follows with `subq $8,%rsp`: the callee returns with the stack 8 bytes higher
     ".cfi_endproc\n");
 
 static __thread int t_cb_stackargs;   // inside a host call whose callbacks have more than eight integer arguments (see rebar_bridge_enter)
@@ -1558,6 +1561,11 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
     if ((uint64_t)si->si_addr == rip) {
         if (rip - g_guest_lo < g_guest_size || guest_owned_code(rip)) {  // host code jumped to a guest function
             { uint64_t ra = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; if (g_sigtramp_ra && ra - (g_sigtramp_ra - 0x80) < 0x100) t_sig_entry = (int)uc->uc_mcontext->__ss.__rdi; }   // called by the host's signal trampoline: a signal handler
+            { static int chk = -1; if (chk < 0) chk = getenv("REBAR_CHECK_ALIGN") != NULL;
+              if (chk && (uc->uc_mcontext->__ss.__rsp & 15) != 8) { static int n; if (n++ < 8) { uint64_t ra = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; Dl_info di; const char *nm = dladdr((void *)ra, &di) && di.dli_sname ? di.dli_sname : "?";
+                char b[300]; int k = snprintf(b, sizeof b, "[align] host jumped to guest %llx with rsp %llx (mod 16 = %d); return address %llx in %s\n", (unsigned long long)rip, (unsigned long long)uc->uc_mcontext->__ss.__rsp, (int)(uc->uc_mcontext->__ss.__rsp & 15), (unsigned long long)ra, nm); write(2, b, k); } } }
+            { uint64_t ra0 = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; uint32_t after = 0; mach_vm_size_t got0 = 0; uc->uc_mcontext->__ss.__r10 = 0;
+              if (!getenv("REBAR_NO_ASYNC_RET") && mach_vm_read_overwrite(mach_task_self(), ra0, 4, (mach_vm_address_t)&after, &got0) == KERN_SUCCESS && got0 == 4 && after == 0x08ec8348u) uc->uc_mcontext->__ss.__r10 = 0x5ca1ab1e5ca1ab1eull; }   // 48 83 ec 08 = subq $8,%rsp
             uc->uc_mcontext->__ss.__r11 = rip;
             uc->uc_mcontext->__ss.__rip = (uint64_t)rebar_guest_entry;
             if (g_entry_stats) {
@@ -1604,6 +1612,7 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
       } }
     fprintf(stderr, "rebar: fault (signal %d) addr %p, host pc %p, last guest pc 0x%llx, last import %s called from 0x%llx\n",
             sig, si->si_addr, (void *)rip, (unsigned long long)(t_cpu ? t_cpu->pc : 0), t_last_stub ? t_last_stub->name : "-", (unsigned long long)t_last_lr);
+    if (getenv("REBAR_DUMP_CODE_AT")) { uint64_t a = strtoull(getenv("REBAR_DUMP_CODE_AT"), NULL, 16); const uint8_t *q = (const uint8_t *)(a - 0x100); fprintf(stderr, "  [code from %p:", (void *)q); for (int k = 0; k < 0x180; k++) fprintf(stderr, " %02x", q[k]); fprintf(stderr, "]\n"); }
     if (getenv("REBAR_DUMP_CODE")) { const uint8_t *pc = (const uint8_t *)uc->uc_mcontext->__ss.__rip; fprintf(stderr, "  [code at host pc %p, 48 bytes before and 16 after:", (void *)pc); for (int k = -48; k < 16; k++) fprintf(stderr, " %02x", pc[k]); fprintf(stderr, "]\n"); }
     if (getenv("REBAR_DUMP_HOTPAGE")) fprintf(stderr, "  [hotPage TLS slot 43 of this thread = %p]\n", pthread_getspecific(43));
     if (getenv("REBAR_DUMP_OBJ")) {   // REBAR_DUMP_OBJ=rbx|...: the 8 words at the address a register holds, and the class name its isa gives (debugging aid)
