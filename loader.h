@@ -405,6 +405,16 @@ H(h_dlopen) {
             if (realpath(cand, real)) gp = strdup(real);
         }
     }
+    if (!gp && path[0] != '/' && path[0] != '@' && strchr(path, '/') && g_main_image && g_main_image->path) {   // a relative path (GTK's pixbuf loaders cache lists "lib/gdk-pixbuf-2.0/..."): the app's launcher
+        char dir[PATH_MAX], cand[PATH_MAX], real[PATH_MAX];                                                    // would have been started with the bundle's Resources as the working directory
+        snprintf(dir, sizeof dir, "%s", g_main_image->path);
+        for (int up = 0; up < 8 && !gp; up++) {
+            char *slash = strrchr(dir, '/'); if (!slash || slash == dir) break; *slash = 0;
+            snprintf(cand, sizeof cand, "%s/%s", dir, path);
+            if (realpath(cand, real)) gp = strdup(real);
+            else { snprintf(cand, sizeof cand, "%s/Resources/%s", dir, path); if (realpath(cand, real)) gp = strdup(real); }   // (<bundle>/Contents/Resources is the usual working directory)
+        }
+    }
     if (!gp && !strncmp(path, "@rpath/", 7)) {   // dlopen("@rpath/x") searches the rpaths of the images that are loaded (the caller's, and the executable's): the caller is not known here, so all of them
         char cand[PATH_MAX], real[PATH_MAX];
         for (int k = 0; k < g_nimages && !gp; k++)
