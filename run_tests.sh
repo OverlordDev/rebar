@@ -202,5 +202,15 @@ hbcheck brew_lua 42 lua -e 'print(6*7)'
 [ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
 hbcheck brew_tmux "tmux 3.8" tmux -V
 
+# iOS: an iOS-platform arm64 command-line program, packed as an IPA and started with tools/ipa.py (needs the iphoneos SDK)
+if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
+    rm -rf $T/ipa && mkdir -p $T/ipa/Payload/IosCli.app
+    xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios15.0 -fobjc-arc -framework Foundation ios_cli.m -o $T/ipa/Payload/IosCli.app/IosCli 2>/dev/null
+    printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>IosCli</string><key>CFBundleIdentifier</key><string>dev.rebar.ioscli</string><key>MinimumOSVersion</key><string>15.0</string></dict></plist>' > $T/ipa/Payload/IosCli.app/Info.plist
+    (cd $T/ipa && zip -qr ../IosCli.ipa Payload)
+    printf 'json {"k":[1,2,3]}\nbundle dev.rebar.ioscli\nhw.machine arm64\nargs 2\n' > $T/a
+    REBAR=$PWD/$R run_to 30 $T/b python3 -I ../tools/ipa.py run $T/IosCli.ipa x y; grep -v '^nvrm' $T/b > $T/b2; check ios_cli_ipa $T/a $T/b2
+else echo "SKIP ios_cli_ipa (no iphoneos SDK)"; fi
+
 echo "passed $pass, failed $fail"
 [ $fail = 0 ]

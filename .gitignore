@@ -1,5 +1,6 @@
 # built products
 /rebar
+/rebar-ios
 /librebar_exec.dylib
 *.o
 *.dSYM/
