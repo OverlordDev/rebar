@@ -159,3 +159,39 @@ final class PidCache {
         return v
     }
 }
+
+
+/// What matters about an executable for iOS apps: the CPU types, whether its code is FairPlay-encrypted (LC_ENCRYPTION_INFO cryptid 1) and whether it links UIKit or SwiftUI (of the arm64 slice).
+func machoInfo(atPath path: String) -> (archs: [String], encrypted: Bool, usesUI: Bool)? {
+    let archs = machoArchs(atPath: path)
+    guard !archs.isEmpty, let h = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? h.close() }
+    var base: UInt64 = 0
+    let head = [UInt8](h.readData(ofLength: 4096))
+    func be(_ o: Int) -> UInt32 { UInt32(head[o]) << 24 | UInt32(head[o + 1]) << 16 | UInt32(head[o + 2]) << 8 | UInt32(head[o + 3]) }
+    if head.count >= 8, be(0) == 0xCAFEBABE || be(0) == 0xCAFEBABF {   // fat: find the arm64 slice
+        let is64 = be(0) == 0xCAFEBABF, stride = is64 ? 32 : 20
+        for i in 0..<Int(be(4)) where 8 + stride * (i + 1) <= head.count && be(8 + stride * i) == 0x0100000C {
+            base = is64 ? UInt64(be(8 + stride * i + 8)) << 32 | UInt64(be(8 + stride * i + 12)) : UInt64(be(8 + stride * i + 8))
+        }
+    }
+    try? h.seek(toOffset: base)
+    let d = [UInt8](h.readData(ofLength: 1 << 17))
+    func le(_ o: Int) -> UInt32 { UInt32(d[o + 3]) << 24 | UInt32(d[o + 2]) << 16 | UInt32(d[o + 1]) << 8 | UInt32(d[o]) }
+    guard d.count > 32, le(0) == 0xFEEDFACF, le(4) == 0x0100000C else { return (archs, false, false) }
+    var off = 32, enc = false, ui = false
+    for _ in 0..<Int(le(16)) where off + 8 <= d.count {
+        let cmd = le(off), size = Int(le(off + 4))
+        if size < 8 || off + size > d.count { break }
+        if cmd == 0x2C, size >= 20, le(off + 16) != 0 { enc = true }   // LC_ENCRYPTION_INFO_64
+        if cmd == 0xC || cmd == 0x80000018 || cmd == 0x8000001F || cmd == 0x1F {   // LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LOAD_UPWARD_DYLIB
+            let no = off + Int(le(off + 8))
+            if no < off + size, let end = d[no..<(off + size)].firstIndex(of: 0) {
+                let n = String(decoding: d[no..<end], as: UTF8.self)
+                if n.contains("/UIKit.framework/") || n.contains("/UIKitCore.framework/") || n.contains("/SwiftUI.framework/") { ui = true }
+            }
+        }
+        off += size
+    }
+    return (archs, enc, ui)
+}

@@ -9,6 +9,13 @@ struct AppEntry: Identifiable, Hashable {
     let exe: String
     let engine: String?      // "Electron" or "Chromium" for an app built on Chromium (it takes Chromium's switches), else nil
     var isElectron: Bool { engine != nil }
+    var ios: IOSInfo? = nil  // an iOS app (an .ipa or an unpacked iOS .app): path is its .app folder (Info.plist and the executable lie directly in it)
+}
+
+/// What is known about an iOS app from its executable.
+struct IOSInfo: Hashable {
+    let usesUI: Bool         // links UIKit or SwiftUI: needs rebar-ios (the Mac Catalyst UIKit) in a host .app bundle
+    let encrypted: Bool      // FairPlay (LC_ENCRYPTION_INFO cryptid 1): the code cannot be read, nothing here decrypts it
 }
 
 /// What is set for one application. The defaults are what works best for Electron apps (VS Code and friends).
@@ -58,6 +65,13 @@ final class Launcher: NSObject, ObservableObject {
     private var ticks = 0, scanningInstances = false
     static let markerCache = PidCache()
     private var rebar: String { support.appendingPathComponent("bin/rebar").path }
+    private var rebarIOS: String { support.appendingPathComponent("bin/rebar-ios").path }
+    private var iosHostRoot: String {   // (proc_pidpath gives the real path)
+        let p = support.appendingPathComponent("ios-host").path
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        return (realpath(p, &buf).map { String(cString: $0) } ?? p) + "/"
+    }
+    private var ipaRoot: String { support.appendingPathComponent("ipa").path }
 
     override init() {
         let fm = FileManager.default
@@ -84,6 +98,10 @@ final class Launcher: NSObject, ObservableObject {
         if (try? Data(contentsOf: src)) != (try? Data(contentsOf: dst)) { try? fm.removeItem(at: dst); try? fm.copyItem(at: src, to: dst) }
         chmod(dst.path, 0o755)
         removexattr(dst.path, "com.apple.quarantine", 0)
+        if let ios = Bundle.main.url(forResource: "rebar-ios", withExtension: nil, subdirectory: "bin") {   // rebar as a Mac Catalyst process, for iOS apps that use UIKit
+            let idst = dst.deletingLastPathComponent().appendingPathComponent("rebar-ios")
+            if (try? Data(contentsOf: ios)) != (try? Data(contentsOf: idst)) { try? fm.removeItem(at: idst); try? fm.copyItem(at: ios, to: idst); chmod(idst.path, 0o755); removexattr(idst.path, "com.apple.quarantine", 0) }
+        }
         if let shim = Bundle.main.url(forResource: "librebar_exec.dylib", withExtension: nil, subdirectory: "bin") {   // (rebar looks for it next to itself)
             let sdst = dst.deletingLastPathComponent().appendingPathComponent("librebar_exec.dylib")
             if (try? Data(contentsOf: shim)) != (try? Data(contentsOf: sdst)) { try? fm.removeItem(at: sdst); try? fm.copyItem(at: shim, to: sdst) }
@@ -100,12 +118,15 @@ final class Launcher: NSObject, ObservableObject {
             let fm = FileManager.default
             var roots = ["/Applications", NSHomeDirectory() + "/Applications"]
             var direct: [String] = []
-            for e in extra { if e.hasSuffix(".app") { direct.append(e) } else { roots.append(e) } }
+            for e in extra { if e.hasSuffix(".app") || e.hasSuffix(".ipa") { direct.append(e) } else { roots.append(e) } }
             var candidates = direct
+            var ipas: [String] = direct.filter { $0.hasSuffix(".ipa") }
+            candidates.removeAll { $0.hasSuffix(".ipa") }
             for r in roots {
                 for n in (try? fm.contentsOfDirectory(atPath: r)) ?? [] {
                     let p = r + "/" + n
                     if n.hasSuffix(".app") { candidates.append(p) }
+                    else if n.hasSuffix(".ipa") { ipas.append(p) }
                     else {   // one folder level down (/Applications/Utilities, a vendor folder, ...)
                         var isDir: ObjCBool = false
                         if fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue {
@@ -114,8 +135,10 @@ final class Launcher: NSObject, ObservableObject {
                     }
                 }
             }
+            for ipa in ipas { if let app = self.unpackIPA(ipa) { candidates.append(app) } }
             var found: [AppEntry] = [], icons: [String: NSImage] = [:], seen = Set<String>()
             for p in candidates where seen.insert(p).inserted {
+                if !fm.fileExists(atPath: p + "/Contents/Info.plist"), let e = self.iosEntry(p) { found.append(e); icons[p] = NSWorkspace.shared.icon(for: .application); continue }   // (an iOS app: Info.plist in the folder itself)
                 guard let info = NSDictionary(contentsOfFile: p + "/Contents/Info.plist"), let exeName = info["CFBundleExecutable"] as? String else { continue }
                 let exe = p + "/Contents/MacOS/" + exeName
                 let archs = machoArchs(atPath: exe)
@@ -127,6 +150,69 @@ final class Launcher: NSObject, ObservableObject {
             found.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             DispatchQueue.main.async { self.apps = found; self.icons = icons; self.scanning = false }
         }
+    }
+
+    // MARK: iOS apps (.ipa)
+
+    /// Unpacks an .ipa (once per file and modification time) into Application Support and returns the Payload/*.app folder, or nil.
+    private func unpackIPA(_ ipa: String) -> String? {
+        let fm = FileManager.default
+        let mtime = ((try? fm.attributesOfItem(atPath: ipa))?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let dest = ipaRoot + "/" + Proc.appID(ipa + String(mtime))
+        let payload = dest + "/Payload"
+        if !fm.fileExists(atPath: dest + "/.done") {
+            try? fm.removeItem(atPath: dest)
+            try? fm.createDirectory(atPath: dest, withIntermediateDirectories: true)
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/unzip"); p.arguments = ["-q", "-o", ipa, "-d", dest]
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return nil }
+            p.waitUntilExit()
+            guard p.terminationStatus <= 1 else { return nil }
+            fm.createFile(atPath: dest + "/.done", contents: nil)
+        }
+        return ((try? fm.contentsOfDirectory(atPath: payload)) ?? []).first { $0.hasSuffix(".app") }.map { payload + "/" + $0 }
+    }
+
+    /// The entry of an iOS app folder (flat: Info.plist and the executable inside), or nil when it is not one that rebar can run.
+    private func iosEntry(_ p: String) -> AppEntry? {
+        guard let info = NSDictionary(contentsOfFile: p + "/Info.plist"), let exeName = info["CFBundleExecutable"] as? String else { return nil }
+        let exe = p + "/" + exeName
+        guard let m = machoInfo(atPath: exe), m.archs.contains("arm64") else { return nil }
+        let name = (info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String) ?? exeName
+        return AppEntry(path: p, name: name, version: (info["CFBundleShortVersionString"] as? String) ?? "", exe: exe, engine: nil, ios: IOSInfo(usesUI: m.usesUI, encrypted: m.encrypted))
+    }
+
+    /// UIKit (Mac Catalyst) only runs in a process that lives in an .app: its scene server looks the client up by bundle. So an iOS app that uses UIKit runs from a small host bundle:
+    /// Contents/MacOS/<Name> is rebar-ios, Contents/Resources is the iOS .app folder (nibs, assets), Contents/Info.plist is the app's with the executable renamed. Returns the host executable.
+    private func hostBundle(_ app: AppEntry) -> String? {
+        let fm = FileManager.default
+        let name = (app.exe as NSString).lastPathComponent
+        let host = iosHostRoot + Proc.appID(app.path) + "/" + name + ".app"
+        let exe = host + "/Contents/MacOS/" + name, stamp = host + "/.stamp"
+        let want = "\((try? fm.attributesOfItem(atPath: rebarIOS))?[.modificationDate] as? Date ?? .distantPast) \(app.path)"
+        if (try? String(contentsOfFile: stamp, encoding: .utf8)) == want, fm.isExecutableFile(atPath: exe) { return exe }
+        try? fm.removeItem(atPath: host)
+        guard fm.fileExists(atPath: rebarIOS) else { return nil }
+        do {
+            try fm.createDirectory(atPath: host + "/Contents/MacOS", withIntermediateDirectories: true)
+            try fm.copyItem(atPath: rebarIOS, toPath: exe)
+            try fm.createSymbolicLink(atPath: host + "/Contents/Resources", withDestinationPath: app.path)
+            var plist = (NSDictionary(contentsOfFile: app.path + "/Info.plist") as? [String: Any]) ?? [:]
+            plist["CFBundleExecutable"] = name
+            plist.removeValue(forKey: "NSPrincipalClass")
+            plist["CFBundlePackageType"] = "APPL"
+            plist["LSMinimumSystemVersion"] = "12.0"
+            if plist["CFBundleVersion"] == nil { plist["CFBundleVersion"] = "1" }
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: URL(fileURLWithPath: host + "/Contents/Info.plist"))
+        } catch { return nil }
+        for (tool, args) in [("/usr/bin/codesign", ["--force", "--sign", "-", host]),
+                             ("/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister", ["-f", host])] {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: tool); p.arguments = args
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            if (try? p.run()) != nil { p.waitUntilExit() }
+        }
+        try? want.write(toFile: stamp, atomically: true, encoding: .utf8)
+        return exe
     }
 
     /// Electron apps carry "Electron Framework"; other Chromium-based apps (ChatGPT's "Codex Framework", CEF apps) carry a renamed framework that still holds ANGLE's libEGL.
@@ -205,7 +291,17 @@ final class Launcher: NSObject, ObservableObject {
             guard let eq = line.firstIndex(of: "="), eq != line.startIndex else { continue }
             env[String(line[..<eq]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: eq)...])
         }
-        guard let pid = Proc.spawn(rebar, [app.exe] + args, env: env, log: logPath(app)) else { message = "Could not start rebar."; return }
+        var program = rebar, programArgs = [app.exe] + args
+        if let ios = app.ios {
+            if ios.encrypted { message = "“\(app.name)” is encrypted (FairPlay, from the App Store): its code cannot be read, so it cannot run. Only apps you built yourself or have the decrypted binary of work."; return }
+            env["REBAR_IOS"] = "1"
+            if ios.usesUI {
+                guard let host = hostBundle(app) else { message = "UIKit apps need rebar-ios next to rebar (it is made by build.sh with Xcode's vtool)."; return }
+                program = host; programArgs = [app.exe] + args
+                env["CFProcessPath"] = host; env["REBAR_CFPROCESSPATH"] = host
+            } else { env["CFProcessPath"] = app.exe }
+        }
+        guard let pid = Proc.spawn(program, programArgs, env: env, log: logPath(app)) else { message = "Could not start rebar."; return }
         running[app.path] = pid
         owned.insert(app.path)
         started[app.path] = Date()
@@ -244,11 +340,11 @@ final class Launcher: NSObject, ObservableObject {
 
     /// Looks for running processes of every app (they are rebar processes whose command line starts with the app's path), whoever started them.
     func refreshInstances(sync: Bool = false) {
-        let apps = self.apps, rebar = self.rebar
+        let apps = self.apps, rebar = self.rebar, iosRoot = self.iosHostRoot
         let work = { () -> [String: (leader: pid_t, pids: [pid_t], groups: [pid_t])] in
             let procs = Proc.snapshot()
             // processes of our rebar that carry an app's marker (REBAR_APP_ID) belong to that app wherever their program lives
-            let ours = procs.filter { $0.exe == rebar }
+            let ours = procs.filter { $0.exe == rebar || $0.exe.hasPrefix(iosRoot) }
             var marked: [String: [Proc.Entry]] = [:]
             for p in ours {
                 if let id = Launcher.markerCache.value(for: p.pid, load: { Proc.environment(of: p.pid).first { $0.hasPrefix("REBAR_APP_ID=") }.map { String($0.dropFirst(13)) } }) { marked[id, default: []].append(p) }
@@ -257,7 +353,7 @@ final class Launcher: NSObject, ObservableObject {
             for a in apps {
                 // (a guest process shows its own command line; one started by an older rebar shows "rebar <program> ...")
                 let main = rebar + " " + a.exe, any = rebar + " " + a.path + "/Contents/", own = a.path + "/Contents/"
-                var mine = ours.filter { $0.command.hasPrefix(any) || $0.command.hasPrefix(own) }
+                var mine = ours.filter { $0.command.hasPrefix(any) || $0.command.hasPrefix(own) || (a.ios != nil && $0.command.hasPrefix(a.exe)) }   // (an iOS app is a flat folder: its processes show its executable)
                 for p in marked[Proc.appID(a.path)] ?? [] where !mine.contains(where: { $0.pid == p.pid }) { mine.append(p) }
                 if mine.isEmpty { continue }
                 guard let leader = mine.filter({ $0.command.hasPrefix(main) || $0.command.hasPrefix(a.exe) }).map({ $0.pid }).min() else {

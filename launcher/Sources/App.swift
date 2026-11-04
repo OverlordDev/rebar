@@ -34,7 +34,7 @@ struct ContentView: View {
                 }
                 Spacer()
                 Button(action: { model.scan() }) { Image(systemName: "arrow.clockwise") }.help("Refresh the list").disabled(model.scanning)
-                Button("Add…") { choose() }.help("Add an app or a folder with apps (for example from an open .dmg)")
+                Button("Add…") { choose() }.help("Add an app, an iOS app (.ipa) or a folder with apps (for example from an open .dmg)")
             }
             TextField("Search", text: $filter)
             if shown.isEmpty {
@@ -65,7 +65,7 @@ struct ContentView: View {
             Image(nsImage: model.icons[app.path] ?? NSImage()).resizable().frame(width: 36, height: 36)
             VStack(alignment: .leading, spacing: 1) {
                 Text(app.name).font(.headline)
-                Text([app.version, app.engine ?? "", "arm64 only"].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption).foregroundColor(.secondary)
+                Text(app.ios.map { [app.version, "iOS app", $0.encrypted ? "encrypted (FairPlay): cannot run" : "arm64"].filter { !$0.isEmpty }.joined(separator: " · ") } ?? [app.version, app.engine ?? "", "arm64 only"].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption).foregroundColor(.secondary)
             }
             Spacer()
             if model.running[app.path] != nil {
@@ -73,7 +73,7 @@ struct ContentView: View {
                 Button("Stop") { model.stop(app) }.help("Close the app and everything left of it")
                 Button("Restart") { model.restart(app) }.help("Close and start again: helps when the app is running but has no window")
             } else {
-                Button("Launch") { model.launch(app) }
+                Button("Launch") { model.launch(app) }.disabled(app.ios?.encrypted == true)
             }
             Button(action: { editing = app }) { Image(systemName: "gearshape") }.buttonStyle(BorderlessButtonStyle()).help("Settings of this app")
         }
@@ -83,7 +83,7 @@ struct ContentView: View {
     private func choose() {
         let p = NSOpenPanel()
         p.canChooseFiles = true; p.canChooseDirectories = true; p.allowsMultipleSelection = false
-        p.message = "Choose an app (.app) or a folder to search for apps"
+        p.message = "Choose an app (.app), an iOS app (.ipa) or a folder to search for apps"
         p.directoryURL = URL(fileURLWithPath: "/Volumes")
         if p.runModal() == .OK, let u = p.url { model.add(u) }
     }
