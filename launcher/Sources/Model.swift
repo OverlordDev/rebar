@@ -78,7 +78,7 @@ final class Launcher: NSObject, ObservableObject {
     /// rebar travels inside the app; it runs from a copy in Application Support (an app that came from the internet may be moved to a read-only place).
     private func prepareRebar() {
         let fm = FileManager.default
-        guard let src = Bundle.main.url(forResource: "rebar", withExtension: nil, subdirectory: "bin") else { message = "В приложении нет rebar."; return }
+        guard let src = Bundle.main.url(forResource: "rebar", withExtension: nil, subdirectory: "bin") else { message = "rebar is not in the app."; return }
         let dst = support.appendingPathComponent("bin/rebar")
         try? fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
         if (try? Data(contentsOf: src)) != (try? Data(contentsOf: dst)) { try? fm.removeItem(at: dst); try? fm.copyItem(at: src, to: dst) }
@@ -183,7 +183,7 @@ final class Launcher: NSObject, ObservableObject {
     func launch(_ app: AppEntry) {
         if !FileManager.default.isExecutableFile(atPath: rebar) { prepareRebar() }   // (something removed the working copy while the launcher was open)
         refreshInstances(sync: true)   // (an instance that an earlier launcher started and nobody sees would take this launch over and quit at once)
-        guard running[app.path] == nil else { message = "«\(app.name)» уже запущена (возможно, без окна): нажмите «Перезапустить»."; return }
+        guard running[app.path] == nil else { message = "“\(app.name)” is already running (maybe without a window): click “Restart”."; return }
         message = ""
         let s = settings(app)
         applyFastEditor(s.fastEditor, app)
@@ -205,7 +205,7 @@ final class Launcher: NSObject, ObservableObject {
             guard let eq = line.firstIndex(of: "="), eq != line.startIndex else { continue }
             env[String(line[..<eq]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: eq)...])
         }
-        guard let pid = Proc.spawn(rebar, [app.exe] + args, env: env, log: logPath(app)) else { message = "Не удалось запустить rebar."; return }
+        guard let pid = Proc.spawn(rebar, [app.exe] + args, env: env, log: logPath(app)) else { message = "Could not start rebar."; return }
         running[app.path] = pid
         owned.insert(app.path)
         started[app.path] = Date()
@@ -220,7 +220,7 @@ final class Launcher: NSObject, ObservableObject {
     /// Stops the app together with everything that is left of it, waits until it is gone and starts it again.
     func restart(_ app: AppEntry) {
         stop(app)
-        message = "Перезапускаю «\(app.name)»…"
+        message = "Restarting “\(app.name)”…"
         var tries = 0
         func again() {
             tries += 1
@@ -229,7 +229,7 @@ final class Launcher: NSObject, ObservableObject {
                 running[app.path] = nil; owned.remove(app.path); instance[app.path] = nil
                 message = ""; launch(app)
             } else if tries < 16 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { again() } }
-            else { message = "«\(app.name)» не закрылась за 8 секунд; закройте её вручную (Мониторинг системы) и запустите снова." }
+            else { message = "“\(app.name)” did not close within 8 seconds; close it yourself (Activity Monitor) and start it again." }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { again() }
     }
@@ -237,9 +237,9 @@ final class Launcher: NSObject, ObservableObject {
     /// What the row of a running app says: it is still coming up (our own start, no window yet, less than two minutes), it runs without a window, or it is simply running.
     func status(_ app: AppEntry) -> String {
         guard running[app.path] != nil else { return "" }
-        if !windowless.contains(app.path) { return "Запущено" }
-        if owned.contains(app.path), Date().timeIntervalSince(started[app.path] ?? .distantPast) < 120 { return "Запускается…" }
-        return "Запущено, окна нет"
+        if !windowless.contains(app.path) { return "Running" }
+        if owned.contains(app.path), Date().timeIntervalSince(started[app.path] ?? .distantPast) < 120 { return "Starting…" }
+        return "Running, no window"
     }
 
     /// Looks for running processes of every app (they are rebar processes whose command line starts with the app's path), whoever started them.
@@ -299,7 +299,7 @@ final class Launcher: NSObject, ObservableObject {
         }
     }
 
-    /// `RebarLauncher --selftest <app name> [seconds]`: what a click on "Запустить" does, without a window (for checking from a script, over ssh or at night):
+    /// `RebarLauncher --selftest <app name> [seconds]`: what a click on "Launch" does, without a window (for checking from a script, over ssh or at night):
     /// launches the app, prints its row's status and the windows of its processes every few seconds, then stops it. Exit code 0 when a window came up.
     static func selfTest(_ args: [String]) -> Int32 {
         let l = Launcher()
@@ -346,9 +346,9 @@ final class Launcher: NSObject, ObservableObject {
             let name = apps.first { $0.path == path }?.name ?? path
             let quick = Date().timeIntervalSince(started[path] ?? .distantPast) < 30
             if status != 0 && status != -SIGTERM && status != -SIGKILL && quick {
-                message = "«\(name)» закрылось сразу (код \(status)). Не все приложения работают под rebar; подробности в логе (шестерёнка → «Показать лог»)."
+                message = "“\(name)” closed right away (code \(status)). Not every app works under rebar; see the log for details (gear → “Show log”)."
             } else if status == 0 && Date().timeIntervalSince(started[path] ?? .distantPast) < 10 {
-                message = "«\(name)» сразу завершилась без ошибки. Так бывает, когда она уже запущена (возможно, без окна) и новому запуску велели ничего не делать: если «\(name)» теперь в списке как запущенная, нажмите «Перезапустить»."
+                message = "“\(name)” exited right away without an error. That happens when it is already running (maybe without a window) and the new launch was told to do nothing: if “\(name)” is now listed as running, click “Restart”."
             }
             refreshInstances()   // (it may have left processes behind)
         }

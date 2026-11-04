@@ -202,6 +202,7 @@ static GImage *load_image(const char *real_path, GImage *loader, bool is_main) {
     parse_load_commands(img);
     map_segments(img, fd, (uint64_t)(slice - file));
     close(fd);
+    { static int show = -1; if (show < 0) show = getenv("REBAR_IMAGES") != NULL; if (show && !is_main) fprintf(stderr, "rebar: loaded %s base=0x%llx slide=0x%llx\n", img->path, (unsigned long long)img->base, (unsigned long long)img->slide); }   // (the images of the main program are listed at start)
 
     // thread-local template (runtime addresses)
     const struct load_command *lc = (const void *)(img->mh + 1);

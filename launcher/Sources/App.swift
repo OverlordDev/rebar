@@ -30,16 +30,16 @@ struct ContentView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Rebar").font(.title2).bold()
-                    Text("Приложения для Apple Silicon (arm64), которые можно запустить на этом Mac").font(.callout).foregroundColor(.secondary)
+                    Text("Apps for Apple Silicon (arm64) that you can run on this Mac").font(.callout).foregroundColor(.secondary)
                 }
                 Spacer()
-                Button(action: { model.scan() }) { Image(systemName: "arrow.clockwise") }.help("Обновить список").disabled(model.scanning)
-                Button("Добавить…") { choose() }.help("Добавить приложение или папку с приложениями (например, из открытого .dmg)")
+                Button(action: { model.scan() }) { Image(systemName: "arrow.clockwise") }.help("Refresh the list").disabled(model.scanning)
+                Button("Add…") { choose() }.help("Add an app or a folder with apps (for example from an open .dmg)")
             }
-            TextField("Поиск", text: $filter)
+            TextField("Search", text: $filter)
             if shown.isEmpty {
                 Spacer()
-                Text(model.scanning ? "Ищу приложения…" : "Приложений только для arm64 не нашлось в «Программах». Нажмите «Добавить…» и укажите приложение или папку.")
+                Text(model.scanning ? "Looking for apps…" : "No arm64-only apps found in Applications. Click “Add…” and choose an app or a folder.")
                     .foregroundColor(.secondary).frame(maxWidth: .infinity)
                 Spacer()
             } else {
@@ -48,7 +48,7 @@ struct ContentView: View {
             if !model.message.isEmpty {
                 Text(model.message).font(.callout).foregroundColor(.red).fixedSize(horizontal: false, vertical: true)
             }
-            Text("Работает не со всеми приложениями: rebar — эмулятор, а первый запуск может занять до минуты.")
+            Text("Does not work with every app: rebar is an emulator, and the first launch can take up to a minute.")
                 .font(.caption).foregroundColor(.secondary)
         }
         .padding(16)
@@ -65,17 +65,17 @@ struct ContentView: View {
             Image(nsImage: model.icons[app.path] ?? NSImage()).resizable().frame(width: 36, height: 36)
             VStack(alignment: .leading, spacing: 1) {
                 Text(app.name).font(.headline)
-                Text([app.version, app.engine ?? "", "только arm64"].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption).foregroundColor(.secondary)
+                Text([app.version, app.engine ?? "", "arm64 only"].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption).foregroundColor(.secondary)
             }
             Spacer()
             if model.running[app.path] != nil {
-                Text(model.status(app)).font(.caption).foregroundColor(model.status(app) == "Запущено" ? .green : .orange)
-                Button("Остановить") { model.stop(app) }.help("Закрыть приложение и всё, что от него осталось")
-                Button("Перезапустить") { model.restart(app) }.help("Закрыть и запустить заново: помогает, если приложение запущено, но окна нет")
+                Text(model.status(app)).font(.caption).foregroundColor(model.status(app) == "Running" ? .green : .orange)
+                Button("Stop") { model.stop(app) }.help("Close the app and everything left of it")
+                Button("Restart") { model.restart(app) }.help("Close and start again: helps when the app is running but has no window")
             } else {
-                Button("Запустить") { model.launch(app) }
+                Button("Launch") { model.launch(app) }
             }
-            Button(action: { editing = app }) { Image(systemName: "gearshape") }.buttonStyle(BorderlessButtonStyle()).help("Настройки этого приложения")
+            Button(action: { editing = app }) { Image(systemName: "gearshape") }.buttonStyle(BorderlessButtonStyle()).help("Settings of this app")
         }
         .padding(.vertical, 3)
     }
@@ -83,7 +83,7 @@ struct ContentView: View {
     private func choose() {
         let p = NSOpenPanel()
         p.canChooseFiles = true; p.canChooseDirectories = true; p.allowsMultipleSelection = false
-        p.message = "Выберите приложение (.app) или папку, в которой искать приложения"
+        p.message = "Choose an app (.app) or a folder to search for apps"
         p.directoryURL = URL(fileURLWithPath: "/Volumes")
         if p.runModal() == .OK, let u = p.url { model.add(u) }
     }
@@ -102,30 +102,30 @@ struct SettingsSheet: View {
                 Text(app.name).font(.title3).bold()
             }
             if app.isElectron {
-                Toggle("Ускорение на видеокарте (GPU)", isOn: $s.gpu)
-                hint("Окно рисует видеокарта (Metal): прокрутка заметно плавнее. Если окно пустое или в нём мусор, выключите.")
-                Toggle("Без песочницы Chromium", isOn: $s.noSandbox)
-                hint("Под rebar песочница не запускается. Выключайте, только если точно знаете зачем.")
-                Toggle("Не спрашивать пароль Связки ключей", isOn: $s.mockKeychain)
-                hint("Включено: ключ, которым приложение шифрует свои данные (вход в аккаунты и т. п.), не хранится в Связке ключей и защищён слабее. Выключено: macOS будет спрашивать пароль от вашей связки ключей.")
+                Toggle("GPU acceleration", isOn: $s.gpu)
+                hint("The window is drawn by the GPU (Metal): scrolling is much smoother. If the window is blank or shows garbage, turn it off.")
+                Toggle("No Chromium sandbox", isOn: $s.noSandbox)
+                hint("The sandbox does not run under rebar. Turn it off only if you know why.")
+                Toggle("Do not ask for the Keychain password", isOn: $s.mockKeychain)
+                hint("On: the key the app uses to encrypt its data (account sign-ins and the like) is not kept in the Keychain and is protected less well. Off: macOS will ask for your keychain password.")
             }
             if model.vsCodeFolder(app) != nil {
-                Toggle("Быстрый скролл (облегчённый редактор) — включён по умолчанию", isOn: $s.fastEditor)
-                hint("Выключает в редакторе миникарту, закреплённые заголовки (sticky scroll), хлебные крошки, цветные скобки и подсветку совпадений и текущей строки. Прокрутка плавнее: около 60–68 кадров/с вместо ~50. В ваш settings.json добавляется один блок между строками «// >>> rebar» и «// <<< rebar»; выключите переключатель, и он удалится (копия файла до изменения: settings.json.rebar-backup). Настройки с теми же именами, которые вы сами задали ниже в файле, имеют приоритет.")
+                Toggle("Fast scrolling (lighter editor), on by default", isOn: $s.fastEditor)
+                hint("Turns off the minimap, sticky scroll headers, breadcrumbs, bracket colouring and match / current-line highlighting in the editor. Scrolling is smoother: about 60–68 frames/s instead of ~50. One block between the lines “// >>> rebar” and “// <<< rebar” is added to your settings.json; turn the switch off and it is removed (a copy of the file from before the change: settings.json.rebar-backup). Settings with the same names that you set yourself further down in the file take priority.")
             }
-            Toggle("Быстрый режим (JIT)", isOn: $s.jit)
-            hint("rebar переводит код в машинный на лету, это в несколько раз быстрее. Выключайте только при поиске ошибок.")
-            Text("Аргументы командной строки").font(.subheadline)
-            TextField("например: --user-data-dir=\"/Users/me/my profile\"", text: $s.args)
-            Text("Переменные окружения (по одной в строке: ИМЯ=значение)").font(.subheadline)
+            Toggle("Fast mode (JIT)", isOn: $s.jit)
+            hint("rebar translates code to machine code on the fly, several times faster. Turn it off only when hunting bugs.")
+            Text("Command-line arguments").font(.subheadline)
+            TextField("for example: --user-data-dir=\"/Users/me/my profile\"", text: $s.args)
+            Text("Environment variables (one per line: NAME=value)").font(.subheadline)
             TextEditor(text: $s.env).font(.system(.body, design: .monospaced)).frame(height: 60)
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.4)))
-            hint("Изменения применяются при следующем запуске.")
+            hint("Changes take effect on the next launch.")
             HStack {
-                Button("Показать лог") { NSWorkspace.shared.open(URL(fileURLWithPath: model.logPath(app))) }
-                Button("Сбросить") { s = AppSettings() }
+                Button("Show log") { NSWorkspace.shared.open(URL(fileURLWithPath: model.logPath(app))) }
+                Button("Reset") { s = AppSettings() }
                 Spacer()
-                Button("Готово") { model.setSettings(s, for: app); presentation.wrappedValue.dismiss() }.keyboardShortcut(.defaultAction)
+                Button("Done") { model.setSettings(s, for: app); presentation.wrappedValue.dismiss() }.keyboardShortcut(.defaultAction)
             }
         }
         .padding(20).frame(width: 500)

@@ -1,28 +1,28 @@
-Rebar — запуск приложений для Apple Silicon (arm64) на Mac с процессором Intel или AMD
+Rebar: run Apple Silicon (arm64) apps on a Mac with an Intel or AMD processor
 
-Как пользоваться
-1. Перенесите Rebar.app в «Программы» (или куда удобно) и откройте. Если macOS пишет, что приложение повреждено или
-   от неопознанного разработчика (оно не подписано, это нормально), выполните в Терминале:
+How to use
+1. Move Rebar.app to Applications (or anywhere) and open it. If macOS says the app is damaged or from an unidentified developer
+   (it is not signed, that is normal), run this in Terminal:
        xattr -dr com.apple.quarantine /Applications/Rebar.app
-   (или: Системные настройки → Конфиденциальность и безопасность → «Всё равно открыть»).
-2. Rebar сам найдёт в «Программах» приложения, у которых есть только версия для arm64 (то, что Mac не запускает сам), и покажет их списком.
-3. Нажмите «Запустить» у нужного приложения. Первый запуск может занять до минуты.
-4. Шестерёнка рядом с приложением — его собственные настройки: ускорение на видеокарте, быстрый режим, аргументы, переменные окружения.
-   Изменения применяются при следующем запуске.
-5. Если приложения нет в списке (например, оно в открытом .dmg), нажмите «Добавить…» и укажите приложение или папку.
+   (or: System Settings > Privacy & Security > "Open Anyway").
+2. Rebar looks in Applications for apps that only have an arm64 version (what the Mac cannot run by itself) and lists them.
+3. Click "Launch" next to an app. The first launch can take up to a minute.
+4. The gear next to an app opens its own settings: GPU acceleration, fast mode, arguments, environment variables.
+   Changes take effect on the next launch.
+5. If an app is not in the list (for example it sits in an open .dmg), click "Add..." and choose the app or a folder.
 
-Важно: rebar — эмулятор, он работает не со всеми приложениями. Если приложение сразу закрылось, откройте его настройки → «Показать лог».
-Нужна macOS 11 или новее (приложения могут требовать больше, например VS Code — macOS 12).
+Important: rebar is an emulator and does not work with every app. If an app closes right away, open its settings > "Show log".
+macOS 11 or newer is required (some apps need more, for example VS Code needs macOS 12).
 
-Если нажали «Запустить», а окна нет
-Приложение могло остаться запущенным с прошлого раза (без окна): новый запуск тогда передаёт управление ему и сразу завершается, и кажется, что ничего не происходит.
-Лаунчер теперь видит такие запущенные экземпляры: у них написано «Запущено» или «Запущено, окна нет», а рядом кнопки «Остановить» (закрыть всё, что от приложения осталось)
-и «Перезапустить» (закрыть и запустить заново). Пока приложение только запускается, написано «Запускается…»: первый запуск может занять до минуты.
+If you clicked "Launch" and there is no window
+The app may still be running from last time (without a window): the new launch then hands over to it and exits at once, so nothing seems to happen.
+The launcher now sees such running instances: they say "Running" or "Running, no window", with the buttons "Stop" (close everything left of the app)
+and "Restart" (close and start again). While an app is still starting it says "Starting...": the first launch can take up to a minute.
 
-Совет для VS Code: скролл текста
-По умолчанию редактор прокручивается на экране примерно на 50 кадров в секунду (на сильной машине под эмуляцией). Чтобы получить 60 и больше,
-переключатель «Быстрый скролл (облегчённый редактор)» в настройках VS Code (шестерёнка у приложения) включён по умолчанию: при запуске он сам добавляет в ваш settings.json
-блок между строками «// >>> rebar» и «// <<< rebar»; выключите переключатель, и блок будет удалён (до первого изменения копия файла: settings.json.rebar-backup). Вручную то же самое (Settings → поиск по названию, либо в settings.json):
+Tip for VS Code: scrolling text
+By default the editor scrolls at about 50 frames per second on screen (on a strong machine under emulation). To get 60 and more,
+the switch "Fast scrolling (lighter editor)" in the VS Code settings (the gear next to the app) is on by default: when the app starts it adds to your settings.json
+a block between the lines "// >>> rebar" and "// <<< rebar"; turn the switch off and the block is removed (a copy of the file from before the first change: settings.json.rebar-backup). By hand the same is (Settings > search by name, or in settings.json):
     "editor.minimap.enabled": false,
     "editor.stickyScroll.enabled": false,
     "breadcrumbs.enabled": false,
@@ -31,4 +31,4 @@ Rebar — запуск приложений для Apple Silicon (arm64) на Ma
     "editor.occurrencesHighlight": "off",
     "editor.selectionHighlight": false,
     "editor.renderLineHighlight": "none"
-Только миникарта даёт около +4 кадров в секунду. Это не ускорение эмулятора, а меньше работы на каждый кадр.
+The minimap alone gives about +4 frames per second. This does not speed up the emulator, it is just less work per frame.

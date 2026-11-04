@@ -1,9 +1,9 @@
 import Foundation
 
-/// "Быстрый скролл" for VS Code: a block of editor settings that make scrolling cheaper (no minimap, no sticky scroll, ...).  The block sits between two marker
+/// "Fast scrolling" for VS Code: a block of editor settings that make scrolling cheaper (no minimap, no sticky scroll, ...).  The block sits between two marker
 /// comments in the user's settings.json, so switching the option off removes exactly it and nothing else of the file is touched (the file may hold comments).
 enum FastEditor {
-    static let begin = "// >>> rebar: быстрый скролл (этот блок убирается выключением переключателя в лаунчере)"
+    static let begin = "// >>> rebar: fast scrolling (this block is removed when the switch is turned off in the launcher)"
     static let end = "// <<< rebar"
     static let settings: [(String, String)] = [
         ("editor.minimap.enabled", "false"),
