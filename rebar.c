@@ -1588,6 +1588,17 @@ int main(int argc, char **argv) {
         setenv("MallocNanoZone", "0", 1);
         if (_NSGetExecutablePath(self, &sz) == 0) execv(self, argv);
     }
+    {   // CoreFoundation fixes the process's main bundle the first time anything asks for it, and it reads CFProcessPath for that. Something that loads before the guest (AppKit for VLC)
+        // asked before main() could set it, so a program inside an .app is run by a rebar that starts with CFProcessPath already in its environment.
+        const char *prog = NULL;
+        for (int k = 1; k < argc; k++) if (argv[k][0] != '-') { prog = argv[k]; break; }
+        char real0[PATH_MAX];
+        if (prog && strstr(prog, ".app/Contents/MacOS/") && realpath(prog, real0) && (!getenv("CFProcessPath") || strcmp(getenv("CFProcessPath"), real0))) {
+            char self[PATH_MAX]; uint32_t sz = sizeof self;
+            setenv("CFProcessPath", real0, 1);
+            if (_NSGetExecutablePath(self, &sz) == 0) execv(self, argv);
+        }
+    }
     if (!getenv("REBAR_NOATFORK")) pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
     clock_gettime(CLOCK_MONOTONIC, &g_t0);
     if (getenv("REBAR_TRACE_FILE")) {  // helper processes lose their stderr: each process writes its debug output to <file>.<pid>
@@ -1659,6 +1670,7 @@ int main(int argc, char **argv) {
     char real[PATH_MAX];
     if (!realpath(argv[ai], real)) { perror(argv[ai]); return 1; }
     snprintf(g_exe_path, sizeof g_exe_path, "%s", real);
+    setenv("CFProcessPath", g_exe_path, 1);   // before anything loads AppKit: once something asks for the main bundle, CoreFoundation keeps the answer (it was the folder of rebar for VLC)
     proc_pidpath(getpid(), g_self_path, sizeof g_self_path);  // helper processes are started as `rebar <program>`
     if (!getenv("REBAR_NO_EXECSHIM")) {   // librebar_exec.dylib lives next to rebar
         char shim[PATH_MAX]; snprintf(shim, sizeof shim, "%s", g_self_path);

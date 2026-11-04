@@ -28,6 +28,7 @@ static SEL s_stringWithFormat, s_initWithFormat, s_appendFormat, s_stringByAppen
 static SEL s_predicateWithFormat_arguments;
 static SEL s_arrayWithObjects, s_initWithObjects, s_setWithObjects, s_orderedSetWithObjects;
 static SEL s_dictionaryWithObjectsAndKeys, s_initWithObjectsAndKeys;
+static SEL s_initWithColorsAndLocations, s_initWithColors_atLocations_colorSpace;
 static SEL s_withObjects_count, s_initWithObjects_count, s_dictWith_forKeys_count, s_initWith_forKeys_count;
 static SEL s_setWithObjects_count, s_orderedSetWithObjects_count;
 static SEL s_raise_format, s_raise_format_arguments;
@@ -50,6 +51,7 @@ static void objc_bridge_init(void) {
     SELN(s_setWithObjects, "setWithObjects:"); SELN(s_orderedSetWithObjects, "orderedSetWithObjects:");
     SELN(s_dictionaryWithObjectsAndKeys, "dictionaryWithObjectsAndKeys:");
     SELN(s_initWithObjectsAndKeys, "initWithObjectsAndKeys:");
+    SELN(s_initWithColorsAndLocations, "initWithColorsAndLocations:"); SELN(s_initWithColors_atLocations_colorSpace, "initWithColors:atLocations:colorSpace:");
     SELN(s_withObjects_count, "arrayWithObjects:count:"); SELN(s_initWithObjects_count, "initWithObjects:count:");
     SELN(s_setWithObjects_count, "setWithObjects:count:"); SELN(s_orderedSetWithObjects_count, "orderedSetWithObjects:count:");
     SELN(s_dictWith_forKeys_count, "dictionaryWithObjects:forKeys:count:");
@@ -261,6 +263,19 @@ static bool variadic_send(CPU *c, id self, SEL sel) {
         SEL target = sel == s_arrayWithObjects ? s_withObjects_count : sel == s_initWithObjects ? s_initWithObjects_count
                    : sel == s_setWithObjects ? s_setWithObjects_count : s_orderedSetWithObjects_count;
         c->x[0] = (uint64_t)send(self, target, objs, (uint64_t)n);
+        return true;
+    }
+    if (sel == s_initWithColorsAndLocations) {   // NSGradient: (color, CGFloat location) pairs ending with a nil color: the first color is in x2, then on the stack: location, color, location, ...
+        id cols[64]; double locs[64]; int n = 0;
+        if (c->x[2]) {
+            cols[0] = (id)c->x[2];
+            const uint64_t *p = (const uint64_t *)sp;
+            locs[0] = *(const double *)p++; n = 1;
+            while (*p && n < 64) { cols[n] = (id)*p++; locs[n] = *(const double *)p++; n++; }
+        }
+        id arr = send((id)objc_getClass("NSArray"), s_withObjects_count, cols, (uint64_t)n);
+        id cs = send((id)objc_getClass("NSColorSpace"), sel_registerName("genericRGBColorSpace"));
+        c->x[0] = (uint64_t)send(self, s_initWithColors_atLocations_colorSpace, arr, locs, cs);
         return true;
     }
     if (sel == s_dictionaryWithObjectsAndKeys || sel == s_initWithObjectsAndKeys) {
@@ -514,6 +529,7 @@ static bool guest_bundle_root(const char *img, char *out, size_t n) {
 static bool guest_bundle_for_class(CPU *c, uint64_t cls) {
     GImage *im = image_by_addr(cls);
     char root[PATH_MAX];
+    if (getenv("REBAR_OBJC_TRACE")) fprintf(stderr, "  [objc] bundleForClass %llx: image %s\n", (unsigned long long)cls, im && im->path ? im->path : "(none)");
     if (!im || !im->path || !guest_bundle_root(im->path, root, sizeof root)) return false;
     objc_bridge_init();
     send_fn send = (send_fn)p_msgSend;
@@ -645,6 +661,22 @@ H(h_objc_msgSend) {
     if (g_trace) fprintf(stderr, "  [msg] %p %s%s\n", (void *)self, self ? (class_isMetaClass(object_getClass(self)) ? "+" : "-") : "", sel_getName(sel));
     if (!self) { c->x[0] = c->x[1] = 0; memset(&c->vr[0], 0, 64); return; }
     { static SEL s_bfc; if (!s_bfc) s_bfc = sel_registerName("bundleForClass:"); if (sel == s_bfc && c->x[2] > 0x10000 && in_guest(c->x[2]) && guest_bundle_for_class(c, c->x[2])) return; }
+    {   // +[NSBundle mainBundle] is the bundle of the guest program (the .app around g_exe_path). CoreFoundation normally derives it from CFProcessPath, but it keeps the first answer it
+        // gave, and for VLC that was the folder of rebar (Sparkle then raised "This host has no CFBundleVersion" and the macosx interface did not start).
+        static SEL s_mb; static id mb_cache; static Class cNSBundle;
+        if (!s_mb) { s_mb = sel_registerName("mainBundle"); cNSBundle = objc_getClass("NSBundle"); }
+        if (sel == s_mb && self == (id)cNSBundle) {
+            if (!mb_cache) {
+                char root[PATH_MAX];
+                if (g_exe_path[0] && guest_bundle_root(g_exe_path, root, sizeof root)) {
+                    id str = send_h((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), root);
+                    mb_cache = str ? send_h((id)cNSBundle, sel_registerName("bundleWithPath:"), str) : NULL;
+                    if (mb_cache) send_h(mb_cache, sel_registerName("retain"));
+                }
+            }
+            if (mb_cache) { c->x[0] = (uint64_t)mb_cache; c->x[1] = 0; return; }
+        }
+    }
     Class cls = object_getClass(self);
     IMP imp = (IMP)imp_unwrap((uint64_t)class_getMethodImplementation(cls, sel));
     if (in_guest((uint64_t)imp)) { c->pc = (uint64_t)imp; return; }  // guest -> guest: stay in the interpreter
