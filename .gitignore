@@ -1,0 +1,27 @@
+# built products
+/rebar
+/librebar_exec.dylib
+*.o
+*.dSYM/
+*.bak
+.DS_Store
+
+# samples: keep the sources, not the arm64 / x86_64 binaries built from them
+/samples/*
+!/samples/*.c
+!/samples/*.cpp
+!/samples/*.m
+!/samples/*.mm
+!/samples/*.h
+!/samples/*.S
+
+# launcher and GPU check: sources only
+/launcher/dist/
+/launcher/.build/
+/gpucheck/dist/
+/tools/winlist
+
+# scratch
+/vscode-on-rebar*.png
+1.56931
+/PLAN_SPEEDUP.md
