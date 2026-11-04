@@ -66,6 +66,16 @@ static char *resolve_guest_dep(const GImage *loader, const char *name) {
                 free(rp);
                 if (realpath(cand, real)) return strdup(real);
             }
+        // No rpath leads to it (a binary with no LC_RPATH at all, like the python3 launcher of GIMP's bundle, whose Python library sits several levels up): look for the rest of the
+        // name below each directory above the loader, as a bundle would have it laid out
+        if (loader && loader->path) {
+            char dir[PATH_MAX]; snprintf(dir, sizeof dir, "%s", loader->path);
+            for (int up = 0; up < 8; up++) {
+                char *slash = strrchr(dir, '/'); if (!slash || slash == dir) break; *slash = 0;
+                snprintf(cand, sizeof cand, "%s/%s", dir, name + 7);
+                if (realpath(cand, real)) return strdup(real);
+            }
+        }
         return NULL;
     }
     if (name[0] == '@') {

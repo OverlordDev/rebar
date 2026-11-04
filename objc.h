@@ -601,6 +601,9 @@ static void wrap_ctx(CPU *c, int arg, size_t bytes, uint8_t *tmp) {
 }
 H(h_CFRunLoopObserverCreate) { uint8_t t[40]; c->x[4] = imp_wrap(c->x[4]); wrap_ctx(c, 5, 40, t); host_call(c, HOSTFN("CFRunLoopObserverCreate"), false); }
 H(h_CFRunLoopTimerCreate) { uint8_t t[40]; c->x[5] = imp_wrap(c->x[5]); wrap_ctx(c, 6, 40, t); host_call(c, HOSTFN("CFRunLoopTimerCreate"), false); }
+// vfork: the child would run the interpreter on the parent's CPU structure and stack (shared memory) until its exec, and the parent's host frame would be returned through twice.
+// A fork is what the program asked for at the level it can see (the child execs or exits at once): the child gets its own copy.
+H(h_vfork) { host_call(c, HOSTFN("fork"), false); }
 H(h_SSLSetIOFuncs) { c->x[1] = imp_wrap_any(c->x[1], true); c->x[2] = imp_wrap_any(c->x[2], true); host_call(c, HOSTFN("SSLSetIOFuncs"), false); }   // SecureTransport calls the guest's read / write functions (.NET's System.Net.Security)
 // CGGetActiveDisplayList is empty on this Mac (the display is online but not "active" for Quartz), while the main display has valid bounds and a mode: GTK and others that count the
 // active displays found no monitor. Answer with the main display when the host has none.
