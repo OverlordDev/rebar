@@ -3072,6 +3072,7 @@ static uint64_t resolve_import(GImage *img, const char *name, int ordinal, bool 
         uint64_t a = host_data_addr(name);
         if (a) return a;
     }
+    if (getenv("REBAR_TRACE_BINDS") && !strncmp(name, "_OBJC_CLASS_$_", 14)) fprintf(stderr, "[bind] class %s ordinal %d lib %s supported %d -> stub\n", name, ordinal, lib ? lib : "(none)", lib ? (int)lib_supported(lib) : -1);
     return stub_for(name, lib, weak);
 }
 

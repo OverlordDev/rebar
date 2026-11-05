@@ -62,7 +62,11 @@ def info(app):
     d["platform"] = next((l.split()[1] for l in build.split("\n") if l.strip().startswith("platform")), "?")
     linked = [l.strip().split(" (")[0] for l in sh("otool", "-arch", "arm64", "-L", exe).split("\n")[1:] if l.strip()]
     d["links"] = linked
-    d["uses_ui"] = any(("/%s.framework/" % f) in l for l in linked for f in UI_FRAMEWORKS)
+    # (a debug build from Xcode puts the whole app in "<name>.debug.dylib" and leaves a stub executable that links nothing: look at the dylibs next to the executable too)
+    extra = []
+    for n in os.listdir(app):
+        if n.endswith(".dylib"): extra += [l.strip().split(" (")[0] for l in sh("otool", "-arch", "arm64", "-L", os.path.join(app, n)).split("\n")[1:] if l.strip()]
+    d["uses_ui"] = any(("/%s.framework/" % f) in l for l in linked + extra for f in UI_FRAMEWORKS)
     enc = sh("otool", "-arch", "arm64", "-l", exe)
     d["encrypted"] = "cryptid 1" in enc
     fw = os.path.join(app, "Frameworks")
