@@ -1115,6 +1115,15 @@ static void register_class_now(GClass *c);   // (below)
 // The Swift runtime has set the class up: now the Objective-C runtime may know it (and realize it, from the updated class_ro_t)
 static uint64_t g_swift_done[1024]; static int g_nswift_done;
 static bool swift_class_is_done(uint64_t cls) { for (int k = 0; k < g_nswift_done; k++) if (g_swift_done[k] == cls) return true; return false; }
+// A category of a Swift class that is still waiting for the Swift runtime (its class is not known to the Objective-C runtime yet) is attached when the class is set up.
+static uint64_t g_pending_cats[512]; static int g_npending_cats;
+static void attach_category_now(GCat *cat, Class cls);
+static void attach_pending_categories(uint64_t cls) {
+    for (int k = 0; k < g_npending_cats; k++) {
+        GCat *cat = (GCat *)g_pending_cats[k];
+        if (cat && cat->cls == cls) { g_pending_cats[k] = 0; attach_category_now(cat, (Class)cls); }
+    }
+}
 static void swift_class_ready(uint64_t cls) {
     if (!cls || !swift_deferred(cls)) return;
     GClass *c = (GClass *)cls;
@@ -1122,6 +1131,7 @@ static void swift_class_ready(uint64_t cls) {
     if (g_nswift_done < 1024) g_swift_done[g_nswift_done++] = cls;
     if (in_guest(c->superclass) && swift_deferred(c->superclass)) swift_class_ready(c->superclass);
     register_class_now(c);   // (the Swift runtime has realized the class in place by now; the runtime still has to learn its name and put it in its class table)
+    attach_pending_categories(cls);
 }
 static void swift_class_ensure_ready(CPU *c, uint64_t cls) {
     if (!swift_deferred(cls) || swift_class_is_done(cls)) return;
@@ -1315,18 +1325,25 @@ static void objc_attach_categories(GImage *img) {
         for (uint64_t o = 0; o < s->size; o += 8) {
             GCat *cat = *(GCat **)(SA(s) + o);
             Class cls = (Class)cat->cls;
-            if (getenv("REBAR_OBJC_TRACE")) fprintf(stderr, "  [objc] category on %p %s\n", (void *)cls, cls ? class_getName(cls) : "(null)");
             if (class_dropped((uint64_t)cls)) continue;
-            each_method(cat->instanceMethods, imp_register_cb, NULL);
-            each_method(cat->classMethods, imp_register_cb, NULL);
-            each_method(cat->instanceMethods, add_method_cb, cls);
-            each_method(cat->classMethods, add_method_cb, object_getClass((id)cls));
-            add_category_properties(cls, cat->instanceProperties);
-            if (cat->protocols) {   // the protocols the category adopts (J2ObjC's checks `[NSString conformsToProtocol:...]` after loading its categories)
-                const uint64_t *pl = (const uint64_t *)cat->protocols; uint64_t np = pl[0];
-                for (uint64_t k = 0; k < np && k < 64; k++) if (in_guest(pl[1 + k])) class_addProtocol(cls, (Protocol *)pl[1 + k]);
+            if (in_guest((uint64_t)cls) && swift_deferred((uint64_t)cls) && !swift_class_is_done((uint64_t)cls)) {   // (not in the runtime yet)
+                if (g_npending_cats < 512) g_pending_cats[g_npending_cats++] = (uint64_t)cat;
+                continue;
             }
+            attach_category_now(cat, cls);
         }
+}
+static void attach_category_now(GCat *cat, Class cls) {
+    if (getenv("REBAR_OBJC_TRACE")) fprintf(stderr, "  [objc] category on %p %s\n", (void *)cls, cls ? class_getName(cls) : "(null)");
+    each_method(cat->instanceMethods, imp_register_cb, NULL);
+    each_method(cat->classMethods, imp_register_cb, NULL);
+    each_method(cat->instanceMethods, add_method_cb, cls);
+    each_method(cat->classMethods, add_method_cb, object_getClass((id)cls));
+    add_category_properties(cls, cat->instanceProperties);
+    if (cat->protocols) {   // the protocols the category adopts (J2ObjC's checks `[NSString conformsToProtocol:...]` after loading its categories)
+        const uint64_t *pl = (const uint64_t *)cat->protocols; uint64_t np = pl[0];
+        for (uint64_t k = 0; k < np && k < 64; k++) if (in_guest(pl[1 + k])) class_addProtocol(cls, (Protocol *)pl[1 + k]);
+    }
 }
 
 // Step 3 (just before the image's static initializers): +load, superclasses first, then categories.
