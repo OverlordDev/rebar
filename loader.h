@@ -222,6 +222,7 @@ static GImage *load_image(const char *real_path, GImage *loader, bool is_main) {
         if (getenv("REBAR_JIT_JAVA_SKIP")) { g_jit_skip[g_jit_nskip].lo = 0x10000; g_jit_skip[g_jit_nskip].hi = 0x100000000ull; g_jit_nskip++; }   // (not translated at all)
         else { g_jit_precise_lo = 0x10000; g_jit_precise_hi = 0x100000000ull; }   // translated in the precise form
     }
+    if (getenv("REBAR_JIT_PRECISE")) { g_jit_precise_lo = 0x10000; g_jit_precise_hi = ~0ull; }   // REBAR_JIT_PRECISE=1: every block stores the pc and registers before a load / store (faults, and the signal handlers that see them, are exact everywhere; slower)
     { static int show = -1; if (show < 0) show = getenv("REBAR_IMAGES") != NULL; if (show && !is_main) fprintf(stderr, "rebar: loaded %s base=0x%llx slide=0x%llx\n", img->path, (unsigned long long)img->base, (unsigned long long)img->slide); }   // (the images of the main program are listed at start)
 
     // thread-local template (runtime addresses)
