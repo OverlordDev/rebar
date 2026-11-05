@@ -135,7 +135,7 @@ static void jc_save(void) {
 // Only blocks of the images that were loaded at start are kept, and only if they are still valid: code a program generates itself differs from run to run.
 typedef struct { char magic[8]; uint64_t rebar_size; int64_t rebar_mtime; uint64_t arena, ic, stub_base, stub_size, guest_lo, guest_size, stubs_hash, knobs_hash, cpu_hash;
                  uint64_t thunk_len, top_off, cell_len, code_file_off, cell_file_off, rec_file_off, img_bytes; uint32_t nimg, nrec, npend, nsites, leaf_malloc, pad; uint64_t nblocks, ninsns; } SnHdr;
-typedef struct { uint64_t pc; uint32_t code_off, len, exit_off, sites_idx; uint16_t nsites; uint8_t n, precise; } SnRec;
+typedef struct { uint64_t pc; uint32_t code_off, len, exit_off, sites_idx; uint16_t nsites; uint8_t n, precise; uint32_t img, pad; } SnRec;
 typedef struct { uint64_t target; uint32_t site_off, pad; } SnPend;
 #define SN_PAGE 16384ull
 #define SN_ALIGN(x) (((x) + SN_PAGE - 1) & ~(SN_PAGE - 1))
@@ -162,14 +162,18 @@ static bool sn_env_same(const SnHdr *a, const SnHdr *b) {
 }
 static bool sn_pad(int fd, size_t n) { char z[4096]; memset(z, 0, sizeof z); while (n) { size_t k = n < sizeof z ? n : sizeof z; if (!jc_write_all(fd, z, k)) return false; n -= k; } return true; }
 
+static double jc_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static double g_sn_restore_ms, g_sn_save_ms;
 static void sn_save_now(void);
 static void sn_save_if(size_t min_new) {
     if (g_sn_saved_blocks && g_jit_reg_n < g_sn_saved_blocks + min_new) return;
     if (!g_sn_saved_blocks && g_jit_reg_n < 32) return;
     sn_save_now();
 }
-static void sn_save_now(void) {
-    if (!g_sn_on || !g_jit_on || g_sn_nimg0 <= 0 || sn_debug_modes() || g_sn_file[0] == 0) return;
+static void sn_save_inner(void);
+static void sn_save_now(void) { double t0 = jc_now_ms(); sn_save_inner(); g_sn_save_ms += jc_now_ms() - t0; }
+static void sn_save_inner(void) {
+    if (!g_sn_on || !g_jit_on || g_sn_nimg0 < 0 || sn_debug_modes() || g_sn_file[0] == 0) return;
     pthread_mutex_lock(&g_jc_mu);
     if (t_jit_busy || g_jit_reg_n == 0) { pthread_mutex_unlock(&g_jc_mu); return; }   // (not enough new code to write it all again)
     JCArena ar; size_t cap = (size_t)g_jit_reg_n * (sizeof(SnRec) + 16 * sizeof(JSite)) + ((size_t)g_jit_cell_top - (size_t)g_jit_end) + ((size_t)1 << 20) * sizeof(SnPend) + (size_t)(g_jit_top - g_jit_arena) + ((size_t)64 << 20);
@@ -183,13 +187,13 @@ static void sn_save_now(void) {
     size_t cap_sites = (size_t)g_jit_reg_n * 16; JSite *sites = jc_alloc(&ar, cap_sites * sizeof *sites);
     SnPend *pend = jc_alloc(&ar, ((size_t)1 << 20) * sizeof *pend);
     bool ok = cellcopy && codecopy && recs && sites && pend; uint32_t nrec = 0, nsites = 0, npend = 0;
-    int nimg = g_sn_nimg0 < g_nimages ? g_sn_nimg0 : g_nimages;
+    int nimg = g_nimages < MAX_IMAGES ? g_nimages : MAX_IMAGES;
     for (size_t k = 0; ok && k < g_jit_reg_n; k++) {
         const JReg *r = &g_jit_reg[k];
         JEnt *e = jit_probe(r->pc); if (!e || e->code != r->code) continue;     // translated and still valid
-        bool inimg = false; for (int q = 0; q < nimg; q++) if (g_images[q] && r->pc >= g_images[q]->base && r->pc < g_images[q]->end) { inimg = true; break; }
-        if (!inimg || nsites + r->nsites > cap_sites) continue;
-        recs[nrec++] = (SnRec){r->pc, (uint32_t)(r->code - g_jit_arena), r->len, r->exit_off, nsites, (uint16_t)r->nsites, (uint8_t)r->n, (uint8_t)r->precise};
+        int inimg = -1; for (int q = 0; q < nimg; q++) if (g_images[q] && r->pc >= g_images[q]->base && r->pc < g_images[q]->end) { inimg = q; break; }
+        if (inimg < 0 || nsites + r->nsites > cap_sites) continue;
+        recs[nrec++] = (SnRec){r->pc, (uint32_t)(r->code - g_jit_arena), r->len, r->exit_off, nsites, (uint16_t)r->nsites, (uint8_t)r->n, (uint8_t)r->precise, (uint32_t)inimg, 0};
         if (r->nsites) memcpy(&sites[nsites], r->sites, r->nsites * sizeof(JSite));
         nsites += r->nsites;
     }
@@ -211,7 +215,7 @@ static void sn_save_now(void) {
         if (!imgs || !jc_stat(path, &sz, &mt)) { ok = false; break; }
         memcpy(imgs + ip, &len, 2); ip += 2; memcpy(imgs + ip, path, len); ip += len; memcpy(imgs + ip, &sz, 8); memcpy(imgs + ip + 8, &mt, 8); memcpy(imgs + ip + 16, &base, 8); ip += 24;
     }
-    h.leaf_malloc = g_leaf_malloc_used; h.nblocks = g_jit_nblocks; h.ninsns = g_jit_ninsns;
+    h.leaf_malloc = g_leaf_malloc_used; h.pad = g_zone_cloned; h.nblocks = g_jit_nblocks; h.ninsns = g_jit_ninsns;
     h.top_off = top; h.cell_len = cells; h.nimg = (uint32_t)nimg; h.nrec = nrec; h.npend = npend; h.nsites = nsites; h.img_bytes = ip;
     h.code_file_off = SN_PAGE; h.cell_file_off = h.code_file_off + SN_ALIGN(top); h.rec_file_off = h.cell_file_off + SN_ALIGN(cells);
     size_t reg_n_now = g_jit_reg_n;
@@ -232,7 +236,68 @@ static void sn_save_now(void) {
 }
 
 // At the first kick, before the guest has run anything: map the snapshot over the arena when everything matches.
-static void sn_restore(void) {
+// State of a restored snapshot (kept for the life of the process: images that are loaded later have their blocks entered when they appear).
+static SnRec *g_sn_recs; static uint32_t g_sn_nrec; static SnPend *g_sn_pend; static uint32_t g_sn_npend;
+static JCImg *g_sn_imgs; static uint32_t g_sn_nimg; static uint8_t *g_sn_imgstate;   // per snapshot image: 0 not seen yet, 1 entered, 2 invalid
+static uint32_t *g_sn_by_img_start, *g_sn_by_img;                                      // the records of each image: indexes into g_sn_recs
+static uint64_t *g_sn_imgbase; static JSite *g_sn_sites;
+
+// the blocks of snapshot image q: entered into the tables (the code is in the arena already), or, if the image is not what it was, forgotten (and every cell that points at them reset)
+static void sn_enter_image(uint32_t q, bool valid) {
+    uint32_t from = g_sn_by_img_start[q], to = g_sn_by_img_start[q + 1];
+    if (to == from) return;
+    t_jit_busy = true; pthread_mutex_lock(&g_jit_mu);
+    if (valid) {
+        JReg *add = jgrow(NULL, 0, (size_t)(to - from) * sizeof(JReg)); size_t nadd = 0;
+        for (uint32_t k = from; k < to; k++) {
+            const SnRec *r = &g_sn_recs[g_sn_by_img[k]]; uint8_t *code = g_jit_arena + r->code_off;
+            if (jit_probe(r->pc)) continue;   // (translated again meanwhile: the new block stays)
+            jit_insert(r->pc, code);
+            JBlk *b = jpool_alloc(1, sizeof *b); b->pc = r->pc; b->bytes = (uint32_t)r->n * 4; b->exit_off = r->exit_off; b->code = code;
+            unsigned ph = (unsigned)((r->pc >> 12) & ((1 << JIT_PAGE_BITS) - 1)); b->next = g_jit_pages[ph]; g_jit_pages[ph] = b;
+            add[nadd++] = (JReg){code, r->len, r->n, r->pc, r->precise != 0, r->nsites ? &g_sn_sites[r->sites_idx] : NULL, r->nsites, r->exit_off};
+        }
+        // the registry is ordered by code address (fault reports search it): the new entries are merged in
+        for (size_t x = 1; x < nadd; x++) { JReg t = add[x]; size_t y = x; while (y > 0 && add[y - 1].code > t.code) { add[y] = add[y - 1]; y--; } add[y] = t; }
+        if (g_jit_reg_n + nadd > g_jit_reg_cap) { size_t nc = (g_jit_reg_n + nadd) * 2; g_jit_reg = jgrow(g_jit_reg, g_jit_reg_cap * sizeof(JReg), nc * sizeof(JReg)); g_jit_reg_cap = nc; }
+        size_t i = g_jit_reg_n, j2 = nadd, k2 = g_jit_reg_n + nadd;
+        while (j2 > 0) { if (i > 0 && g_jit_reg[i - 1].code > add[j2 - 1].code) g_jit_reg[--k2] = g_jit_reg[--i]; else g_jit_reg[--k2] = add[--j2]; }
+        g_jit_reg_n += nadd; munmap(add, (size_t)(to - from) * sizeof(JReg));
+        for (uint32_t k = 0; k < g_sn_npend; k++) {   // the blocks of this image that wait for a target
+            if (g_sn_pend[k].pad != q + 1) continue;
+            JPend *w = jpool_alloc(0, sizeof *w); w->target = g_sn_pend[k].target; w->site = g_jit_arena + g_sn_pend[k].site_off;
+            unsigned qh = (unsigned)((w->target >> 2) * 0x9E3779B97F4A7C15ull >> (64 - JIT_PEND_BITS)); w->next = g_jit_pend[qh]; g_jit_pend[qh] = w;
+        }
+        g_sn_restored_blocks += to - from;
+    } else {
+        size_t cells = (size_t)(g_jit_cell_top - g_jit_end);
+        for (size_t c = 0; c + 8 <= cells; c += 8) {
+            uint64_t v; memcpy(&v, g_jit_end + c, 8);
+            if (v < (uint64_t)g_jit_arena || v >= (uint64_t)g_jit_top) continue;
+            uint32_t off = (uint32_t)(v - (uint64_t)g_jit_arena); size_t lo = 0, hi = g_sn_nrec;
+            while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_sn_recs[mid].code_off < off) lo = mid + 1; else hi = mid; }
+            if (lo < g_sn_nrec && g_sn_recs[lo].code_off == off && g_sn_recs[lo].img == q) { uint64_t d = (uint64_t)g_jit_dummy; memcpy(g_jit_end + c, &d, 8); }
+        }
+    }
+    t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu);
+}
+// the snapshot's images that are loaded now (images [0, upto) have been through their fixups) and have not been looked at yet
+static void sn_check_images(int upto) {
+    if (!g_sn_restored) return;
+    for (uint32_t q = 0; q < g_sn_nimg; q++) {
+        if (g_sn_imgstate[q]) continue;
+        GImage *g = NULL; for (int k = 0; k < upto; k++) if (g_images[k] && g_images[k]->path && !strcmp(g_images[k]->path, g_sn_imgs[q].path)) { g = g_images[k]; break; }
+        if (!g) continue;   // not loaded (yet)
+        uint64_t sz; int64_t mt; bool valid = g->base == g_sn_imgbase[q] && jc_stat(g_sn_imgs[q].path, &sz, &mt) && sz == g_sn_imgs[q].size && mt == g_sn_imgs[q].mtime;
+        g_sn_imgstate[q] = valid ? 1 : 2; sn_enter_image(q, valid);
+        if (g_jc_debug) { char m[PATH_MAX + 120]; int n = snprintf(m, sizeof m, "[jitcache] snapshot image %u %s: %s (%u blocks) base %llx vs %llx\n", q, valid ? "entered" : "INVALID", g_sn_imgs[q].path, g_sn_by_img_start[q + 1] - g_sn_by_img_start[q], (unsigned long long)g->base, (unsigned long long)g_sn_imgbase[q]); if (n > 0) (void)!write(2, m, (size_t)n); }
+    }
+}
+
+static void sn_restore_inner(void);
+static void sn_restore(void) { double t0 = jc_now_ms(); sn_restore_inner(); g_sn_restore_ms += jc_now_ms() - t0; }
+// At the first kick, before the guest has run anything: the code is mapped over the arena when the environment matches; the blocks of the images that are loaded and unchanged are entered.
+static void sn_restore_inner(void) {
     if (!g_sn_on || !g_jit_on || g_jit_nblocks != 0 || sn_debug_modes() || g_sn_file[0] == 0) return;
     int fd = open(g_sn_file, O_RDONLY); if (fd < 0) return;
     struct stat st; SnHdr h, cur;
@@ -240,48 +305,53 @@ static void sn_restore(void) {
     sn_env(&cur);
     size_t need = (size_t)h.rec_file_off + h.img_bytes + (size_t)h.nrec * sizeof(SnRec) + (size_t)h.npend * sizeof(SnPend) + (size_t)h.nsites * sizeof(JSite);
     if (memcmp(h.magic, cur.magic, 8) || !sn_env_same(&h, &cur) || (size_t)st.st_size < need || h.top_off > (size_t)(g_jit_end - g_jit_arena) || h.top_off < h.thunk_len ||
-        h.cell_len > (size_t)(g_jit_cell_end - g_jit_end) || h.nimg == 0 || (int)h.nimg != g_sn_nimg0 || h.nimg > MAX_IMAGES || h.nrec > (4u << 20) || h.npend > (1u << 20)) { close(fd); return; }
-    JCArena ar; if (!jc_arena(&ar, (size_t)need + ((size_t)16 << 20))) { close(fd); return; }
+        h.cell_len > (size_t)(g_jit_cell_end - g_jit_end) || h.nimg == 0 || h.nimg > MAX_IMAGES || h.nrec > (4u << 20) || h.npend > (1u << 20)) { close(fd); return; }
     // the thunks this run generated must be what the snapshot starts with (the strongest check of every setting that shapes the code)
-    uint8_t *tbuf = jc_alloc(&ar, h.thunk_len);
+    JCArena tmp; if (!jc_arena(&tmp, h.thunk_len + 4096)) { close(fd); return; }
+    uint8_t *tbuf = jc_alloc(&tmp, h.thunk_len);
     bool good = tbuf && pread(fd, tbuf, h.thunk_len, (off_t)h.code_file_off) == (ssize_t)h.thunk_len && !memcmp(tbuf, g_jit_arena, h.thunk_len);
-    size_t tail_len = need - (size_t)h.rec_file_off; uint8_t *tail = good ? jc_alloc(&ar, tail_len) : NULL;
-    good = good && tail && pread(fd, tail, tail_len, (off_t)h.rec_file_off) == (ssize_t)tail_len;
-    size_t tp = 0;
-    for (uint32_t q = 0; good && q < h.nimg; q++) {   // the images: the same files at the same addresses
+    jc_arena_free(&tmp);
+    if (!good) { close(fd); return; }
+    // what is kept for the life of the process: the image table, the records, the pending patches, the access records
+    size_t tail_len = need - (size_t)h.rec_file_off;
+    uint8_t *tail = jgrow(NULL, 0, tail_len + 16);
+    if (pread(fd, tail, tail_len, (off_t)h.rec_file_off) != (ssize_t)tail_len) { munmap(tail, tail_len + 16); close(fd); return; }
+    JCImg *imgs = jgrow(NULL, 0, (size_t)h.nimg * sizeof *imgs); uint64_t *bases = jgrow(NULL, 0, (size_t)h.nimg * 8); size_t tp = 0;
+    for (uint32_t q = 0; good && q < h.nimg; q++) {
         uint16_t len; if (tp + 2 > h.img_bytes) { good = false; break; } memcpy(&len, tail + tp, 2); tp += 2;
         if (len >= PATH_MAX || tp + len + 24 > h.img_bytes) { good = false; break; }
-        char path[PATH_MAX]; memcpy(path, tail + tp, len); path[len] = 0; tp += len;
-        uint64_t sz, base, csz; int64_t mt, cmt; memcpy(&sz, tail + tp, 8); memcpy(&mt, tail + tp + 8, 8); memcpy(&base, tail + tp + 16, 8); tp += 24;
-        if (!g_images[q] || strcmp(g_images[q]->path, path) || g_images[q]->base != base || !jc_stat(path, &csz, &cmt) || csz != sz || cmt != mt) good = false;
+        char *copy = jgrow(NULL, 0, (size_t)len + 1); memcpy(copy, tail + tp, len); copy[len] = 0; tp += len;
+        imgs[q].path = copy; memcpy(&imgs[q].size, tail + tp, 8); memcpy(&imgs[q].mtime, tail + tp + 8, 8); memcpy(&bases[q], tail + tp + 16, 8); tp += 24;
     }
-    if (!good) { jc_arena_free(&ar); close(fd); return; }
-    // everything matches: the code and the cells are mapped over the arena
+    if (!good) { munmap(tail, tail_len + 16); close(fd); return; }
+    SnRec *rb = (SnRec *)(tail + h.img_bytes); SnPend *pb = (SnPend *)(rb + h.nrec); JSite *sb = (JSite *)(pb + h.npend);
+    // the records are sorted by code address in the file; the index by image
+    uint32_t *start = jgrow(NULL, 0, ((size_t)h.nimg + 2) * 4), *byimg = jgrow(NULL, 0, ((size_t)h.nrec + 1) * 4); memset(start, 0, ((size_t)h.nimg + 2) * 4);
+    for (uint32_t k = 0; k < h.nrec; k++) if (rb[k].img < h.nimg) start[rb[k].img + 1]++;
+    for (uint32_t q = 0; q < h.nimg; q++) start[q + 1] += start[q];
+    { uint32_t *fill = jgrow(NULL, 0, ((size_t)h.nimg + 1) * 4); memcpy(fill, start, ((size_t)h.nimg + 1) * 4);
+      for (uint32_t k = 0; k < h.nrec; k++) if (rb[k].img < h.nimg) byimg[fill[rb[k].img]++] = k;
+      munmap(fill, ((size_t)h.nimg + 1) * 4); }
+    // a pending patch belongs to the image of the block that holds its site
+    for (uint32_t k = 0; k < h.npend; k++) {
+        uint32_t off = pb[k].site_off; size_t l = 0, u = h.nrec; pb[k].pad = 0;
+        while (l < u) { size_t mid = (l + u) / 2; if (rb[mid].code_off + rb[mid].len <= off) l = mid + 1; else u = mid; }
+        if (l < h.nrec && off >= rb[l].code_off) pb[k].pad = rb[l].img + 1;
+    }
+    // map the code and the cells over the arena
     void *m1 = mmap(g_jit_arena, SN_ALIGN(h.top_off), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, fd, (off_t)h.code_file_off);
-    if (m1 == MAP_FAILED) { jc_arena_free(&ar); close(fd); return; }
+    if (m1 == MAP_FAILED) { close(fd); return; }
     if (h.cell_len && mmap(g_jit_end, SN_ALIGN(h.cell_len), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, fd, (off_t)h.cell_file_off) == MAP_FAILED) abort();   // (the arena is half replaced: nothing to go back to)
     close(fd);
-    const SnRec *rb = (const SnRec *)(tail + h.img_bytes); const SnPend *pb = (const SnPend *)(rb + h.nrec); const JSite *sb_src = (const JSite *)(pb + h.npend);
-    JSite *sb = h.nsites ? jgrow(NULL, 0, (size_t)h.nsites * sizeof(JSite)) : NULL;   // (the blocks' records point into it for the life of the process)
-    if (h.nsites) memcpy(sb, sb_src, (size_t)h.nsites * sizeof(JSite));
     t_jit_busy = true; pthread_mutex_lock(&g_jit_mu);
-    g_jit_top = g_jit_arena + h.top_off; g_jit_cell_top = g_jit_end + h.cell_len;
-    if (g_jit_reg_cap < h.nrec + 65536) { size_t nc = (size_t)h.nrec + 65536; g_jit_reg = jgrow(g_jit_reg, g_jit_reg_cap * sizeof(JReg), nc * sizeof(JReg)); g_jit_reg_cap = nc; }
-    for (uint32_t k = 0; k < h.nrec; k++) {
-        const SnRec *r = &rb[k]; uint8_t *code = g_jit_arena + r->code_off;
-        jit_insert(r->pc, code);
-        JBlk *b = jpool_alloc(1, sizeof *b); b->pc = r->pc; b->bytes = (uint32_t)r->n * 4; b->exit_off = r->exit_off; b->code = code;
-        unsigned ph = (unsigned)((r->pc >> 12) & ((1 << JIT_PAGE_BITS) - 1)); b->next = g_jit_pages[ph]; g_jit_pages[ph] = b;
-        g_jit_reg[g_jit_reg_n++] = (JReg){code, r->len, r->n, r->pc, r->precise != 0, r->nsites ? &sb[r->sites_idx] : NULL, r->nsites, r->exit_off};
-    }
-    for (uint32_t k = 0; k < h.npend; k++) {
-        JPend *w = jpool_alloc(0, sizeof *w); w->target = pb[k].target; w->site = g_jit_arena + pb[k].site_off;
-        unsigned qh = (unsigned)((w->target >> 2) * 0x9E3779B97F4A7C15ull >> (64 - JIT_PEND_BITS)); w->next = g_jit_pend[qh]; g_jit_pend[qh] = w;
-    }
-    g_jit_nblocks = h.nblocks; g_jit_ninsns = h.ninsns; if (h.leaf_malloc) g_leaf_malloc_used = true;
-    g_sn_restored = true; g_sn_restored_blocks = h.nrec; g_sn_saved_blocks = g_jit_reg_n;
+    g_jit_top = g_jit_arena + h.top_off; g_jit_cell_top = g_jit_end + h.cell_len; g_jit_nblocks = h.nblocks; g_jit_ninsns = h.ninsns;
+    if (h.pad) g_leaf_malloc_off = true; else if (h.leaf_malloc) g_leaf_malloc_used = true;   // (a snapshot made after the guest took the zone holds no leaf malloc: keep it that way)
     t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu);
-    jc_arena_free(&ar);
+    g_sn_recs = rb; g_sn_nrec = h.nrec; g_sn_pend = pb; g_sn_npend = h.npend; g_sn_imgs = imgs; g_sn_nimg = h.nimg; g_sn_imgbase = bases; g_sn_sites = sb;
+    g_sn_by_img_start = start; g_sn_by_img = byimg; g_sn_imgstate = jgrow(NULL, 0, h.nimg + 16);
+    g_sn_restored = true;
+    sn_check_images(g_nimages);
+    g_sn_saved_blocks = g_jit_reg_n;
 }
 
 static void jc_flush_map(void) { if (g_jit_map) fflush(g_jit_map); }
@@ -289,8 +359,8 @@ static void jc_atexit(void) {
     if (getenv("REBAR_DBG_ADDR")) { char m[512]; int n = snprintf(m, sizeof m, "[addr] arena=%p stubbase=%llx guestlo=%llx strlen=%p sin=%p malloc=%p dyldslide=%p main_base=%llx nimg=%d img1=%llx\n", (void *)g_jit_arena, (unsigned long long)g_stub_base, (unsigned long long)g_guest_lo, dlsym(RTLD_DEFAULT, "strlen"), dlsym(RTLD_DEFAULT, "sin"), dlsym(RTLD_DEFAULT, "malloc"), (void *)&environ, (unsigned long long)g_main_image->base, g_nimages, (unsigned long long)(g_nimages > 1 ? g_images[1]->base : 0)); (void)!write(2, m, (size_t)n); }
     if (g_jit_map) fflush(g_jit_map);
     jc_save();
-    sn_save_if(1000);
-    if (g_jc_debug) { char m[PATH_MAX + 160]; int n = snprintf(m, sizeof m, "[jitcache] pid %d: %llu blocks translated by the guest, %llu in the background (%zu cached), %llu restored from the snapshot, file %s\n", (int)getpid(), (unsigned long long)g_jc_main_compiles, (unsigned long long)g_jc_bg_compiles, g_jce_n, (unsigned long long)g_sn_restored_blocks, g_jc_file); if (n > 0) (void)!write(2, m, (size_t)n); }
+    sn_save_if(g_sn_saved_blocks / 4 > 2000 ? g_sn_saved_blocks / 4 : 2000);   // (a snapshot is tens of megabytes: only when a good part of the code is new)
+    if (g_jc_debug) { char m[PATH_MAX + 160]; int n = snprintf(m, sizeof m, "[jitcache] pid %d: %llu blocks translated by the guest, %llu in the background (%zu cached), %llu restored from the snapshot (%.0f ms to restore, %.0f ms saving), %llu blocks invalidated, file %s\n", (int)getpid(), (unsigned long long)g_jc_main_compiles, (unsigned long long)g_jc_bg_compiles, g_jce_n, (unsigned long long)g_sn_restored_blocks, g_sn_restore_ms, g_sn_save_ms, (unsigned long long)g_ji_killed, g_jc_file); if (n > 0) (void)!write(2, m, (size_t)n); }
 }
 
 // the cache's images that are loaded now (same path, size and modification time)
@@ -337,7 +407,7 @@ static void *jc_saver(void *arg) {
 // Called when images [.., upto) have been through their fixups (start_images): the cache's blocks in them can be translated now.
 static void jitcache_kick(int upto) {
     if (!g_jc_on) return;
-    if (g_sn_nimg0 < 0) { g_sn_nimg0 = upto; g_sn_stubs0 = sn_stubs_hash(); sn_restore(); }   // the first kick: the images loaded at start are the ones a snapshot can hold
+    if (g_sn_nimg0 < 0) { g_sn_nimg0 = upto; g_sn_stubs0 = sn_stubs_hash(); sn_restore(); } else if (g_sn_restored) { double t0 = jc_now_ms(); sn_check_images(upto); g_sn_restore_ms += jc_now_ms() - t0; }   // the first kick: the code is mapped, the loaded images' blocks entered; later ones: the images that appeared since
     pthread_mutex_lock(&g_jc_mu); g_jc_ready = upto; pthread_cond_signal(&g_jc_cv); pthread_mutex_unlock(&g_jc_mu);
 }
 // The snapshots are big (tens to hundreds of megabytes of code per program): when the cache directory holds more than REBAR_JIT_CACHE_MAX_MB (default 6000), the least recently written

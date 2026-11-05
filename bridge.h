@@ -143,13 +143,14 @@ static inline uint64_t stub_addr(int idx) { return g_stub_base + 16 * (uint64_t)
 static bool g_no_async_tail;   // REBAR_NO_ASYNC_TAIL (set at start)
 static bool g_zone_cloned;       // the guest asked for the default zone (to patch it, as Chromium's allocator shim does): its malloc and free must go through the handlers from now on
 static bool g_leaf_malloc_used;  // translated code calls the host's malloc and free directly
+static bool g_leaf_malloc_off;   // a code snapshot made after the guest took the default zone is in use: no leaf malloc (its blocks have none, and taking the zone again must not throw them away)
 static bool jit_leaf_import(uint64_t target, void **fn, int *nargs, int *zext8) {
     uint64_t off = target - g_stub_base;
     if (off >= g_stub_size || (off & 15) || off / 16 < 2 || off / 16 >= (uint64_t)g_nstubs) return false;
     const Stub *s = &g_stubs[off / 16];
     // malloc, calloc, realloc, free: while the guest has not got hold of the default zone nothing can have patched it, so the call goes straight to the host (the handler path costs
     // ~140 ns a call and takes the interpreter lock); the moment it asks for the zone every translation is thrown away (h_malloc_default_zone) and these calls take the handlers
-    if (s->name && !g_zone_cloned && !getenv("REBAR_NO_LEAF_MALLOC") && (!strcmp(s->name, "_malloc") || !strcmp(s->name, "_free") || !strcmp(s->name, "_calloc") || !strcmp(s->name, "_realloc"))) {
+    if (s->name && !g_zone_cloned && !g_leaf_malloc_off && !getenv("REBAR_NO_LEAF_MALLOC") && (!strcmp(s->name, "_malloc") || !strcmp(s->name, "_free") || !strcmp(s->name, "_calloc") || !strcmp(s->name, "_realloc"))) {
         *fn = dlsym(RTLD_DEFAULT, s->name + 1); *zext8 = 0;
         *nargs = !strcmp(s->name, "_malloc") || !strcmp(s->name, "_free") ? 1 : 2;
         if (!*fn) return false;
