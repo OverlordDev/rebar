@@ -1,0 +1,6 @@
+fcadd 0 fcmla 0 fcmla-elem 0
+fmlal 0 fmlal-elem 0
+i8mm 0 i8dot 0
+bfdot 0 bfdot-elem 0 bfmmla 0 bfmlal 0 bfcvt 0
+rdm 0 rdm-elem 0
+flagm 0 ldtr 0 ldra 0 pacga 0

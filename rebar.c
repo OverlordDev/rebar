@@ -95,8 +95,9 @@ static jmp_buf *g_die_jmp;  // set by --simd-selftest, which runs encodings the 
 static __thread jmp_buf *t_fault_jb;   // where a guest memory fault, once its signal handler (the guest's own) has run, continues: the wrapper of run_until below
 static uint64_t g_guest_fault_handler[3];   // the guest's SIGSEGV, SIGBUS and SIGILL handlers (0: none), see h_sigaction
 static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr);
+static const char *g_die_why;   // (what --probe-insns reports)
 [[noreturn]] static void die(CPU *c, const char *why, uint32_t insn) {
-    if (g_die_jmp) longjmp(*g_die_jmp, 1);
+    if (g_die_jmp) { g_die_why = why; longjmp(*g_die_jmp, 1); }
     if (t_fault_jb && g_guest_fault_handler[2] && !strncmp(why, "unimplemented", 13)) deliver_guest_signal(c, SIGILL, 1, c->pc);   // an instruction the guest wants to trap on (HotSpot's deoptimization instruction)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }
     fprintf(stderr, "rebar: %s (insn 0x%08x at pc 0x%llx)\n", why, insn, (unsigned long long)c->pc);
@@ -422,9 +423,15 @@ x_ldst:
         } else if (!B(i, 21, 21)) {
             int idx = B(i, 11, 10);
             int64_t imm = sext(B(i, 20, 12), 9);
-            if (idx == 2) die(c, "unprivileged ldst", i);
+            if (idx == 2 && V) die(c, "unprivileged ldst", i);   // LDTR / STTR family (unprivileged: ordinary at EL0)
             addr = idx == 1 ? base : base + imm;
             if (idx == 1 || idx == 3) wb = 1, base += imm;
+        } else if (!V && size == 3 && B(i, 21, 21) && B(i, 10, 10)) {   // LDRAA / LDRAB (arm64e authenticated load: the pointer is not signed here): offset S:imm9 scaled by 8, optional pre-index writeback
+            int64_t off = sext((B(i, 22, 22) << 9) | B(i, 20, 12), 10) * 8;
+            addr = base + (uint64_t)off;
+            wr(c, rt, mem_ld(addr, 3));
+            if (B(i, 11, 11)) wr_sp(c, rn, addr);
+            return true;
         } else die(c, "bad ldst", i);
         if (V) vmem(c, rt, size, opc, addr);
         else if (opc == 0) mem_st(addr, size, rd(c, rt));
@@ -511,6 +518,20 @@ x_dpreg:
         wr(c, rt, r);
         return true;
     }
+    // ---- FlagM: SETF8 / SETF16 and RMIF
+    if ((i & 0xffffbc1f) == 0x3a00080d) {
+        int hi = B(i, 14, 14) ? 15 : 7; uint32_t v = (uint32_t)rd(c, rn);
+        c->n = (v >> hi) & 1; c->z = (v & ((2u << hi) - 1)) == 0; c->v = ((v >> (hi + 1)) ^ (v >> hi)) & 1;
+        return true;
+    }
+    if ((i & 0xffe07c10) == 0xba000400) {
+        int sh = B(i, 20, 15), mk = B(i, 3, 0); uint64_t x = rd(c, rn), t = sh ? (x >> sh) | (x << (64 - sh)) : x;
+        if (mk & 8) c->n = (t >> 3) & 1;
+        if (mk & 4) c->z = (t >> 2) & 1;
+        if (mk & 2) c->c = (t >> 1) & 1;
+        if (mk & 1) c->v = t & 1;
+        return true;
+    }
     // ---- conditional compare
     if (B(i, 29, 21) == 0x1d2 && !B(i, 10, 10) && !B(i, 4, 4)) {
         int cond = B(i, 15, 12), nzcv = B(i, 3, 0);
@@ -547,6 +568,9 @@ x_dpreg:
         case 11: r = shift_val(a, 3, b, sf); break;
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23:  // CRC32{B,H,W,X}, CRC32C{B,H,W,X}
             r = crc32_insn((uint32_t)a, b, 1 << (op & 3), op & 4); break;
+        case 12: {   // PACGA Xd, Xn, Xm|SP: a 32-bit code in the top half (any fixed function of the inputs: nothing here checks it against a key)
+            uint64_t mod = rm == 31 ? c->sp : b, h = (a ^ (mod * 0x9e3779b97f4a7c15ull)) * 0xff51afd7ed558ccdull; h ^= h >> 29;
+            r = (h & 0xffffffff00000000ull); break; }
         default: die(c, "unsupported dp2src", i);
         }
         wr(c, rt, r & mask(sf));
@@ -958,6 +982,36 @@ done:
 
 // --------------------------------------------------------------------- loader
 
+// rebar --probe-insns: A64 words on stdin (hex, one per line), each run once by the interpreter with every register pointing into a scratch window: prints OK (ran), FAULT (an access went
+// outside the window: the decoder accepted it) or DIED <reason> (the interpreter does not implement it). Branches are skipped. A coverage tool: the words come from a disassembler.
+static sigjmp_buf g_probe_jb;
+static void probe_fault(int sig) { (void)sig; siglongjmp(g_probe_jb, 1); }
+static int probe_insns(void) {
+    size_t sz = 1 << 20;
+    uint8_t *mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    uint32_t *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = probe_fault; sa.sa_flags = SA_NODEFER; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+    CPU *a = calloc(1, sizeof(CPU));
+    char line[64];
+    while (fgets(line, sizeof line, stdin)) {
+        uint32_t w = (uint32_t)strtoul(line, NULL, 16);
+        if (B(w, 30, 26) == 0x5 || (w & 0xfe000000) == 0xd6000000 || (w & 0x7e000000) == 0x34000000 || (w & 0xff000010) == 0x54000000 || (w & 0xff000000) == 0xd4000000 || (w & 0x7f000000) == 0x36000000) { printf("%08x SKIP\n", w); continue; }
+        memset(a, 0, sizeof *a);
+        for (int k = 0; k < 31; k++) a->x[k] = (uint64_t)mem + (sz / 2) + (uint64_t)k * 64;
+        a->sp = (uint64_t)mem + sz / 2 + 4096;
+        for (int k = 0; k < 32; k++) { a->vr[k].d[0] = 0x3ff0000000000000ull + (uint64_t)k; a->vr[k].d[1] = 0x4000000000000000ull; }
+        code[0] = w; code[1] = 0x14000000 | ((2048 - 4) / 4);   // (b to the stop address: run_until looks for it at branches)
+        a->pc = (uint64_t)code; a->code_lo = (uint64_t)code; a->code_len = 4096;
+        jmp_buf jb; volatile int died = 0, faulted = 0;
+        g_die_jmp = &jb; g_die_why = NULL; g_jit_on = false; t_cpu = a;
+        if (sigsetjmp(g_probe_jb, 1)) { faulted = 1; }
+        else if (setjmp(jb) == 0) run_until(a, (uint64_t)code + 2048); else died = 1;
+        g_die_jmp = NULL;
+        if (died) printf("%08x DIED %s\n", w, g_die_why ? g_die_why : "?"); else printf("%08x %s\n", w, faulted ? "FAULT" : "OK");
+    }
+    return 0;
+}
 // rebar --simd-selftest [count]: random AdvSIMD encodings, run once with the fast paths (simdfast.h) and once without,
 // from the same random state; any difference in registers, flags or memory is printed.
 static uint64_t g_rng = 0x9e3779b97f4a7c15ull;
@@ -1701,6 +1755,7 @@ int main(int argc, char **argv) {
         if (ai + 5 < argc && !strcmp(argv[ai + 4], "scan") && !scan_load(argv[ai + 5])) return 2;
         return jit_selftest(ai + 1 < argc ? atol(argv[ai + 1]) : 200000, ai + 2 < argc ? strtoull(argv[ai + 2], NULL, 0) : 0, ai + 3 < argc && strcmp(argv[ai + 3], "-") ? argv[ai + 3] : NULL, ai + 4 < argc && (!strcmp(argv[ai + 4], "tails") || !strcmp(argv[ai + 4], "scan")));
     }
+    if (ai < argc && !strcmp(argv[ai], "--probe-insns")) { CPU cpu0 = {0}; t_cpu = &cpu0; return probe_insns(); }
     if (ai < argc && !strcmp(argv[ai], "--simd-selftest")) {
         CPU cpu0 = {0}; t_cpu = &cpu0;
         return simd_selftest(ai + 1 < argc ? atol(argv[ai + 1]) : 1000000);

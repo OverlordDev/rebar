@@ -49,6 +49,14 @@ static inline uint64_t f2raw(double v, int es) {
     uint64_t r; memcpy(&r, &v, 8); return r;
 }
 
+static inline float bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
+static inline uint16_t f2bf(float f) {   // round to nearest even; a NaN is made quiet (FPCR.AH = 0)
+    uint32_t u; memcpy(&u, &f, 4);
+    if (isnan(f)) return (uint16_t)((u >> 16) | 0x40);
+    u += 0x7fffu + ((u >> 16) & 1);
+    return (uint16_t)(u >> 16);
+}
+
 static uint64_t sat_s(__int128 v, int es) {
     int bits = es * 8;
     __int128 mx = ((__int128)1 << (bits - 1)) - 1, mn = -mx - 1;
@@ -302,6 +310,8 @@ static void fp_scalar(CPU *c, uint32_t i) {
             case 3: fpw(c, rdn, type, sqrt(a)); return;
             case 4: fpw(c, rdn, 0, a); return;
             case 5: fpw(c, rdn, 1, a); return;
+            case 6: if (type != 1) die(c, "unsupported fp 1-source", i);   // BFCVT Hd, Sn
+                { float f = (float)fpr(c, rn, 0); VReg t; memset(&t, 0, 16); t.h[0] = f2bf(f); c->vr[rdn] = t; } return;
             case 7: fpw(c, rdn, 3, a); return;
             case 8: fpw(c, rdn, type, fp_round(a, 0)); return;
             case 9: fpw(c, rdn, type, fp_round(a, 1)); return;
@@ -1073,6 +1083,141 @@ static void simd_dot(CPU *c, uint32_t i, bool indexed) {
     c->vr[rdn] = res;
 }
 
+// ------------------------------------------------- v8.2 .. v8.6 extensions: FCMA, FHM, I8MM, BF16, RDM (vector forms)
+
+
+// FCADD Vd, Vn, Vm, #90|#270: complex addition of (re, im) pairs; FCMLA Vd, Vn, Vm, #0|90|180|270: complex multiply-accumulate of one half of the product, fused
+static void simd_fcomplex(CPU *c, uint32_t i, bool cmla, bool indexed) {
+    int Q = B(i, 30, 30), size = B(i, 23, 22), rn = B(i, 9, 5), rdn = B(i, 4, 0), rm, rot, es, idxp = 0;
+    if (indexed) { rot = B(i, 14, 13); rm = (B(i, 20, 20) << 4) | B(i, 19, 16); es = size == 1 ? 2 : 4; if (size != 1 && size != 2) die(c, "bad fcmla size", i);
+                   if (size == 1) { idxp = (B(i, 11, 11) << 1) | B(i, 21, 21); rm = B(i, 19, 16) | (B(i, 20, 20) << 4); } else idxp = B(i, 11, 11);
+                   if (size == 2 && (B(i, 21, 21) || !Q)) die(c, "bad fcmla index", i); }
+    else { rm = B(i, 20, 16); rot = cmla ? (B(i, 12, 11)) : (B(i, 12, 12) ? 3 : 1); es = size == 1 ? 2 : size == 2 ? 4 : 8; if (size == 0 || (size == 3 && !Q)) die(c, "bad fcomplex size", i); }
+    const VReg n = c->vr[rn], m = c->vr[rm], d0 = c->vr[rdn];
+    int N = (Q ? 16 : 8) / es;
+    VReg res; memset(&res, 0, 16);
+    for (int e = 0; e < N; e += 2) {
+        double nr = raw2f(vget(&n, es, e), es), ni = raw2f(vget(&n, es, e + 1), es);
+        int me = indexed ? 2 * idxp : e;
+        double mr = raw2f(vget(&m, es, me), es), mi = raw2f(vget(&m, es, me + 1), es);
+        double dr = raw2f(vget(&d0, es, e), es), di = raw2f(vget(&d0, es, e + 1), es), rr, ri;
+        if (!cmla) {   // rot is 1 (#90) or 3 (#270)
+            if (rot == 1) { rr = nr - mi; ri = ni + mr; } else { rr = nr + mi; ri = ni - mr; }
+        } else switch (rot) {
+            case 0: rr = fp_fma(es, nr, mr, dr); ri = fp_fma(es, nr, mi, di); break;
+            case 1: rr = fp_fma(es, -ni, mi, dr); ri = fp_fma(es, ni, mr, di); break;
+            case 2: rr = fp_fma(es, -nr, mr, dr); ri = fp_fma(es, -nr, mi, di); break;
+            default: rr = fp_fma(es, ni, mi, dr); ri = fp_fma(es, -ni, mr, di); break;
+        }
+        vset(&res, es, e, f2raw(rr, es)); vset(&res, es, e + 1, f2raw(ri, es));
+    }
+    c->vr[rdn] = res;
+}
+
+// FMLAL / FMLSL (lower half of the sources) and FMLAL2 / FMLSL2 (upper half): half-precision products added to single-precision lanes, fused
+static void simd_fmlal(CPU *c, uint32_t i, bool indexed) {
+    int Q = B(i, 30, 30), U = B(i, 29, 29), sub = B(i, 23, 23), rn = B(i, 9, 5), rdn = B(i, 4, 0);
+    int rm = indexed ? B(i, 19, 16) : B(i, 20, 16), idx = indexed ? (B(i, 11, 11) << 2) | (B(i, 21, 21) << 1) | B(i, 20, 20) : 0;
+    if (indexed) sub = B(i, 14, 14);
+    const VReg n = c->vr[rn], m = c->vr[rm], d0 = c->vr[rdn];
+    int L = Q ? 4 : 2, off = U ? L : 0;
+    VReg res; memset(&res, 0, 16);
+    for (int k = 0; k < L; k++) {
+        double a = hraw2f(n.h[off + k]), b = hraw2f(m.h[indexed ? idx : off + k]);
+        float acc; memcpy(&acc, &d0.s[k], 4);
+        float r = fmaf((float)(sub ? -a : a), (float)b, acc);
+        uint32_t u; if (isnan(r)) u = 0x7fc00000u; else memcpy(&u, &r, 4);
+        res.s[k] = u;
+    }
+    c->vr[rdn] = res;
+}
+
+// vector SQRDMLAH / SQRDMLSH (the by-element forms are in simd_indexed), scalar forms too
+static void simd_rdm(CPU *c, uint32_t i, bool scalar) {
+    int Q = scalar ? 0 : B(i, 30, 30), size = B(i, 23, 22), rm = B(i, 20, 16), rn = B(i, 9, 5), rdn = B(i, 4, 0), sub = B(i, 11, 11);
+    if (size != 1 && size != 2) die(c, "bad sqrdmlah size", i);
+    int es = size == 1 ? 2 : 4, bits = es * 8, L = scalar ? 1 : (Q ? 16 : 8) / es;
+    const VReg n = c->vr[rn], m = c->vr[rm], d0 = c->vr[rdn];
+    VReg res; memset(&res, 0, 16);
+    for (int k = 0; k < L; k++) {
+        __int128 a = sx(vget(&n, es, k), es), b = sx(vget(&m, es, k), es), acc = sx(vget(&d0, es, k), es);
+        __int128 r = ((acc << bits) + (sub ? -(a * b * 2) : a * b * 2) + ((__int128)1 << (bits - 1))) >> bits;
+        vset(&res, es, k, sat_s(r, es));
+    }
+    c->vr[rdn] = res;
+}
+
+// SMMLA / UMMLA / USMMLA: the 2x8 byte matrix of Vn times the transpose of the 2x8 matrix of Vm, added to the 2x2 int32 matrix in Vd.
+// USDOT / SUDOT (indexed): byte dot products with mixed signedness
+static void simd_i8mm(CPU *c, uint32_t i, int kind, bool indexed) {   // kind 0 SMMLA, 1 UMMLA, 2 USMMLA, 3 USDOT, 4 SUDOT
+    int Q = B(i, 30, 30), rn = B(i, 9, 5), rdn = B(i, 4, 0), rm = indexed ? (B(i, 20, 20) << 4) | B(i, 19, 16) : B(i, 20, 16);
+    const VReg n = c->vr[rn], m = c->vr[rm], d0 = c->vr[rdn];
+    VReg res; memset(&res, 0, 16);
+    if (kind <= 2) {
+        for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) {
+            int32_t acc = (int32_t)d0.s[2 * r + q];
+            for (int k = 0; k < 8; k++) {
+                int a = kind == 1 ? n.b[8 * r + k] : kind == 2 ? n.b[8 * r + k] : (int8_t)n.b[8 * r + k];
+                int b = kind == 1 ? m.b[8 * q + k] : (int8_t)m.b[8 * q + k];
+                acc += a * b;
+            }
+            res.s[2 * r + q] = (uint32_t)acc;
+        }
+    } else {
+        int idx = indexed ? (B(i, 11, 11) << 1) | B(i, 21, 21) : 0;
+        if (indexed) rm = (B(i, 20, 20) << 4) | B(i, 19, 16);
+        const VReg mm = c->vr[rm];
+        for (int k = 0; k < (Q ? 4 : 2); k++) {
+            int32_t acc = (int32_t)d0.s[k];
+            for (int j = 0; j < 4; j++) {
+                int a = kind == 3 ? n.b[4 * k + j] : (int8_t)n.b[4 * k + j];
+                int b = kind == 3 ? (int8_t)mm.b[4 * (indexed ? idx : k) + j] : mm.b[4 * (indexed ? idx : k) + j];
+                acc += a * b;
+            }
+            res.s[k] = (uint32_t)acc;
+        }
+    }
+    c->vr[rdn] = res;
+}
+
+// BFDOT (pairs of bfloat16 into single-precision lanes), BFMMLA (2x4 by 4x2 matrix), BFMLALB / BFMLALT (even / odd elements, fused), BFCVTN / BFCVTN2
+static void simd_bf16(CPU *c, uint32_t i, int kind, bool indexed) {   // kind 0 BFDOT, 1 BFMMLA, 2 BFMLAL (Q: T)
+    int Q = B(i, 30, 30), rn = B(i, 9, 5), rdn = B(i, 4, 0), rm = indexed ? (B(i, 20, 20) << 4) | B(i, 19, 16) : B(i, 20, 16);
+    const VReg n = c->vr[rn], m = c->vr[rm], d0 = c->vr[rdn];
+    VReg res; memset(&res, 0, 16);
+    float acc[4]; for (int k = 0; k < 4; k++) memcpy(&acc[k], &d0.s[k], 4);
+    if (kind == 0) {
+        int idx = indexed ? (B(i, 11, 11) << 1) | B(i, 21, 21) : 0;
+        for (int k = 0; k < (Q ? 4 : 2); k++) {
+            int mk = indexed ? idx : k;
+            double r = (double)acc[k] + (double)bf2f(n.h[2 * k]) * bf2f(m.h[2 * mk]) + (double)bf2f(n.h[2 * k + 1]) * bf2f(m.h[2 * mk + 1]);   // (one rounding, in double: close to the architecture's round-to-odd sum)
+            float f = (float)r; memcpy(&res.s[k], &f, 4);
+        }
+    } else if (kind == 1) {
+        for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) {
+            double s = acc[2 * r + q];
+            for (int k = 0; k < 4; k++) s += (double)bf2f(n.h[4 * r + k]) * bf2f(m.h[4 * q + k]);
+            float f = (float)s; memcpy(&res.s[2 * r + q], &f, 4);
+        }
+    } else {
+        int idx = indexed ? (B(i, 11, 11) << 2) | (B(i, 21, 21) << 1) | B(i, 20, 20) : 0;
+        if (indexed) rm = B(i, 19, 16);
+        const VReg mm = c->vr[rm];
+        for (int k = 0; k < 4; k++) {
+            float f = fmaf(bf2f(n.h[2 * k + Q]), bf2f(mm.h[indexed ? idx : 2 * k + Q]), acc[k]);
+            if (isnan(f)) res.s[k] = 0x7fc00000u; else memcpy(&res.s[k], &f, 4);
+        }
+    }
+    c->vr[rdn] = res;
+}
+static void simd_bfcvtn(CPU *c, uint32_t i) {
+    int Q = B(i, 30, 30), rn = B(i, 9, 5), rdn = B(i, 4, 0);
+    const VReg n = c->vr[rn]; VReg res = Q ? c->vr[rdn] : (VReg){0};
+    if (!Q) memset(&res, 0, 16);
+    for (int k = 0; k < 4; k++) { float f; memcpy(&f, &n.s[k], 4); res.h[(Q ? 4 : 0) + k] = f2bf(f); }
+    c->vr[rdn] = res;
+}
+
 // ------------------------------------------------------------------ dispatcher
 
 #include "crypto.h"
@@ -1085,6 +1230,20 @@ static bool exec_fpsimd(CPU *c, uint32_t i) {
     switch (B(i, 28, 24)) {
     case 0x0e:
         if (b31) return false;
+        if (B(i, 21, 21) && B(i, 10, 10) && !B(i, 22, 22) && ((!U && B(i, 15, 11) == 0x1d) || (U && B(i, 15, 11) == 0x19))) { simd_fmlal(c, i, false); return true; }   // FMLAL / FMLSL / FMLAL2 / FMLSL2
+        if ((i & 0xbffffc00) == 0x0ea16800) { simd_bfcvtn(c, i); return true; }   // BFCVTN / BFCVTN2
+        if (!B(i, 21, 21) && B(i, 15, 15) && B(i, 10, 10)) {   // three same, extra
+            int op5 = B(i, 15, 11), size = B(i, 23, 22);
+            if (U && (op5 == 0x10 || op5 == 0x11)) { simd_rdm(c, i, false); return true; }
+            if (!U && size == 2 && op5 == 0x13) { simd_i8mm(c, i, 3, false); return true; }
+            if (size == 2 && op5 == 0x14) { simd_i8mm(c, i, U ? 1 : 0, false); return true; }
+            if (!U && size == 2 && op5 == 0x15) { simd_i8mm(c, i, 2, false); return true; }
+            if (U && size == 1 && op5 == 0x1f) { simd_bf16(c, i, 0, false); return true; }
+            if (U && size == 1 && op5 == 0x1d) { simd_bf16(c, i, 1, false); return true; }
+            if (U && size == 3 && op5 == 0x1f) { simd_bf16(c, i, 2, false); return true; }
+            if (U && op5 >= 0x18 && op5 <= 0x1b) { simd_fcomplex(c, i, true, false); return true; }
+            if (U && (op5 == 0x1c || op5 == 0x1e)) { simd_fcomplex(c, i, false, false); return true; }
+        }
         if (B(i, 21, 21)) {
             if (B(i, 10, 10)) { simd_3same(c, i, false, false); return true; }
             if (B(i, 11, 10) == 0) { simd_3diff(c, i); return true; }
@@ -1103,6 +1262,16 @@ static bool exec_fpsimd(CPU *c, uint32_t i) {
     case 0x0f:
         if (b31) return false;
         if (!B(i, 10, 10)) {
+            int sz = B(i, 23, 22), op4 = B(i, 15, 12);
+            if (U && (op4 == 1 || op4 == 3 || op4 == 5 || op4 == 7) && (sz == 1 || sz == 2)) { simd_fcomplex(c, i, true, true); return true; }   // FCMLA by element
+            if (!U && sz == 2 && (op4 == 0 || op4 == 4)) { simd_fmlal(c, i, true); return true; }   // FMLAL / FMLSL by element
+            if (U && sz == 2 && (op4 == 8 || op4 == 0xc)) { simd_fmlal(c, i, true); return true; }   // FMLAL2 / FMLSL2 by element
+            if (!U && op4 == 0xf) {
+                if (sz == 2) { simd_i8mm(c, i, 3, true); return true; }   // USDOT
+                if (sz == 0) { simd_i8mm(c, i, 4, true); return true; }   // SUDOT
+                if (sz == 1) { simd_bf16(c, i, 0, true); return true; }   // BFDOT
+                if (sz == 3) { simd_bf16(c, i, 2, true); return true; }   // BFMLALB / BFMLALT
+            }
             if (B(i, 23, 22) == 2 && B(i, 15, 12) == 0xe) { simd_dot(c, i, true); return true; }   // SDOT / UDOT by element
             simd_indexed(c, i, false);
             return true;
@@ -1119,6 +1288,7 @@ static bool exec_fpsimd(CPU *c, uint32_t i) {
                 if (B(i, 22, 17) == 0x3c && B(i, 11, 10) == 2) { simd_misc2(c, i, true, true); return true; }   // half precision
                 return false;
             }
+            if (U && !B(i, 21, 21) && B(i, 10, 10) && (B(i, 15, 11) == 0x10 || B(i, 15, 11) == 0x11)) { simd_rdm(c, i, true); return true; }   // SQRDMLAH / SQRDMLSH, scalar
             if (B(i, 22, 21) == 2 && !B(i, 15, 14) && B(i, 10, 10)) { simd_3same(c, i, true, true); return true; }   // half precision
             if (!U && !B(i, 15, 15) && B(i, 10, 10) && !B(i, 23, 21)) { simd_copy(c, i, true); return true; }
             return false;
