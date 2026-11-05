@@ -1668,6 +1668,7 @@ static void fork_block_signals(void) {
     pthread_sigmask(SIG_BLOCK, &all, &t_fork_oldmask);
 }
 static void atfork_prepare(void) {
+    t_forking = true; t_fork_ppid = getpid();
     fork_block_signals();
     if (!t_have_gil) { pthread_mutex_lock(&g_gil); t_fork_gil = true; }
     pthread_mutex_lock(&g_jit_mu); pthread_mutex_lock(&g_gstack_mu); pthread_mutex_lock(&g_owned_lock);
@@ -1678,15 +1679,20 @@ static void atfork_parent(void) {
     pthread_mutex_unlock(&g_gstack_mu); pthread_mutex_unlock(&g_jit_mu);
     if (t_fork_gil) { t_fork_gil = false; pthread_mutex_unlock(&g_gil); }
     pthread_sigmask(SIG_SETMASK, &t_fork_oldmask, NULL);
+    t_forking = false;
 }
-static void atfork_child(void) {
+// The child: the locks the forking thread held are copies in the locked state and nobody will ever release them, so they start clean.  Done by atfork_child, or earlier by the first entry
+// into guest code in the child (rebar_bridge_enter): libSystem's own child handler runs first and releases xpc objects, whose dealloc can be guest code that needs the translator's lock.
+static void fork_child_reinit(void) {
     pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
     g_gpu_mu = fresh; g_thunk_mu = fresh; g_owned_lock = fresh; g_gstack_mu = fresh; g_jit_mu = fresh; g_gil = fresh;
     g_gil_waiters = 0;
     if (t_have_gil) pthread_mutex_lock(&g_gil);   // the forking thread was inside a handler: it still is
     t_fork_gil = false;
     pthread_sigmask(SIG_SETMASK, &t_fork_oldmask, NULL);
+    t_forking = false;
 }
+static void atfork_child(void) { if (t_forking) fork_child_reinit(); }
 
 // UIKit for Mac Catalyst starts with [NSApplication _startWindowServerIfNecessary] (AppKit in macOS 26 has it; this macOS 15 does not): a process that is in a window-server session
 // already (rebar always is) needs nothing there, so the class method is added as a no-op. The scene server (FuseBoard) only accepts a client that runs from an .app bundle.
