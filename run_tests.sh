@@ -247,6 +247,7 @@ if [ -x "$HB/bin/go" ]; then
     run_to 60 $T/b $R $gd/gopanics; grep -v '^nvrm' $T/b > $T/b2; check go_panics $T/a $T/b2
 fi
 hbcheck brew_python_ctypes "ctypes 5 [1, 2, 3, 4, 5] 1024.0 42 42-x" python3.13 ctypes_basic.py
+hbcheck brew_python_ctypes_guest "guest 7 3 4 0 0 21.0 21.0" python3.13 ctypes_guest.py   # (calls into an arm64 library: ffi_call is made by rebar with the arm64 convention)
 # libffi closures from a C program (the host libffi is x86_64: the arm64 ABI constant and the closure size are translated)
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x ffi_closure_$a ] && [ ffi_closure_$a -nt ffi_closure.c ] || clang -arch $ar ffi_closure.c -lffi -lm -o ffi_closure_$a 2>/dev/null; done
 # libxml2's SAX2 startElementNs has nine arguments: the ninth is on the arm64 callee's stack

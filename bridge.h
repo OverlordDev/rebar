@@ -1396,8 +1396,9 @@ H(h_dyld_image_count); H(h_dyld_get_image_name); H(h_dyld_get_image_header);
 H(h_dyld_get_image_vmaddr_slide); H(h_dyld_register_func_for_add_image);
 typedef struct { const char *name; StubHandler h; } Special;
 H(h_path_begin_end); H(h_path_iter_step);
+H(h_ffi_call); H(h_ffi_prep_cif_var); H(h_ffi_prep_cif);
 static const Special k_special[] = {
-    {"__ZNKSt3__14__fs10filesystem4path5beginEv", h_path_begin_end}, {"__ZNKSt3__14__fs10filesystem4path3endEv", h_path_begin_end}, {"__ZNSt3__14__fs10filesystem4path8iterator11__incrementEv", h_path_iter_step}, {"__ZNSt3__14__fs10filesystem4path8iterator11__decrementEv", h_path_iter_step},
+    {"_ffi_call", h_ffi_call}, {"_ffi_prep_cif_var", h_ffi_prep_cif_var}, {"_ffi_prep_cif", h_ffi_prep_cif}, {"__ZNKSt3__14__fs10filesystem4path5beginEv", h_path_begin_end}, {"__ZNKSt3__14__fs10filesystem4path3endEv", h_path_begin_end}, {"__ZNSt3__14__fs10filesystem4path8iterator11__incrementEv", h_path_iter_step}, {"__ZNSt3__14__fs10filesystem4path8iterator11__decrementEv", h_path_iter_step},
     {"_printf", h_printf}, {"_fprintf", h_fprintf}, {"_sprintf", h_sprintf}, {"_snprintf", h_snprintf},
     {"_dprintf", h_dprintf}, {"_asprintf", h_asprintf}, {"_scanf", h_scanf}, {"_sscanf", h_sscanf}, {"_fscanf", h_fscanf},
     {"___printf_chk", h_printf_chk}, {"___fprintf_chk", h_fprintf_chk},
@@ -1887,6 +1888,99 @@ H(h_path_iter_step) {   // x0 = the iterator; both return a reference to it
     t_stk = NULL; host_call(c, hostfn, false);
     path_it_to_guest(hit, hp, gp); memcpy(git, hit, 56);
     c->x[0] = (uint64_t)git;
+}
+
+// ---- libffi: ffi_call into a guest function. The host's libffi is the x86_64 one, which would call with the System V convention; an arm64 (Apple) function wants other registers,
+// other struct rules and a different stack layout, so for a guest target the call is made here from the cif's types. (Calls to host code still go through the host's ffi_call.)
+typedef struct FfiType { uint64_t size; uint16_t align, type; struct FfiType **elements; } FfiType;
+typedef struct { int abi; unsigned nargs; FfiType **arg_types; FfiType *rtype; } FfiCif;
+static struct { const void *cif; unsigned nfixed; } g_ffi_var[128]; static unsigned g_ffi_var_n;   // cifs made by ffi_prep_cif_var: the arguments from nfixed on are variadic (8-byte stack slots on Apple's arm64)
+static void ffi_var_forget(const void *cif) { for (unsigned k = 0; k < 128 && k < g_ffi_var_n; k++) if (g_ffi_var[k].cif == cif) g_ffi_var[k].cif = NULL; }   // (a cif is usually a stack variable: its address is reused)
+H(h_ffi_prep_cif_var) {   // (cif, abi, nfixedargs, ntotalargs, rtype, atypes)
+    ffi_var_forget((const void *)c->x[0]);
+    g_ffi_var[g_ffi_var_n++ % 128].cif = (const void *)c->x[0]; g_ffi_var[(g_ffi_var_n - 1) % 128].nfixed = (unsigned)c->x[2];
+    if ((uint32_t)c->x[1] == 1) c->x[1] = 2;
+    host_call(c, HOSTFN("ffi_prep_cif_var"), false);
+}
+H(h_ffi_prep_cif) { ffi_var_forget((const void *)c->x[0]); if ((uint32_t)c->x[1] == 1) c->x[1] = 2; host_call(c, HOSTFN("ffi_prep_cif"), false); }
+static int ffi_flat_fp(const FfiType *t, int *kind) {   // the number of float / double members of a type that is a homogeneous floating-point aggregate, else -1
+    if (t->type == 2 || t->type == 3) { if (*kind && *kind != t->type) return -1; *kind = t->type; return 1; }
+    if (t->type != 13) return -1;
+    int n = 0;
+    for (FfiType **e = t->elements; e && *e; e++) { int k = ffi_flat_fp(*e, kind); if (k < 0) return -1; n += k; }
+    return n;
+}
+static uint64_t ffi_int_value(const FfiType *t, const void *p) {   // an integer-class argument as the callee expects it: extended to 64 bits
+    switch (t->type) {
+        case 5: return *(const uint8_t *)p; case 6: return (uint64_t)(int64_t)*(const int8_t *)p;
+        case 7: return *(const uint16_t *)p; case 8: return (uint64_t)(int64_t)*(const int16_t *)p;
+        case 9: return *(const uint32_t *)p; case 1: case 10: return (uint64_t)(int64_t)*(const int32_t *)p;
+        default: return *(const uint64_t *)p;
+    }
+}
+H(h_ffi_call) {   // (cif, fn, rvalue, avalue)
+    const FfiCif *cif = (const FfiCif *)c->x[0]; uint64_t fn = c->x[1]; void *rvalue = (void *)c->x[2]; void **av = (void **)c->x[3];
+    if (!(in_guest(fn) || guest_owned_code(fn) || fn - g_stub_base < g_stub_size)) { host_call(c, HOSTFN("ffi_call"), false); return; }
+    unsigned nfixed = cif->nargs;
+    for (int k = g_ffi_var_n > 128 ? 127 : (int)g_ffi_var_n - 1; k >= 0; k--) if (g_ffi_var[k].cif == cif) { nfixed = g_ffi_var[k].nfixed; break; }
+    if (getenv("REBAR_DEBUG_FFI")) { fprintf(stderr, "[ffi_call] fn %llx nargs %u nfixed %u rtype %d size %llu:", (unsigned long long)fn, cif->nargs, nfixed, cif->rtype->type, (unsigned long long)cif->rtype->size); for (unsigned i = 0; i < cif->nargs; i++) fprintf(stderr, " (t%d s%llu v%llx)", cif->arg_types[i]->type, (unsigned long long)cif->arg_types[i]->size, (unsigned long long)*(uint64_t *)av[i]); fprintf(stderr, "\n"); }
+    uint64_t xr[8] = {0}; int ngrn = 0, nsrn = 0; VReg vr[8]; memset(vr, 0, sizeof vr);
+    uint8_t stk[1024]; size_t so = 0; static __thread uint8_t big[16][256]; int nbig = 0;
+    #define STK_PUT(al, sz, src) do { size_t a_ = (al); so = (so + a_ - 1) & ~(a_ - 1); if (so + (sz) <= sizeof stk) memcpy(stk + so, (src), (sz)); so += (sz); } while (0)
+    for (unsigned i = 0; i < cif->nargs; i++) {
+        const FfiType *t = cif->arg_types[i]; const void *a = av[i]; bool var = i >= nfixed;
+        if (t->type == 13) {
+            int kind = 0, nfp = ffi_flat_fp(t, &kind);
+            if (!var && nfp >= 1 && nfp <= 4) {
+                size_t msz = kind == 2 ? 4 : 8;
+                if (nsrn + nfp <= 8) { for (int m = 0; m < nfp; m++) memcpy(&vr[nsrn++], (const uint8_t *)a + m * msz, msz); }
+                else { nsrn = 8; STK_PUT(8, ((t->size + 7) & ~7ull), a); }
+            } else if (t->size > 16) {
+                const void *ptr = a; if (t->size <= 256 && nbig < 16) { memcpy(big[nbig], a, t->size); ptr = big[nbig++]; }
+                uint64_t v = (uint64_t)ptr; if (!var && ngrn < 8) xr[ngrn++] = v; else STK_PUT(8, 8, &v);
+            } else {
+                int words = (int)((t->size + 7) / 8); uint64_t w[2] = {0, 0}; memcpy(w, a, t->size);
+                if (!var && ngrn + words <= 8) { xr[ngrn++] = w[0]; if (words == 2) xr[ngrn++] = w[1]; }
+                else { if (!var) ngrn = 8; STK_PUT(8, (size_t)words * 8, w); }
+            }
+        } else if (t->type == 2 || t->type == 3) {
+            if (!var && nsrn < 8) memcpy(&vr[nsrn++], a, t->type == 2 ? 4 : 8);
+            else if (var) { uint64_t w = 0; memcpy(&w, a, t->type == 2 ? 4 : 8); STK_PUT(8, 8, &w); }
+            else STK_PUT(t->type == 2 ? 4 : 8, t->type == 2 ? 4 : 8, a);
+        } else {
+            uint64_t v = ffi_int_value(t, a); size_t sz = t->size > 8 ? 8 : t->size;
+            if (!var && ngrn < 8) xr[ngrn++] = v; else if (var) STK_PUT(8, 8, &v); else STK_PUT(sz ? sz : 8, sz ? sz : 8, &v);
+        }
+    }
+    const FfiType *rt = cif->rtype; int rkind = 0, rfp = rt->type == 13 ? ffi_flat_fp(rt, &rkind) : -1; bool rmem = rt->type == 13 && rfp < 1 && rt->size > 16;
+    if (rt->type == 13 && rfp > 4) rmem = true;
+    CPU saved = *c;
+    for (int k = 0; k < 8; k++) { c->x[k] = xr[k]; c->vr[k] = vr[k]; }
+    if (rmem) c->x[8] = (uint64_t)rvalue;
+    c->sp = (saved.sp - 512 - ((so + 15) & ~15ull)) & ~0xfull; memcpy((void *)c->sp, stk, so < sizeof stk ? so : sizeof stk);
+    c->x[30] = stub_addr(STUB_RET); c->pc = fn;
+    bool held = gil_release();
+    run_until(c, stub_addr(STUB_RET));
+    if (held) gil_acquire(); else if (t_have_gil) gil_release();
+    uint64_t r0 = c->x[0], r1 = c->x[1]; VReg rv[4]; for (int k = 0; k < 4; k++) rv[k] = c->vr[k];
+    *c = saved;
+    switch (rt->type) {
+        case 0: break;
+        case 2: memcpy(rvalue, &rv[0], 4); break;
+        case 3: memcpy(rvalue, &rv[0], 8); break;
+        case 13:
+            if (rfp >= 1 && rfp <= 4) { size_t msz = rkind == 2 ? 4 : 8; for (int m = 0; m < rfp; m++) memcpy((uint8_t *)rvalue + m * msz, &rv[m], msz); }
+            else if (!rmem) { uint64_t w[2] = {r0, r1}; memcpy(rvalue, w, rt->size); }
+            break;
+        case 5: *(uint64_t *)rvalue = (uint8_t)r0; break;
+        case 6: *(int64_t *)rvalue = (int8_t)r0; break;
+        case 7: *(uint64_t *)rvalue = (uint16_t)r0; break;
+        case 8: *(int64_t *)rvalue = (int16_t)r0; break;
+        case 9: *(uint64_t *)rvalue = (uint32_t)r0; break;
+        case 1: case 10: *(int64_t *)rvalue = (int32_t)r0; break;
+        default: *(uint64_t *)rvalue = r0; break;
+    }
+    #undef STK_PUT
 }
 
 // std::wstring: the long form is the same as std::string's; the short form holds up to 4 wchar_t (arm64: characters from byte 0 and the size in byte 23, x86_64: the size << 1 in
