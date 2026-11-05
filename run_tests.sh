@@ -187,6 +187,11 @@ for src in fw_*.swift; do
     else echo "SKIP $fwn (no swiftc?)"; fi
 done
 
+# std::filesystem: path iteration (begin / end / ++ hand out iterators over the guest's path), status / symlink_status / space returned in memory
+for cn in cpp_path_iter cpp_filesystem; do
+    for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x ${cn}_$a ] && [ ${cn}_$a -nt $cn.cpp ] || clang++ -std=c++20 -O1 -arch $ar $cn.cpp -o ${cn}_$a 2>/dev/null; done
+    run_to 30 $T/a ./${cn}_x86; run_to 60 $T/b $R ${cn}_arm; grep -v '^nvrm' $T/b > $T/b2; check $cn $T/a $T/b2
+done
 # libc++ (C++20) in one program: streams, filesystem, regex, threads, futures, ranges, format, locale, containers
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x cpp_stdlib_$a ] && [ cpp_stdlib_$a -nt cpp_stdlib.cpp ] || clang++ -std=c++20 -O1 -arch $ar cpp_stdlib.cpp -o cpp_stdlib_$a 2>/dev/null; done
 run_to 60 $T/a ./cpp_stdlib_x86; run_to 120 $T/b $R cpp_stdlib_arm; grep -v '^nvrm' $T/b > $T/b2; check cpp_stdlib $T/a $T/b2
@@ -206,6 +211,11 @@ hbcheck brew_sqlite 42 sqlite3 :memory: "select 6*7"
 hbcheck brew_lua 42 lua -e 'print(6*7)'
 [ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
 hbcheck brew_tmux "tmux 3.8" tmux -V
+# Node (V8, workers, crypto, zlib, http, fs including recursive rm through std::filesystem, wasm, Intl)
+if [ -x "$HB/bin/node" ]; then
+    printf 'fs hello 5\nwatch ok\nzlib 300 brotli\ncrypto 2d711642 8 2b90e4\ned25519 true\naesgcm secret\nhttp echo:ping\nnet tcp!\nchild hi 3\nworker 42\natomics 5\nwasm 42\nintl 1.234.567,891 1970/1/1 SS 1\nregex 11 a_b_\nbigint 265252859812191058636308480000000\njit 28665 true\nfetch hi\ndns ::1\ntimers ok\nhrtime true darwin arm64\n' > $T/a
+    REBAR_PATHMAP=/opt/homebrew=$HB run_to 120 $T/b $R "$HB/bin/node" node_features.js; grep -v '^nvrm' $T/b > $T/b2; check node_features $T/a $T/b2
+fi
 # Go: runtime panics from faults (nil dereference, nil map, index, divide by zero) are recovered: the guest's SIGSEGV handler has to run on its alternate signal stack
 if [ -x "$HB/bin/go" ]; then
     gd=$T/go_panics; rm -rf $gd; mkdir -p $gd; cp go_panics.go $gd/main.go; printf 'module gopanics\ngo 1.21\n' > $gd/go.mod

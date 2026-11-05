@@ -1395,7 +1395,9 @@ H(h_dlopen); H(h_dlsym); H(h_dlclose); H(h_dladdr); H(h_dlerror);
 H(h_dyld_image_count); H(h_dyld_get_image_name); H(h_dyld_get_image_header);
 H(h_dyld_get_image_vmaddr_slide); H(h_dyld_register_func_for_add_image);
 typedef struct { const char *name; StubHandler h; } Special;
+H(h_path_begin_end); H(h_path_iter_step);
 static const Special k_special[] = {
+    {"__ZNKSt3__14__fs10filesystem4path5beginEv", h_path_begin_end}, {"__ZNKSt3__14__fs10filesystem4path3endEv", h_path_begin_end}, {"__ZNSt3__14__fs10filesystem4path8iterator11__incrementEv", h_path_iter_step}, {"__ZNSt3__14__fs10filesystem4path8iterator11__decrementEv", h_path_iter_step},
     {"_printf", h_printf}, {"_fprintf", h_fprintf}, {"_sprintf", h_sprintf}, {"_snprintf", h_snprintf},
     {"_dprintf", h_dprintf}, {"_asprintf", h_asprintf}, {"_scanf", h_scanf}, {"_sscanf", h_sscanf}, {"_fscanf", h_fscanf},
     {"___printf_chk", h_printf_chk}, {"___fprintf_chk", h_fprintf_chk},
@@ -1851,6 +1853,42 @@ static void str_to_guest(uint8_t *g, const uint8_t *d) {
     }
 }
 
+// std::filesystem::path::begin() / end() / iterator::__increment() / __decrement(). A path::iterator is 56 bytes: the current element as a path (a std::string, in the host's layout
+// when the host made it), the path it walks (pointer), a string_view of the element inside that path's characters, and a state byte. The host functions parse the path they are
+// given, so they get a host-layout copy of it; the iterator that comes back is converted to the guest's layout and made to point at the guest's path and characters again.
+static void path_it_to_guest(uint8_t *it, const uint8_t *host_path, uint8_t *guest_path) {
+    uint8_t tmp[24]; str_to_guest(tmp, it); memcpy(it, tmp, 24);
+    *(uint64_t *)(it + 24) = (uint64_t)guest_path;
+    uint64_t e = *(uint64_t *)(it + 32), h = (uint64_t)host_path;
+    if (!(host_path[0] & 1) && e >= h && e <= h + 24) *(uint64_t *)(it + 32) = (uint64_t)guest_path + (e - h) - 1;   // a short string's characters: at 1 in the host layout, at 0 in the guest's
+}
+static void path_it_to_host(uint8_t *hit, const uint8_t *git, uint8_t *host_path, const uint8_t *guest_path) {
+    memcpy(hit, git, 56);
+    uint8_t tmp[24]; str_to_host(tmp, git); memcpy(hit, tmp, 24);
+    str_to_host(host_path, guest_path);
+    *(uint64_t *)(hit + 24) = (uint64_t)host_path;
+    uint64_t e = *(uint64_t *)(git + 32), g = (uint64_t)guest_path;
+    if (!(guest_path[23] & 0x80) && e >= g && e <= g + 24) *(uint64_t *)(hit + 32) = (uint64_t)host_path + (e - g) + 1;
+}
+H(h_path_begin_end) {   // x0 = the path, x8 = where the iterator goes
+    Stub *s = t_last_stub; void *hostfn = s->host ? s->host : dlsym(RTLD_DEFAULT, s->name + 1); uint8_t *gp = (uint8_t *)c->x[0], *git = (uint8_t *)c->x[8];
+    uint8_t hp[24], hit[56]; memset(hit, 0, sizeof hit);
+    str_to_host(hp, gp);
+    c->x[0] = (uint64_t)hp; c->x[8] = (uint64_t)hit;
+    t_stk = NULL; host_call(c, hostfn, true);
+    path_it_to_guest(hit, hp, gp); memcpy(git, hit, 56);
+    c->x[0] = (uint64_t)git;
+}
+H(h_path_iter_step) {   // x0 = the iterator; both return a reference to it
+    Stub *s = t_last_stub; void *hostfn = s->host ? s->host : dlsym(RTLD_DEFAULT, s->name + 1); uint8_t *git = (uint8_t *)c->x[0], *gp = *(uint8_t **)(git + 24);
+    uint8_t hp[24], hit[56];
+    path_it_to_host(hit, git, hp, gp);
+    c->x[0] = (uint64_t)hit;
+    t_stk = NULL; host_call(c, hostfn, false);
+    path_it_to_guest(hit, hp, gp); memcpy(git, hit, 56);
+    c->x[0] = (uint64_t)git;
+}
+
 // std::wstring: the long form is the same as std::string's; the short form holds up to 4 wchar_t (arm64: characters from byte 0 and the size in byte 23, x86_64: the size << 1 in
 // the first 4 bytes and the characters from byte 4).
 static void wstr_to_host(uint8_t *d, const uint8_t *g) {
@@ -2149,6 +2187,7 @@ static void string_call(CPU *c, Stub *s) {
     bool sbc = sp->sb && sb_enter((uint8_t *)gx[0]);
     if (sp->sret) c->x[8] = (uint64_t)rtmp;
     t_stk = s->stk;
+    if (getenv("REBAR_DEBUG_STR")) fprintf(stderr, "[string_call %s] x0=%llx x1=%llx x2=%llx x8=%llx s->sret=%d sp->sret=%d stk=%p\n", s->name, (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[8], s->sret, sp->sret, (void *)s->stk);
     host_call(c, s->host, s->sret || sp->sret);
     t_stk = NULL;
     if (sbc) sb_leave((uint8_t *)gx[0]);
@@ -2565,7 +2604,7 @@ static bool returns_class_by_value(const char *n) {
     return (strstr(n, "7promiseI") && strstr(n, "10get_futureEv")) || (strstr(n, "13packaged_taskI") && strstr(n, "10get_futureEv"))   // promise<T>::get_future returns a future<T>
         || strstr(n, "6locale6global") || strstr(n, "8ios_base6getloc") || strstr(n, "8ios_base5imbue") || (strstr(n, "9basic_ios") && strstr(n, "5imbueE"))
         || (strstr(n, "15basic_streambuf") && (strstr(n, "6getlocEv") || strstr(n, "8pubimbue")))
-        || strstr(n, "10filesystem8__statusE") || strstr(n, "10filesystem15__symlink_statusE") || strstr(n, "10filesystem7__spaceE");
+        || strstr(n, "10filesystem8__statusE") || strstr(n, "10filesystem16__symlink_statusE") || strstr(n, "10filesystem7__spaceE");
 }
 static bool returns_this(const char *name) {
     if (strncmp(name, "__ZN", 4) || !(strstr(name, "C1E") || strstr(name, "C2E") || strstr(name, "C3E") || strstr(name, "D1E") || strstr(name, "D2E"))) return false;

@@ -1,0 +1,25 @@
+const fs = require('fs'), os = require('os'), path = require('path'), zlib = require('zlib'), crypto = require('crypto'), http = require('http'), net = require('net');
+const { Worker, isMainThread, parentPort } = require('worker_threads'), cp = require('child_process'), dns = require('dns'), util = require('util'), { pipeline, Readable } = require('stream');
+(async () => {
+  const out = [];
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-')); fs.writeFileSync(tmp + '/a.txt', 'hello'); out.push('fs ' + fs.readFileSync(tmp + '/a.txt', 'utf8') + ' ' + fs.statSync(tmp + '/a.txt').size);
+  const w = fs.watch(tmp, () => {}); fs.writeFileSync(tmp + '/b.txt', 'x'); w.close(); out.push('watch ok');
+  out.push('zlib ' + zlib.gunzipSync(zlib.gzipSync('abc'.repeat(100))).length + ' ' + zlib.brotliDecompressSync(zlib.brotliCompressSync('brotli')).toString());
+  out.push('crypto ' + crypto.createHash('sha256').update('x').digest('hex').slice(0, 8) + ' ' + crypto.randomBytes(8).length + ' ' + crypto.createHmac('sha1', 'k').update('d').digest('hex').slice(0, 6));
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519'); const sig = crypto.sign(null, Buffer.from('m'), privateKey); out.push('ed25519 ' + crypto.verify(null, Buffer.from('m'), publicKey, sig));
+  const key = crypto.scryptSync('pw', 'salt', 32); const iv = Buffer.alloc(12); const c = crypto.createCipheriv('aes-256-gcm', key, iv); const enc = Buffer.concat([c.update('secret'), c.final()]); const tag = c.getAuthTag(); const d = crypto.createDecipheriv('aes-256-gcm', key, iv); d.setAuthTag(tag); out.push('aesgcm ' + Buffer.concat([d.update(enc), d.final()]).toString());
+  await new Promise(res => { const s = http.createServer((q, r) => { let b = ''; q.on('data', x => b += x); q.on('end', () => r.end('echo:' + b)); }).listen(0, () => { const p = s.address().port; const rq = http.request({ port: p, method: 'POST' }, r => { let t = ''; r.on('data', x => t += x); r.on('end', () => { out.push('http ' + t); s.close(); res(); }); }); rq.end('ping'); }); });
+  await new Promise(res => { const s = net.createServer(sk => sk.pipe(sk)).listen(0, () => { const k = net.connect(s.address().port, () => k.write('tcp!')); k.on('data', x => { out.push('net ' + x); k.end(); s.close(); res(); }); }); });
+  out.push('child ' + cp.execSync('echo hi').toString().trim() + ' ' + cp.spawnSync('sh', ['-c', 'exit 3']).status);
+  await new Promise(res => { const wk = new Worker('const {parentPort}=require("worker_threads"); parentPort.postMessage(40+2)', { eval: true }); wk.on('message', m => { out.push('worker ' + m); res(); }); });
+  const sab = new SharedArrayBuffer(16); const ia = new Int32Array(sab); await new Promise(res => { const wk = new Worker('const {workerData}=require("worker_threads"); const a=new Int32Array(workerData); Atomics.add(a,0,5); Atomics.notify(a,0)', { eval: true, workerData: sab }); wk.on('exit', res); }); out.push('atomics ' + Atomics.load(ia, 0));
+  const wasm = new WebAssembly.Instance(new WebAssembly.Module(Uint8Array.from([0,97,115,109,1,0,0,0,1,7,1,96,2,127,127,1,127,3,2,1,0,7,7,1,3,97,100,100,0,0,10,9,1,7,0,32,0,32,1,106,11]))); out.push('wasm ' + wasm.exports.add(40, 2));
+  out.push('intl ' + new Intl.NumberFormat('de-DE').format(1234567.891) + ' ' + new Date(0).toLocaleDateString('ja-JP', { timeZone: 'UTC' }) + ' ' + 'ß'.toLocaleUpperCase('de') + ' ' + new Intl.Collator('sv').compare('ä', 'z'));
+  out.push('regex ' + /(?<y>\d{4})-(?<m>\d\d)/.exec('on 2026-11 x').groups.m + ' ' + 'aXbX'.replaceAll('X', '_'));
+  let big = 1n; for (let i = 1n; i <= 30n; i++) big *= i; out.push('bigint ' + big);
+  const t0 = Date.now(); let acc = 0; for (let i = 0; i < 3e7; i++) acc = (acc + i * 7) % 1000003; out.push('jit ' + acc + ' ' + (Date.now() - t0 < 20000));
+  const r = await fetch('data:text/plain;base64,aGk=').then(x => x.text()); out.push('fetch ' + r);
+  const lat = await dns.promises.lookup('localhost'); out.push('dns ' + lat.address);
+  await util.promisify(setTimeout)(20); out.push('timers ok'); out.push('hrtime ' + (process.hrtime.bigint() > 0n) + ' ' + process.platform + ' ' + process.arch);
+  fs.rmSync(tmp, { recursive: true }); console.log(out.join('\n'));
+})();
