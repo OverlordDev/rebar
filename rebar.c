@@ -1602,7 +1602,46 @@ static id ios_color_using_cs(id self, SEL sel, id cs) {
     id ns = send1((id)objc_getClass("NSColor"), sel_registerName("colorWithCGColor:"), cg);
     return ns ? send1(ns, sel_registerName("colorUsingColorSpace:"), cs) : nil;
 }
+// UIKitCore (Mac Catalyst) calls objc_opt_respondsToSelector(obj, BOOL) in -[UINavigationController _applyViewControllers:...]: its second argument is a 0 or 1, not a selector. The answer is NO and
+// harmless, but the runtime caches the "forward" answer for selector 1 in the class's method cache, and objc_msgSend takes a bucket whose selector is 1 for the end marker of the table: the next
+// message that hashes to that bucket runs off the table (a second push on a NavigationStack while the first one animates crashed). The imports of the iOSSupport frameworks go through a
+// wrapper that says NO for such a "selector" without asking the runtime.
+static BOOL (*real_opt_responds)(id, SEL);
+static BOOL ios_opt_responds(id o, SEL s) { if ((uintptr_t)s < 0x10000) return NO; return real_opt_responds(o, s); }
+static void ios_patch_got(void) {
+    real_opt_responds = (BOOL (*)(id, SEL))dlsym(RTLD_DEFAULT, "objc_opt_respondsToSelector");
+    if (!real_opt_responds) return;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm || strncmp(nm, "/System/iOSSupport/", 19)) continue;
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        intptr_t slide = 0;   // (the slide dyld reports for cache images is not the one that fits the load commands: take it from where __TEXT really is)
+        { const struct load_command *l0 = (const struct load_command *)(mh + 1);
+          for (uint32_t k = 0; k < mh->ncmds; k++, l0 = (const struct load_command *)((const char *)l0 + l0->cmdsize))
+              if (l0->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)l0)->segname, "__TEXT")) { slide = (intptr_t)((uintptr_t)mh - ((const struct segment_command_64 *)l0)->vmaddr); break; } }
+        const struct load_command *lc = (const struct load_command *)(mh + 1);
+        for (uint32_t k = 0; k < mh->ncmds; k++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+            if (lc->cmd != LC_SEGMENT_64) continue;
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sc = (const struct section_64 *)(sg + 1);
+            for (uint32_t j = 0; j < sg->nsects; j++, sc++) {
+                if (strcmp(sc->sectname, "__stubs") || sc->reserved2 != 6) continue;   // (6-byte "jmp [rip+x]" stubs)
+                const uint8_t *st = (const uint8_t *)(sc->addr + slide);
+                for (uint64_t n = 0; n + 6 <= sc->size; n += 6) {
+                    if (st[n] != 0xff || st[n + 1] != 0x25) continue;
+                    void **slot = (void **)(st + n + 6 + *(const int32_t *)(st + n + 2));
+                    if (*slot != (void *)real_opt_responds) continue;
+                    if (getenv("REBAR_DEBUG_PATCH")) fprintf(stderr, "rebar: stub %p -> slot %p in %s\n", (void *)(st + n), (void *)slot, nm);
+                    mach_vm_protect(mach_task_self(), (mach_vm_address_t)slot & ~0x3fffull, 0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                    *slot = (void *)ios_opt_responds;
+                }
+            }
+        }
+    }
+}
 static void ios_patch_uikit(void) {
+    ios_patch_got();
     Class ui = objc_getClass("UIColor");
     if (ui && !class_getInstanceMethod(ui, sel_registerName("colorUsingColorSpace:"))) class_addMethod(ui, sel_registerName("colorUsingColorSpace:"), (IMP)ios_color_using_cs, "@@:@");
 }

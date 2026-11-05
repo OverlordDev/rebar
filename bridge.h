@@ -1755,6 +1755,8 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
     { const _STRUCT_X86_THREAD_STATE64 *r = &uc->uc_mcontext->__ss; fprintf(stderr, "  host registers: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx rsp=%llx rbp=%llx\n",
         (unsigned long long)r->__rax, (unsigned long long)r->__rbx, (unsigned long long)r->__rcx, (unsigned long long)r->__rdx, (unsigned long long)r->__rsi, (unsigned long long)r->__rdi, (unsigned long long)r->__r8, (unsigned long long)r->__r9,
         (unsigned long long)r->__r10, (unsigned long long)r->__r11, (unsigned long long)r->__r12, (unsigned long long)r->__r13, (unsigned long long)r->__r14, (unsigned long long)r->__r15, (unsigned long long)r->__rsp, (unsigned long long)r->__rbp); }   // (the interpreter keeps the guest pc in one of them)
+    if (r_r10(uc) > 0x10000) { char tmp[8]; mach_vm_size_t got = 0; Class cl = (Class)(r_r10(uc) & 0x7ffffffffff8ull);   // (in objc_msgSend r10 holds the receiver's class: say which one)
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)cl, 8, (mach_vm_address_t)tmp, &got) == KERN_SUCCESS) fprintf(stderr, "  r10 as class: %s   rsi as selector: %s\n", class_getName(cl), (r_rsi(uc) > 0x10000 && mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)r_rsi(uc), 1, (mach_vm_address_t)tmp, &got) == KERN_SUCCESS) ? (const char *)r_rsi(uc) : "?"); }
     { const uint64_t hv[] = {r_rax(uc), r_rbx(uc), r_rcx(uc), r_rdx(uc), r_rsi(uc), r_rdi(uc), r_r8(uc), r_r9(uc), r_r10(uc), r_r11(uc), r_r12(uc), r_r13(uc), r_r14(uc), r_r15(uc)};
       static const char *hn[] = {"rax","rbx","rcx","rdx","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"};
       for (int k = 0; k < 14; k++) { GImage *gi = image_by_addr(hv[k]); if (gi && gi->path) fprintf(stderr, "  %s = %llx is in %s +0x%llx\n", hn[k], (unsigned long long)hv[k], gi->path, (unsigned long long)(hv[k] - gi->base)); } }
@@ -1774,7 +1776,8 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
     }
     {   // host frames of the faulting thread, from the interrupted context's frame pointer chain
         uint64_t fp = uc->uc_mcontext->__ss.__rbp;
-        for (int k = 0; k < 24 && fp && !(fp & 7); k++) {
+        static int maxf; if (!maxf) maxf = getenv("REBAR_FRAMES") ? atoi(getenv("REBAR_FRAMES")) : 24;
+        for (int k = 0; k < maxf && fp && !(fp & 7); k++) {
             uint64_t *f = (uint64_t *)fp;
             Dl_info di;
             if (!f[1]) break;

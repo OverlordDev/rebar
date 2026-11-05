@@ -761,6 +761,7 @@ H(h_objc_msgSend) {
     id self = (id)c->x[0];
     SEL sel = (SEL)c->x[1];
     if (try_open_arm64_app(c, self, sel)) return;
+    if (__builtin_expect((uint64_t)sel < 0x10000 && self, 0)) { fprintf(stderr, "rebar: objc_msgSend with selector %llx to %p (class %s) from guest pc %llx lr %llx\n", (unsigned long long)c->x[1], (void *)self, class_getName(object_getClass(self)), (unsigned long long)c->pc, (unsigned long long)c->x[30]); }
     swift_ensure_receiver(c, (uint64_t)self);
     if (__builtin_expect(g_gpu_sync != 0, 0)) gpu_hook(c, self, sel);
     if (__builtin_expect(g_dump_layers != 0, 0)) layer_dump_hook(c, self, sel);
