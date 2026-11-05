@@ -19,4 +19,11 @@ func main() {
 	fmt.Println("nil iface:", try(func() { i.M() }))
 	var ptr *int
 	fmt.Println("write nil:", try(func() { *ptr = 3 }))
+	n := 0 // (faults in code that has been translated: hot loop)
+	for i := 0; i < 3000; i++ {
+		if try(func() { _ = p.b }) != nil {
+			n++
+		}
+	}
+	fmt.Println("hot nil derefs:", n)
 }

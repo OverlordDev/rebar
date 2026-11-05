@@ -255,7 +255,7 @@ fi
 if [ -x "$HB/bin/go" ]; then
     gd=$T/go_panics; rm -rf $gd; mkdir -p $gd; cp go_panics.go $gd/main.go; printf 'module gopanics\ngo 1.21\n' > $gd/go.mod
     RABS=$(cd .. && pwd)/rebar; ( cd $gd && REBAR_PATHMAP=/opt/homebrew=$HB GOCACHE=$T/gocache "$RABS" "$HB/bin/go" build -o gopanics . >/dev/null 2>&1 )
-    printf 'nil deref: runtime error: invalid memory address or nil pointer dereference\nnil map: assignment to entry in nil map\nindex: runtime error: index out of range [3] with length 0\ndiv: runtime error: integer divide by zero\nnil iface: runtime error: invalid memory address or nil pointer dereference\nwrite nil: runtime error: invalid memory address or nil pointer dereference\n' > $T/a
+    printf 'nil deref: runtime error: invalid memory address or nil pointer dereference\nnil map: assignment to entry in nil map\nindex: runtime error: index out of range [3] with length 0\ndiv: runtime error: integer divide by zero\nnil iface: runtime error: invalid memory address or nil pointer dereference\nwrite nil: runtime error: invalid memory address or nil pointer dereference\nhot nil derefs: 3000\n' > $T/a
     run_to 60 $T/b $R $gd/gopanics; grep -v '^nvrm' $T/b > $T/b2; check go_panics $T/a $T/b2
 fi
 hbcheck brew_python_ctypes "ctypes 5 [1, 2, 3, 4, 5] 1024.0 42 42-x" python3.13 ctypes_basic.py

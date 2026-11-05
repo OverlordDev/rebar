@@ -1648,6 +1648,31 @@ static void dump_metadata_chain(uint64_t em, int depth) {   // debugging aid: me
         if (mw[0] == 0x202 || mw[0] == 0x201 || mw[0] == 0x200) em = mw[2]; else break;
     }
 }
+// A guest memory fault inside translated code that keeps registers in host registers: the block was translated with a record of each of its memory accesses (JSite: guest pc and what
+// the register cache held), so the CPU structure can be made exact from the interrupted host registers and the fault given to the guest's handler like one of the interpreter's.
+// (The N Z C V flags are not rebuilt: a handler that resumes the very instruction may see old ones; one that unwinds, as Go's panic from a nil dereference does, does not care.)
+static uint64_t host_reg_of(const _STRUCT_X86_THREAD_STATE64 *r, int n) {
+    switch (n) { case 0: return r->__rax; case 1: return r->__rcx; case 2: return r->__rdx; case 3: return r->__rbx; case 5: return r->__rbp; case 6: return r->__rsi; case 7: return r->__rdi;
+                 case 8: return r->__r8; case 9: return r->__r9; case 10: return r->__r10; case 11: return r->__r11; case 12: return r->__r12; case 13: return r->__r13; case 14: return r->__r14; default: return 0; }
+}
+static bool jit_recover_state(ucontext_t *uc, const JReg *jb) {
+    if (!t_cpu || !jb->sites || getenv("REBAR_NO_JIT_RECOVER")) return false;
+    uint64_t rip = uc->uc_mcontext->__ss.__rip;
+    const JSite *hit = NULL;
+    for (uint32_t k = 0; k < jb->nsites; k++) { uint64_t d = (uint64_t)jb->sites[k].at - rip; if ((int64_t)d >= 0 && d <= 8 && (!hit || jb->sites[k].at < hit->at)) hit = &jb->sites[k]; }   // (the instruction starts a few bytes before its ModRM byte)
+    if (!hit) return false;
+    const _STRUCT_X86_THREAD_STATE64 *r = &uc->uc_mcontext->__ss;
+    static const uint8_t host[8] = {RBX, RBP, R12, R13, R14, R10, R11, RDI};
+    for (int k = 0; k < 8; k++) {
+        if (!hit->reg_of[k]) continue;
+        bool pinned = k < g_npin;
+        if (!pinned && !(hit->dirty & (1u << k))) continue;
+        int g = hit->reg_of[k] - 1; uint64_t v = host_reg_of(r, host[k]);
+        if (g == 31) t_cpu->sp = v; else if (g < 31) t_cpu->x[g] = v;
+    }
+    t_cpu->pc = hit->pc;
+    return true;
+}
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
     if (sig == SIGSEGV && getenv("REBAR_POOL_GUARD") && (uint64_t)si->si_addr == 0 && unwind_out_of_pool_pop(uc)) return;
@@ -1713,9 +1738,11 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
             return;
         }
     }
-    if (g_mach_exc_port && t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise) && t_cpu->pc - g_stub_base >= g_stub_size)
+    bool jit_exact = false;   // a fault in a block that is not precise: rebuild the guest state from the access record, if there is one
+    if (g_jit_on && t_cpu && t_fault_jb && (sig == SIGSEGV || sig == SIGBUS) && (uint64_t)si->si_addr != rip) { const JReg *jb0 = jit_block_of(rip); if (jb0 && !jb0->precise) jit_exact = jit_recover_state(uc, jb0); }
+    if (g_mach_exc_port && t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && (jit_exact || !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise)) && t_cpu->pc - g_stub_base >= g_stub_size)
         deliver_mach_exception(t_cpu, sig, (uint64_t)si->si_addr);   // (returns only when nothing could be delivered)
-    if (t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && g_guest_fault_handler[sig == SIGSEGV ? 0 : 1] && !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise) && t_cpu->pc - g_stub_base >= g_stub_size)   // (not in a stub's host handler: a fault there is rebar's own and must not run guest code with its locks held)
+    if (t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && g_guest_fault_handler[sig == SIGSEGV ? 0 : 1] && (jit_exact || !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise)) && t_cpu->pc - g_stub_base >= g_stub_size)   // (not in a stub's host handler: a fault there is rebar's own and must not run guest code with its locks held)
         deliver_guest_signal(t_cpu, sig, si->si_code, (uint64_t)si->si_addr);   // (does not return: it continues at the pc the guest's handler chose)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }  // REBAR_FAULT_LOG=<file>: fault reports of helper processes whose stderr is lost
     { const JReg *jb = g_jit_on ? jit_block_of(rip) : NULL;

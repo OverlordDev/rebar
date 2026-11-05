@@ -72,7 +72,8 @@ static uint64_t g_jr_ind, g_jr_indmiss;   // REBAR_JITCOUNT: indirect branches e
 static uint64_t g_jr_runs, g_jr_stub, g_jr_budget, g_jr_other, g_jr_found, g_jr_cold;   // REBAR_JITCOUNT: why translated code returned to the dispatcher
 static uint32_t g_jit_fb_key[1 << 12]; static uint64_t g_jit_fb_n[1 << 12];   // instructions that got a helper call instead of a template, by encoding class
 
-typedef struct { uint8_t *code; uint32_t len; uint32_t n; uint64_t pc; bool precise; } JReg;   // precise: every memory access of the block leaves the CPU structure exact first (see g_jit_precise_lo)
+typedef struct { uint8_t *at; uint64_t pc; uint8_t reg_of[8]; uint8_t dirty; } JSite;   // a guest memory access in translated code: where its ModRM byte is, the guest pc, and which guest registers the cache held (and had not stored back) just before it
+typedef struct { uint8_t *code; uint32_t len; uint32_t n; uint64_t pc; bool precise; JSite *sites; uint32_t nsites; } JReg;   // precise: every memory access of the block leaves the CPU structure exact first (see g_jit_precise_lo)
 static uint64_t g_jit_precise_lo, g_jit_precise_hi;   // guest code in [lo, hi) is translated in the precise form: the pc and the registers are stored before each load / store, so that a fault in it can be given to the guest's signal handler
 static JReg *g_jit_reg;       // every block ever translated, in code-address order (for profiling and fault reports)
 static size_t g_jit_reg_n, g_jit_reg_cap;
@@ -109,6 +110,8 @@ typedef struct {
     uint64_t fl_pend_pc; int fl_pend_kind; bool fl_pend_taken, fl_pend_fall;   // flags_out deferred the N Z C V stores of the instruction before the B.cond at fl_pend_pc: see flags_deferrable
     uint8_t *mw_start, *mw_end;   // the code of the MOVZ / MOVN / MOVK just translated (a MOVK that follows rewrites it as one move)
     uint64_t mw_val, mw_pc; int mw_rd, mw_sf;
+    uint8_t fresh;            // cache slots handed out for a register that the current instruction is about to write: their host register has no meaning yet
+    JSite *sites; int nsites, capsites;   // the guest memory accesses of the block (see JSite)
 } JC;
 
 #define GX(r) ((int32_t)(offsetof(CPU, x) + 8 * (r)))
@@ -134,7 +137,14 @@ static inline void rex(JC *j, int w, int reg, int rm, int byte) {
     if (r != 0x40 || (byte && (reg >= 4 || rm >= 4))) e1(j, r);
 }
 static inline void modrm_rr(JC *j, int reg, int rm) { e1(j, 0xC0 | ((reg & 7) << 3) | (rm & 7)); }
+static void jsite_add(JC *j) {
+    if (j->nsites == j->capsites) { j->capsites = j->capsites ? j->capsites * 2 : 64; j->sites = realloc(j->sites, (size_t)j->capsites * sizeof(JSite)); }
+    JSite *s = &j->sites[j->nsites++];
+    s->at = j->p; s->pc = j->pc; memcpy(s->reg_of, j->rc_reg_of, 8); s->dirty = j->rc_dirty;
+    for (int k = 0; k < 8; k++) if (j->fresh & (1u << k)) { s->reg_of[k] = 0; s->dirty &= (uint8_t)~(1u << k); }
+}
 static void modrm_mem(JC *j, int reg, int base, int32_t disp) {
+    if (base != R15) jsite_add(j);   // (a memory operand that is not the CPU structure: a guest access, or the code's own cells)
     int mod = (disp == 0 && (base & 7) != 5) ? 0 : (disp >= -128 && disp <= 127) ? 1 : 2;
     e1(j, (mod << 6) | ((reg & 7) << 3) | ((base & 7) == 4 ? 4 : (base & 7)));
     if ((base & 7) == 4) e1(j, 0x24);
@@ -268,7 +278,7 @@ static void st_g(JC *j, int g, int src) {
 // fills all 64 bits, hrw updates it in place.  The register stays valid, and is not evicted, until the instruction is done.
 static int rc_slot(JC *j, int g, bool load) {
     int k = j->rc_slot_of[g] - 1;
-    if (k < 0) { k = rc_alloc(j, g); if (load) mov_rm(j, RC_HOST[k], R15, rc_mem(g), 1); }
+    if (k < 0) { k = rc_alloc(j, g); if (load) mov_rm(j, RC_HOST[k], R15, rc_mem(g), 1); else if (k >= g_npin) j->fresh |= (uint8_t)(1u << k); }
     j->rc_age[k] = ++j->rc_tick; j->rc_pin |= (uint8_t)(1u << k);
     return k;
 }
@@ -1027,6 +1037,7 @@ static void mem_op(JC *j, int w, int twobyte, uint8_t opc, int reg, Mem m, int b
     if (twobyte) e1(j, 0x0F);
     e1(j, opc);
     if (m.idx < 0) { modrm_mem(j, reg, m.base, m.disp); return; }
+    jsite_add(j);
     int mod = (m.disp == 0 && (m.base & 7) != 5) ? 0 : (m.disp >= -128 && m.disp <= 127) ? 1 : 2;
     e1(j, (mod << 6) | ((reg & 7) << 3) | 4);
     e1(j, (m.scale << 6) | ((m.idx & 7) << 3) | (m.base & 7));
@@ -1420,7 +1431,7 @@ static uint8_t *jit_compile(uint64_t pc) {
         n = 3; ended = true;
     }
     while (!leaf && n < maxn) {
-        j.pc = cur; j.kind_set = false; j.rc_pin = 0; j.insn_left = maxn - n - 1;
+        j.pc = cur; j.kind_set = false; j.rc_pin = 0; j.fresh = 0; j.insn_left = maxn - n - 1;
         if (precise && (*(uint32_t *)cur & 0x0a000000) == 0x08000000) {   // a load or store: the state a signal handler would see
             mov_ri_nf(&j, RAX, cur); mov_mr(&j, R15, (int32_t)offsetof(CPU, pc), RAX, 1);
             rc_sync_out(&j); rc_flush(&j);
@@ -1444,7 +1455,7 @@ static uint8_t *jit_compile(uint64_t pc) {
     g_jit_top = j.p;
     g_jit_nblocks++; g_jit_ninsns += n;
     if (g_jit_reg_n == g_jit_reg_cap) { g_jit_reg_cap = g_jit_reg_cap ? g_jit_reg_cap * 2 : 65536; g_jit_reg = realloc(g_jit_reg, g_jit_reg_cap * sizeof(JReg)); }
-    g_jit_reg[g_jit_reg_n++] = (JReg){start, (uint32_t)(j.p - start), (uint32_t)n, pc, precise};
+    g_jit_reg[g_jit_reg_n++] = (JReg){start, (uint32_t)(j.p - start), (uint32_t)n, pc, precise, j.sites, (uint32_t)j.nsites};
     if (g_jit_map) fprintf(g_jit_map, "%llx %u %llx %d\n", (unsigned long long)start, (unsigned)(j.p - start), (unsigned long long)pc, n);
     if (g_jit_dump) {   // REBAR_JITDUMP=<file>: "pc n bytes guest-words... | x86-bytes" for every block (analysis aid)
         fprintf(g_jit_dump, "%llx %d %u", (unsigned long long)pc, n, (unsigned)(j.p - start));
