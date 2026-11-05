@@ -344,7 +344,7 @@ static void emit_goto(JC *j, uint64_t target) {
 // a callee entered by BLR or from the dispatcher) takes the ordinary path through the cells.  Every way out of translated code resets rsp to the value it had at the entry.
 static uintptr_t g_jit_align = 16;   // REBAR_JIT_ALIGN=<16|32|64>: where block code starts (the word before it is the guest pc)
 static bool g_nodmbopt;   // REBAR_JIT_NODMBOPT=1: every DMB / DSB is an mfence again (to compare)
-static bool g_jit_ras = true;   // REBAR_JIT_RAS=0 turns it off
+static bool g_jit_ras = false;   // REBAR_JIT_RAS=1 turns on bl/blr as host call/ret; off by default: 9-12% slower on the GDScript VM of Godot, no gain on CPython, V8 and rustc (measured 2026-11-05)
 static void emit_call_ras(JC *j, uint64_t target, uint64_t retpc) {
     rc_flush(j);
     op_rm(j, 1, 0, 0x3B, RSP, R15, GHLIM);                    // cmp rsp, [hlim]: too deep, start again from the base
