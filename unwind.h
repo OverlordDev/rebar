@@ -25,7 +25,7 @@ static void dwarf_fde_info(GImage *im, uint64_t off, FuncInfo *fi);
 typedef struct { void *tinfo, *obj; bool objc, cxx, is_ptr; } ExcInfo;
 typedef struct { struct _Unwind_Exception *exc; HostCallRec *rec; uint64_t sp, func, lp; int selector; void *adjusted; const uint8_t *action, *lsda; } Found;
 // What a personality routine of the guest's own (LuaJIT's lj_err_unwind_dwarf) is handed as its _Unwind_Context: the _Unwind_GetCFA / SetGR / SetIP calls it makes come to our handlers.
-typedef struct { uint64_t magic, cfa, ip, gr[2]; } GCtx;
+typedef struct { uint64_t magic, cfa, ip, gr[2], fpc, lsda, start; } GCtx;   // fpc: the frame's pc (a return address), lsda / start: its language-specific data and function address (Rust's rust_eh_personality asks for them)
 #define GCTX_MAGIC 0x72656261725f6374ull
 
 static __thread Found t_found;
@@ -390,7 +390,12 @@ static int call_guest_personality(CPU *c, uint64_t fn, int actions, struct _Unwi
 H(h_Unwind_GetCFA)  { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = g->cfa; else host_call(c, HOSTFN("_Unwind_GetCFA"), false); }
 H(h_Unwind_SetGR)   { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) { if (c->x[1] < 2) g->gr[c->x[1]] = c->x[2]; } else host_call(c, HOSTFN("_Unwind_SetGR"), false); }
 H(h_Unwind_SetIP)   { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) g->ip = c->x[1]; else host_call(c, HOSTFN("_Unwind_SetIP"), false); }
-H(h_Unwind_GetIP)   { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = g->ip; else host_call(c, HOSTFN("_Unwind_GetIP"), false); }
+H(h_Unwind_GetIP)   { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = g->ip ? g->ip : g->fpc; else host_call(c, HOSTFN("_Unwind_GetIP"), false); }
+H(h_Unwind_GetIPInfo) { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) { if (c->x[1]) *(int *)c->x[1] = 0; c->x[0] = g->ip ? g->ip : g->fpc; } else host_call(c, HOSTFN("_Unwind_GetIPInfo"), false); }
+H(h_Unwind_GetLanguageSpecificData) { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = g->lsda; else host_call(c, HOSTFN("_Unwind_GetLanguageSpecificData"), false); }
+H(h_Unwind_GetRegionStart) { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = g->start; else host_call(c, HOSTFN("_Unwind_GetRegionStart"), false); }
+H(h_Unwind_GetDataRelBase) { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = 0; else host_call(c, HOSTFN("_Unwind_GetDataRelBase"), false); }
+H(h_Unwind_GetTextRelBase) { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = 0; else host_call(c, HOSTFN("_Unwind_GetTextRelBase"), false); }
 H(h_Unwind_GetGR)   { GCtx *g = P(0); if (g->magic == GCTX_MAGIC) c->x[0] = c->x[1] < 2 ? g->gr[c->x[1]] : 0; else host_call(c, HOSTFN("_Unwind_GetGR"), false); }
 
 // Phase 1: is there a guest catch clause for this exception in this activation?
@@ -403,7 +408,7 @@ static bool guest_search(HostCallRec *rec, struct _Unwind_Exception *exc) {
         if (!unwind_lookup(f.pc - 1, &fi)) return false;
         if (g_trace) fprintf(stderr, "  [eh] search frame pc=%llx func=%llx enc=%llx lsda=%llx pers=%d\n", (unsigned long long)f.pc, (unsigned long long)fi.func, (unsigned long long)fi.enc, (unsigned long long)fi.lsda, fi.pers);
         if (fi.pers == 4 && fi.pers_fn) {   // a personality routine of the guest's own
-            GCtx gc = {GCTX_MAGIC, f.sp, 0, {0, 0}};   // (_Unwind_GetCFA of the context of a frame is that frame's own stack pointer at the call)
+            GCtx gc = {GCTX_MAGIC, f.sp, 0, {0, 0}, f.pc, fi.lsda, fi.func};   // (_Unwind_GetCFA of the context of a frame is that frame's own stack pointer at the call)
             if (g_trace) fprintf(stderr, "  [eh] guest personality %llx for func %llx: frame sp=%llx fp=%llx\n", (unsigned long long)fi.pers_fn, (unsigned long long)fi.func, (unsigned long long)f.sp, (unsigned long long)f.fp);
             CPU *c = cur_cpu();
             if (call_guest_personality(c, fi.pers_fn, _UA_SEARCH_PHASE, exc, &gc) == _URC_HANDLER_FOUND) {
@@ -447,8 +452,17 @@ int rebar_arrive(struct _Unwind_Exception *exc, long is_handler_frame) {
         if (!unwind_lookup(f.pc - 1, &fi)) return 0;
         if (fi.pers == 4 && fi.pers_fn) {   // a personality routine of the guest's own (LuaJIT's catch frames): it says where to resume, and with what in x0
             bool mine = is_handler_frame && t_found.exc == exc && t_found.sp == f.sp && t_found.func == fi.func && t_found.selector == -2;
-            GCtx gc = {GCTX_MAGIC, f.sp, 0, {0, 0}};   // (_Unwind_GetCFA of the context of a frame is that frame's own stack pointer at the call)
+            GCtx gc = {GCTX_MAGIC, f.sp, 0, {0, 0}, f.pc, fi.lsda, fi.func};   // (_Unwind_GetCFA of the context of a frame is that frame's own stack pointer at the call)
             if (call_guest_personality(c, fi.pers_fn, _UA_CLEANUP_PHASE | (mine ? _UA_HANDLER_FRAME : 0), exc, &gc) == _URC_INSTALL_CONTEXT && gc.ip) {
+                if (!mine && t_found.selector == -2) {   // a cleanup pad of a frame that does not catch (Rust's drop glue): run it here, it ends in _Unwind_Resume, then go on up
+                    uframe_to_cpu(c, &f);
+                    c->pc = gc.ip; c->x[0] = gc.gr[0]; c->x[1] = gc.gr[1];
+                    t_in_driver++;
+                    run_until(c, stub_addr(STUB_RET));
+                    t_in_driver--;
+                    uframe_from_cpu(c, &f);
+                    continue;
+                }
                 uframe_to_cpu(c, &f);
                 c->pc = gc.ip;
                 t_pend_x0 = gc.gr[0]; t_pend_x1 = gc.gr[1];

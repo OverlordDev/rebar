@@ -216,6 +216,15 @@ if [ -x "$HB/bin/node" ]; then
     printf 'fs hello 5\nwatch ok\nzlib 300 brotli\ncrypto 2d711642 8 2b90e4\ned25519 true\naesgcm secret\nhttp echo:ping\nnet tcp!\nchild hi 3\nworker 42\natomics 5\nwasm 42\nintl 1.234.567,891 1970/1/1 SS 1\nregex 11 a_b_\nbigint 265252859812191058636308480000000\njit 28665 true\nfetch hi\ndns ::1\ntimers ok\nhrtime true darwin arm64\n' > $T/a
     REBAR_PATHMAP=/opt/homebrew=$HB run_to 120 $T/b $R "$HB/bin/node" node_features.js; grep -v '^nvrm' $T/b > $T/b2; check node_features $T/a $T/b2
 fi
+# Rust (rustc built for arm64): panics unwind through guest frames running drop glue (a guest personality routine asks for the LSDA and the IP), catch_unwind, threads, std
+if [ -x "$HB/bin/rustc" ]; then
+    REBAR_PATHMAP=/opt/homebrew=$HB $R "$HB/bin/rustc" -O rust_panics.rs -o $T/rust_panics >/dev/null 2>&1
+    printf 'drop inner-a\ndrop inner-b\ndrop inner-a\ndrop inner-b\ndrop inner-a\ndrop outer\nr err true\nmsg Some("boom 0")\ndrop thread\njoin err true\ndrop nested\ninner caught true\nresumed Some(7)\ntrue\ndrop end\n' > $T/a
+    run_to 60 $T/b $R $T/rust_panics; grep -v '^nvrm' $T/b > $T/b2; check rust_panics $T/a $T/b2
+    REBAR_PATHMAP=/opt/homebrew=$HB $R "$HB/bin/rustc" -O rust_std.rs -o $T/rust_std >/dev/null 2>&1
+    printf 'sum 6000\nchan [0, 1, 4, 9, 16]\n[("a", 3), ("b", 2), ("c", 1)]\npanic caught true\ntrue\nOk("hi")\nf64 1.4142 340282366920938463463374607431768211455\n' > $T/a
+    run_to 60 $T/b $R $T/rust_std; grep -v '^nvrm' $T/b > $T/b2; check rust_std $T/a $T/b2
+fi
 # Go: runtime panics from faults (nil dereference, nil map, index, divide by zero) are recovered: the guest's SIGSEGV handler has to run on its alternate signal stack
 if [ -x "$HB/bin/go" ]; then
     gd=$T/go_panics; rm -rf $gd; mkdir -p $gd; cp go_panics.go $gd/main.go; printf 'module gopanics\ngo 1.21\n' > $gd/go.mod

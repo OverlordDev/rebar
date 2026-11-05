@@ -1388,7 +1388,7 @@ static uint64_t tlv_thunk(void) {
 #include "objc.h"
 
 H(h_Unwind_Resume);
-H(h_Unwind_GetCFA); H(h_Unwind_SetGR); H(h_Unwind_SetIP); H(h_Unwind_GetIP); H(h_Unwind_GetGR);
+H(h_Unwind_GetCFA); H(h_Unwind_SetGR); H(h_Unwind_SetIP); H(h_Unwind_GetIP); H(h_Unwind_GetGR); H(h_Unwind_GetIPInfo); H(h_Unwind_GetLanguageSpecificData); H(h_Unwind_GetRegionStart); H(h_Unwind_GetDataRelBase); H(h_Unwind_GetTextRelBase);
 H(h_objc_getProtocol); H(h_NSProtocolFromString); H(h_objc_alloc_init); H(h_objc_alloc); H(h_objc_opt_new); H(h_objc_allocWithZone);
 H(h_vfork); H(h_objc_claimAutoreleasedReturnValue); H(h_objc_autoreleaseReturnValue); H(h_objc_retainAutoreleasedReturnValue); H(h_objc_unsafeClaimAutoreleasedReturnValue); H(h_uname); H(h_thread_get_state); H(h_thread_set_state); H(h_thread_resume); H(h_posix_spawnattr_setbinpref_np); H(h_SSLSetIOFuncs); H(h_SecItemAdd); H(h_SecItemCopyMatching); H(h_SecItemUpdate); H(h_SecItemDelete); H(h_CGGetActiveDisplayList); H(h_CVDisplayLinkCreateWithActiveCGDisplays); H(h_CGDisplayIsActive); H(h_unw_getcontext); H(h_unw_init_local); H(h_unw_step); H(h_unw_get_reg); H(h_unw_set_reg); H(h_unw_get_fpreg); H(h_unw_set_fpreg); H(h_unw_is_signal_frame);
 H(h_dlopen); H(h_dlsym); H(h_dlclose); H(h_dladdr); H(h_dlerror);
@@ -1438,7 +1438,7 @@ static const Special k_special[] = {
     {"_dlopen", h_dlopen}, {"_dlerror", h_dlerror}, {"_dlsym", h_dlsym}, {"_dlclose", h_dlclose}, {"_dladdr", h_dladdr},
     {"__dyld_image_count", h_dyld_image_count}, {"__dyld_get_image_name", h_dyld_get_image_name},
     {"__dyld_get_image_header", h_dyld_get_image_header}, {"__dyld_get_image_vmaddr_slide", h_dyld_get_image_vmaddr_slide},
-    {"__dyld_register_func_for_add_image", h_dyld_register_func_for_add_image}, {"__Unwind_Resume", h_Unwind_Resume}, {"__Unwind_GetCFA", h_Unwind_GetCFA}, {"__Unwind_SetGR", h_Unwind_SetGR}, {"__Unwind_SetIP", h_Unwind_SetIP}, {"__Unwind_GetIP", h_Unwind_GetIP}, {"__Unwind_GetGR", h_Unwind_GetGR},
+    {"__dyld_register_func_for_add_image", h_dyld_register_func_for_add_image}, {"__Unwind_Resume", h_Unwind_Resume}, {"__Unwind_GetIPInfo", h_Unwind_GetIPInfo}, {"__Unwind_GetLanguageSpecificData", h_Unwind_GetLanguageSpecificData}, {"__Unwind_GetRegionStart", h_Unwind_GetRegionStart}, {"__Unwind_GetDataRelBase", h_Unwind_GetDataRelBase}, {"__Unwind_GetTextRelBase", h_Unwind_GetTextRelBase}, {"__Unwind_GetCFA", h_Unwind_GetCFA}, {"__Unwind_SetGR", h_Unwind_SetGR}, {"__Unwind_SetIP", h_Unwind_SetIP}, {"__Unwind_GetIP", h_Unwind_GetIP}, {"__Unwind_GetGR", h_Unwind_GetGR},
     {"_objc_msgSend", h_objc_msgSend}, {"_objc_msgSendSuper2", h_objc_msgSendSuper2},
     {"_CFRunLoopObserverCreate", h_CFRunLoopObserverCreate}, {"_CFRunLoopTimerCreate", h_CFRunLoopTimerCreate}, {"_CFRunLoopSourceCreate", h_CFRunLoopSourceCreate}, {"_CVDisplayLinkSetOutputCallback", h_CVDisplayLinkSetOutputCallback},
     {"_method_setImplementation", h_method_setImplementation}, {"_class_replaceMethod", h_class_replaceMethod}, {"_class_addMethod", h_class_addMethod},
