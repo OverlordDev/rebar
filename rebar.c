@@ -371,6 +371,22 @@ x_dpimm:
         else { r = (op ? a - imm : a + imm) & mask(sf); wr_sp(c, rt, r); }
         return true;
     }
+    // ---- FEAT_CSSC min/max with an immediate (SMAX/UMAX/SMIN/UMIN), and the MTE address-tag arithmetic ADDG/SUBG (allocation tags are not kept: every tag is 0)
+    if (B(i, 28, 23) == 0x23) {
+        if (B(i, 22, 22)) {
+            int opc = B(i, 21, 18); uint32_t imm8 = B(i, 17, 10);
+            if (opc > 3 || B(i, 30, 29)) die(c, "unsupported min/max immediate", i);
+            uint64_t a = rd(c, rn) & mask(sf), r;
+            if (opc & 1) { uint64_t m = imm8; r = (opc & 2) ? (a < m ? a : m) : (a > m ? a : m); }
+            else { int64_t m = (int8_t)imm8, sa = sf ? (int64_t)a : (int64_t)(int32_t)a; r = (uint64_t)((opc & 2) ? (sa < m ? sa : m) : (sa > m ? sa : m)); }
+            wr(c, rt, r & mask(sf));
+            return true;
+        }
+        if (!sf || B(i, 29, 29)) die(c, "unsupported tag arithmetic", i);
+        uint64_t a = rd_sp(c, rn) & ~(0xfull << 56), off = (uint64_t)B(i, 21, 16) << 4;
+        wr_sp(c, rt, B(i, 30, 30) ? a - off : a + off);
+        return true;
+    }
     // ---- logical immediate
     if (B(i, 28, 23) == 0x24) {
         int opc = B(i, 30, 29);
@@ -407,7 +423,7 @@ x_dpimm:
     return false;
 
 x_ldst:
-    if ((B(i, 29, 24) == 0x08 || B(i, 29, 24) == 0x19 || (B(i, 29, 27) == 7 && B(i, 25, 24) == 0 && B(i, 21, 21) && B(i, 11, 10) == 0)) && exec_atomic(c, i)) return true;
+    if ((B(i, 29, 24) == 0x08 || B(i, 29, 24) == 0x19 || B(i, 29, 24) == 0x1d || (B(i, 29, 27) == 7 && B(i, 25, 24) == 0 && B(i, 21, 21) && B(i, 11, 10) == 0)) && exec_atomic(c, i)) return true;
 
     // ---- loads / stores (GPR and SIMD&FP registers)
     if (B(i, 29, 27) == 0x7 && (B(i, 25, 24) == 1 || B(i, 25, 24) == 0)) {
@@ -507,6 +523,12 @@ x_dpreg:
         wr(c, rt, r);
         return true;
     }
+    // ---- FEAT_CPA: ADDPT / SUBPT (checked pointer arithmetic: plain 64-bit add / subtract of the shifted offset)
+    if (B(i, 28, 21) == 0xd0 && B(i, 15, 13) == 1 && sf && !B(i, 29, 29)) {
+        uint64_t off = rd(c, rm) << B(i, 12, 10), a = rd_sp(c, rn);
+        wr_sp(c, rt, B(i, 30, 30) ? a - off : a + off);
+        return true;
+    }
     // ---- add/sub with carry
     if (B(i, 28, 21) == 0xd0 && B(i, 15, 10) == 0) {
         int op = B(i, 30, 30), S = B(i, 29, 29);
@@ -555,6 +577,12 @@ x_dpreg:
         wr(c, rt, r & mask(sf));
         return true;
     }
+    // ---- SUBPS (MTE): SUBP that sets the flags like SUBS
+    if (B(i, 30, 21) == 0x1d6 && sf && B(i, 15, 10) == 0) {
+        uint64_t a = (uint64_t)sext(rd_sp(c, rn) & 0x00ffffffffffffffull, 56), b = (uint64_t)sext(rd_sp(c, rm) & 0x00ffffffffffffffull, 56);
+        wr(c, rt, add_flags(c, a, ~b, 1, 1));
+        return true;
+    }
     // ---- data processing 2 source
     if (B(i, 30, 21) == 0x0d6) {
         int op = B(i, 15, 10);
@@ -568,6 +596,14 @@ x_dpreg:
         case 11: r = shift_val(a, 3, b, sf); break;
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23:  // CRC32{B,H,W,X}, CRC32C{B,H,W,X}
             r = crc32_insn((uint32_t)a, b, 1 << (op & 3), op & 4); break;
+        case 0x18: r = (uint64_t)((sf ? (int64_t)a : (int64_t)(int32_t)a) > (sf ? (int64_t)b : (int64_t)(int32_t)b) ? a : b); break;   // SMAX / UMAX / SMIN / UMIN (FEAT_CSSC)
+        case 0x19: r = a > b ? a : b; break;
+        case 0x1a: r = (uint64_t)((sf ? (int64_t)a : (int64_t)(int32_t)a) < (sf ? (int64_t)b : (int64_t)(int32_t)b) ? a : b); break;
+        case 0x1b: r = a < b ? a : b; break;
+        case 0: if (!sf) die(c, "unsupported dp2src", i);   // SUBP: the difference of two 56-bit addresses (the tags are ignored)
+            r = (uint64_t)(sext(rd_sp(c, rn) & 0x00ffffffffffffffull, 56) - sext(rd_sp(c, rm) & 0x00ffffffffffffffull, 56)); break;
+        case 4: if (!sf) die(c, "unsupported dp2src", i); r = rd_sp(c, rn) & ~(0xfull << 56); wr_sp(c, rt, r); return true;   // IRG: a pointer with tag 0 (every tag excluded)
+        case 5: if (!sf) die(c, "unsupported dp2src", i); r = rd(c, rm) | (1ull << ((rd_sp(c, rn) >> 56) & 15)); break;   // GMI
         case 12: {   // PACGA Xd, Xn, Xm|SP: a 32-bit code in the top half (any fixed function of the inputs: nothing here checks it against a key)
             uint64_t mod = rm == 31 ? c->sp : b, h = (a ^ (mod * 0x9e3779b97f4a7c15ull)) * 0xff51afd7ed558ccdull; h ^= h >> 29;
             r = (h & 0xffffffff00000000ull); break; }
@@ -595,8 +631,11 @@ x_dpreg:
         else if (op == 5) {  // CLS
             uint64_t t = sf ? (a ^ (uint64_t)((int64_t)a >> 1)) : (uint32_t)((int32_t)a ^ ((int32_t)a >> 1));
             r = (t ? __builtin_clzll(t) - (sf ? 0 : 32) : (sf ? 64 : 32)) - 1;
-        } else die(c, "unsupported dp1src", i);
-        wr(c, rt, r);
+        } else if (op == 6) r = a ? __builtin_ctzll(a) : (sf ? 64 : 32);   // CTZ / CNT / ABS (FEAT_CSSC)
+        else if (op == 7) r = __builtin_popcountll(a);
+        else if (op == 8) { int64_t sa = sf ? (int64_t)a : (int64_t)(int32_t)a; r = (uint64_t)(sa < 0 ? -sa : sa); }
+        else die(c, "unsupported dp1src", i);
+        wr(c, rt, sf ? r : r & 0xffffffffull);
         return true;
     }
     // ---- data processing 3 source
@@ -611,6 +650,9 @@ x_dpreg:
             r = o0 ? rd(c, ra) - p : rd(c, ra) + p;
         } else if (op31 == 5) {
             uint64_t p = (uint64_t)(uint32_t)rd(c, rn) * (uint32_t)rd(c, rm);
+            r = o0 ? rd(c, ra) - p : rd(c, ra) + p;
+        } else if (op31 == 3 && sf) {   // MADDPT / MSUBPT (FEAT_CPA)
+            uint64_t p = rd(c, rn) * rd(c, rm);
             r = o0 ? rd(c, ra) - p : rd(c, ra) + p;
         } else if (op31 == 2) r = (uint64_t)(((__int128)(int64_t)rd(c, rn) * (int64_t)rd(c, rm)) >> 64);
         else if (op31 == 6) r = (uint64_t)(((unsigned __int128)rd(c, rn) * rd(c, rm)) >> 64);
@@ -934,7 +976,7 @@ L_br:
         npc = c->pc + (uint64_t)(sext(B(i, 25, 0), 26) * 4);
         goto done;
     }
-    if ((i & 0xff000010) == 0x54000000) {  // B.cond
+    if ((i & 0xff000000) == 0x54000000) {  // B.cond
         if (cond_holds(c, B(i, 3, 0))) npc = c->pc + (uint64_t)(sext(B(i, 23, 5), 19) * 4);
         goto done;
     }
@@ -967,6 +1009,7 @@ L_br:
         npc = t;
         goto done;
     }
+    if ((i & 0xffc0001f) == 0x5500001f) { npc = c->x[30]; goto done; }   // RETAASPPC / RETABSPPC <label> (FEAT_PAuth_LR): the return address is never signed here
     goto L_slow;
 
 L_slow:
@@ -996,7 +1039,7 @@ static int probe_insns(void) {
     char line[64];
     while (fgets(line, sizeof line, stdin)) {
         uint32_t w = (uint32_t)strtoul(line, NULL, 16);
-        if (B(w, 30, 26) == 0x5 || (w & 0xfe000000) == 0xd6000000 || (w & 0x7e000000) == 0x34000000 || (w & 0xff000010) == 0x54000000 || (w & 0xff000000) == 0xd4000000 || (w & 0x7f000000) == 0x36000000) { printf("%08x SKIP\n", w); continue; }
+        if (B(w, 30, 26) == 0x5 || (w & 0xfe000000) == 0xd6000000 || (w & 0x7e000000) == 0x34000000 || (w & 0xff000000) == 0x54000000 || (w & 0xff000000) == 0xd4000000 || (w & 0xffc0001f) == 0x5500001f || (w & 0x7f000000) == 0x36000000) { printf("%08x SKIP\n", w); continue; }
         memset(a, 0, sizeof *a);
         for (int k = 0; k < 31; k++) a->x[k] = (uint64_t)mem + (sz / 2) + (uint64_t)k * 64;
         a->sp = (uint64_t)mem + sz / 2 + 4096;

@@ -416,6 +416,20 @@ static uint64_t vshift_reg(uint64_t a, int64_t sa, int es, int sh, bool u, bool 
     return (uint64_t)(x >> rs);
 }
 
+// SQSHL / UQSHL / SQRSHL / UQRSHL by register: the shift is the signed low byte of the second operand, a negative one shifts right (rounding for the R forms), a left shift saturates
+static uint64_t vshift_sat(uint64_t a, int64_t sa, int es, int sh, bool u, bool round) {
+    __int128 x = u ? (__int128)a : (__int128)sa;
+    if (sh >= 0) {
+        if (x == 0) return 0;
+        if (sh >= 64) return u ? sat_u((__int128)1 << 100, es) : sat_s(x < 0 ? -((__int128)1 << 100) : ((__int128)1 << 100), es);
+        return u ? sat_u(x << sh, es) : sat_s(x << sh, es);
+    }
+    int rs = -sh;
+    if (rs > 64) return u || x >= 0 ? 0 : (round ? 0 : ~0ull);
+    __int128 v = (round ? x + ((__int128)1 << (rs - 1)) : x) >> rs;
+    return u ? sat_u(v, es) : sat_s(v, es);
+}
+
 // h16: the half-precision encoding, whose 3-bit opcode (bits 13..11) maps onto the FP opcodes 24..31 and whose size is just 'a'
 static void simd_3same(CPU *c, uint32_t i, bool scalar, bool h16) {
     int Q = scalar ? 0 : B(i, 30, 30), U = B(i, 29, 29), size = h16 ? B(i, 23, 23) * 2 : B(i, 23, 22), op = h16 ? 24 + B(i, 13, 11) : B(i, 15, 11);
@@ -474,6 +488,8 @@ static void simd_3same(CPU *c, uint32_t i, bool scalar, bool h16) {
             case 7: r = (U ? a >= b : sa >= sb) ? ~0ull : 0; break;
             case 8: r = vshift_reg(a, sa, es, (int8_t)b, U, false); break;
             case 10: r = vshift_reg(a, sa, es, (int8_t)b, U, true); break;
+            case 9: r = vshift_sat(a, sa, es, (int8_t)b, U, false); break;
+            case 11: r = vshift_sat(a, sa, es, (int8_t)b, U, true); break;
             case 12: case 20: r = U ? (a > b ? a : b) : (uint64_t)(sa > sb ? sa : sb); break;
             case 13: case 21: r = U ? (a < b ? a : b) : (uint64_t)(sa < sb ? sa : sb); break;
             case 14: r = U ? (a > b ? a - b : b - a) : (uint64_t)(sa > sb ? sa - sb : sb - sa); break;
@@ -580,6 +596,10 @@ static void simd_3diff(CPU *c, uint32_t i) {
         case 8: r = acc + (uint64_t)(x * y); break;
         case 10: r = acc - (uint64_t)(x * y); break;
         case 12: r = (uint64_t)(x * y); break;
+        case 9: case 11: case 13:   // SQDMLAL / SQDMLSL / SQDMULL: widening, doubling, saturating
+            if (U || size == 0) die(c, "unsupported simd 3diff", i);
+            r = sat_s(op == 13 ? 2 * x * y : op == 9 ? (__int128)sx(acc, des) + 2 * x * y : (__int128)sx(acc, des) - 2 * x * y, des);
+            break;
         default: die(c, "unsupported simd 3diff", i);
         }
         vset(&res, des, k, r);
@@ -679,6 +699,7 @@ static void simd_misc2(CPU *c, uint32_t i, bool scalar, bool h16) {
             case 9: r = (U ? sa <= 0 : sa == 0) ? ~0ull : 0; break;
             case 10: r = sa < 0 ? ~0ull : 0; break;
             case 11: r = U ? (uint64_t)(-sa) : (uint64_t)(sa < 0 ? -sa : sa); break;
+            case 3: r = U ? sat_u((__int128)zx(vget(&d0, es, k), es) + sa, es) : sat_s((__int128)sx(vget(&d0, es, k), es) + (__int128)zx(a, es), es); break;   // USQADD / SUQADD
             case 7: r = U ? sat_s(-(__int128)sa, es) : sat_s(sa < 0 ? -(__int128)sa : (__int128)sa, es); break;
             default: die(c, "unsupported simd misc2", i);
             }
@@ -703,7 +724,14 @@ static void simd_misc2(CPU *c, uint32_t i, bool scalar, bool h16) {
         case 26: isint = true; r = fcvt_int(fa, hi ? 1 : 0, U, es * 8); break;
         case 27: isint = true; r = fcvt_int(fa, hi ? 3 : 2, U, es * 8); break;
         case 28:
-            if (hi) die(c, "unsupported simd misc2", i);
+            if (hi) {   // URECPE / URSQRTE: unsigned reciprocal (square root) estimate of 32-bit lanes (Arm ARM pseudocode)
+                if (es != 4 || h16) die(c, "unsupported simd misc2", i);
+                uint32_t v = (uint32_t)a; isint = true;
+                if (!U) { if (!(v >> 31)) r = 0xffffffffu; else { unsigned t = (v >> 23) * 2 + 1, bq = (1u << 19) / t, e = (bq + 1) / 2; r = (uint64_t)(e & 0x1ff) << 23; } }
+                else if ((v >> 30) == 0) r = 0xffffffffu;
+                else { unsigned t = v >> 23; unsigned long long a2; if (t < 256) a2 = t * 2 + 1; else { a2 = (t >> 1) << 1; a2 = (a2 + 1) * 2; } unsigned long long bq = 512; while (a2 * (bq + 1) * (bq + 1) < (1ull << 28)) bq++; unsigned e = (unsigned)((bq + 1) / 2); r = (uint64_t)(e & 0x1ff) << 23; }
+                break;
+            }
             isint = true; r = fcvt_int(fa, 4, U, es * 8); break;
         case 29:
             if (!hi) {
@@ -716,6 +744,14 @@ static void simd_misc2(CPU *c, uint32_t i, bool scalar, bool h16) {
         case 30: if (hi || es < 4) die(c, "unsupported simd misc2", i); fr = frint_ts(fa, 32, !U); break;   // FRINT32Z / FRINT32X
         case 31:
             if (!hi && es >= 4) { fr = frint_ts(fa, 64, !U); break; }   // FRINT64Z / FRINT64X
+            if (hi && !U && scalar) {   // FRECPX: the exponent inverted, the fraction cleared (a zero or denormal gives the largest finite exponent)
+                int eb = es == 2 ? 5 : es == 4 ? 8 : 11, fb = es * 8 - 1 - eb;
+                uint64_t em = (1ull << eb) - 1, ex = (a >> fb) & em, fr2 = a & ((1ull << fb) - 1), sg = a >> (es * 8 - 1);
+                isint = true;
+                if (ex == em && fr2) r = a | (1ull << (fb - 1));   // a NaN comes back quiet
+                else r = (sg << (es * 8 - 1)) | ((ex == 0 ? (em - 1) : (~ex & em)) << fb);
+                break;
+            }
             if (!(hi && U)) die(c, "unsupported simd misc2", i);
             fr = sqrt(fa); break;
         default: die(c, "unsupported simd fp misc2", i);
@@ -1283,6 +1319,13 @@ static bool exec_fpsimd(CPU *c, uint32_t i) {
         if (!b31 && b30) {  // scalar AdvSIMD
             if (B(i, 21, 21)) {
                 if (B(i, 10, 10)) { simd_3same(c, i, true, false); return true; }
+                if (B(i, 11, 10) == 0 && !U && (B(i, 15, 12) == 9 || B(i, 15, 12) == 11 || B(i, 15, 12) == 13) && (B(i, 23, 22) == 1 || B(i, 23, 22) == 2)) {   // SQDMLAL / SQDMLSL / SQDMULL, scalar
+                    int sz = B(i, 23, 22), es = 1 << sz, des = es * 2, op = B(i, 15, 12), rd = B(i, 4, 0);
+                    __int128 x = sx(vget(&c->vr[B(i, 9, 5)], es, 0), es), y = sx(vget(&c->vr[B(i, 20, 16)], es, 0), es), acc = sx(vget(&c->vr[rd], des, 0), des);
+                    VReg res; memset(&res, 0, 16);
+                    vset(&res, des, 0, sat_s(op == 13 ? 2 * x * y : op == 9 ? acc + 2 * x * y : acc - 2 * x * y, des));
+                    c->vr[rd] = res; return true;
+                }
                 if (B(i, 11, 10) == 2 && B(i, 21, 17) == 0x10) { simd_misc2(c, i, true, false); return true; }
                 if (B(i, 11, 10) == 2 && B(i, 21, 17) == 0x18) { simd_scalar_pairwise(c, i); return true; }
                 if (B(i, 22, 17) == 0x3c && B(i, 11, 10) == 2) { simd_misc2(c, i, true, true); return true; }   // half precision

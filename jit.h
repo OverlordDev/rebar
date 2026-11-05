@@ -516,7 +516,7 @@ static bool flags_skippable(JC *j, int kind) {
     if ((p & 4095) == 0) return false;
     uint32_t n = *(uint32_t *)p;
     int budget = g_fl_budget;
-    if ((n & 0xff000010) == 0x54000000) {   // B.cond
+    if ((n & 0xff000000) == 0x54000000) {   // B.cond
         if (g_skipmode && g_skipmode != 1) return false;
         if (j->insn_left < 1 || !fl_fusable(kind, B(n, 3, 0) & 15)) return false;
         uint64_t t = p + (uint64_t)(sext(B(n, 23, 5), 19) * 4);
@@ -539,7 +539,7 @@ static bool flags_deferrable(JC *j, int kind) {
     uint64_t p = j->pc + 4;
     if ((p & 4095) == 0) return false;
     uint32_t n = *(uint32_t *)p;
-    if ((n & 0xff000010) != 0x54000000) return false;
+    if ((n & 0xff000000) != 0x54000000) return false;
     int cond = B(n, 3, 0);
     if (j->insn_left < 1 || !side_exit_room(j) || (cond & 14) == 14 || !fl_fusable(kind, cond)) return false;
     if (kind == 3 && (cond == 2 || cond == 3 || cond == 6 || cond == 7 || cond == 8 || cond == 9)) return false;   // (a logical result has C and V clear: those conditions are constant)
@@ -1215,7 +1215,7 @@ static JI emit_branch_insn(JC *j, uint32_t i) {
         emit_goto(j, target);
         return JI_END;
     }
-    if ((i & 0xff000010) == 0x54000000) {  // B.cond
+    if ((i & 0xff000000) == 0x54000000) {  // B.cond
         uint64_t target = pc + (uint64_t)(sext(B(i, 23, 5), 19) * 4);
         int cc = cond_cc(j, B(i, 3, 0));
         bool pend = j->fl_pend_pc == pc && j->flagkind;   // the stores of the flags were left to this branch (flags_deferrable)
@@ -1394,7 +1394,7 @@ static bool jit_needs_budget(uint64_t pc, int maxn) {   // could a loop go throu
         uint64_t p = pc + 4 * (uint64_t)k; uint32_t i = *(uint32_t *)p;
         if (B(i, 30, 26) == 0x5) return sext(B(i, 25, 0), 26) <= 0;   // B / BL: the block ends here
         if ((i & 0xfe1ffc1f) == 0xd61f0000) return true;                        // BR / BLR / RET
-        if ((i & 0xff000010) == 0x54000000 && sext(B(i, 23, 5), 19) <= 0) return true;
+        if ((i & 0xff000000) == 0x54000000 && sext(B(i, 23, 5), 19) <= 0) return true;
         if (B(i, 30, 25) == 0x1a && sext(B(i, 23, 5), 19) <= 0) return true;
         if (B(i, 30, 25) == 0x1b && sext(B(i, 18, 5), 14) <= 0) return true;
     }
