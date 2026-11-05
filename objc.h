@@ -777,7 +777,7 @@ static bool msg_special_sel(SEL sel) {
         static const char *names[] = {"stringWithFormat:", "predicateWithFormat:", "raise:format:", "initWithFormat:", "appendFormat:", "stringByAppendingFormat:", "initWithFormat:arguments:", "predicateWithFormat:arguments:",
             "initWithFormat:locale:arguments:", "arrayWithObjects:", "dictionaryWithObjectsAndKeys:", "handleFailureInFunction:file:lineNumber:description:", "handleFailureInMethod:object:file:lineNumber:description:",
             "initWithColorsAndLocations:", "initWithObjects:", "initWithObjectsAndKeys:", "orderedSetWithObjects:", "setWithObjects:", "commit", "set", "setLayer:", "bundleForClass:", "mainBundle", "launch",
-            "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", NULL};
+            "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", "defaultContainer", "containerWithIdentifier:", NULL};
         int k = 0; for (; names[k] && k < 40; k++) sp[k] = sel_registerName(names[k]);
         __atomic_store_n(&n, k, __ATOMIC_RELEASE);
     }
@@ -840,6 +840,12 @@ H(h_objc_msgSend) {
     }
     if (g_trace) fprintf(stderr, "  [msg] %p %s%s\n", (void *)self, self ? (class_isMetaClass(object_getClass(self)) ? "+" : "-") : "", sel_getName(sel));
     if (!self) { c->x[0] = c->x[1] = 0; memset(&c->vr[0], 0, 64); return; }
+    {   // +[CKContainer defaultContainer]: CloudKit needs entitlements a process started by rebar does not have, and on this kind of Mac the call itself takes a SIGSEGV in the host (also in a plain
+        // x86_64 program). A guest gets nil, as an app without the iCloud entitlement would on a device (Telegram's "emergency datacenter" lookup then never answers: it is a fallback for a failed connection).
+        static SEL s_dc, s_cwi; static Class cCK; static int off = -1;
+        if (!s_dc) { s_dc = sel_registerName("defaultContainer"); s_cwi = sel_registerName("containerWithIdentifier:"); cCK = objc_getClass("CKContainer"); off = getenv("REBAR_REAL_CLOUDKIT") != NULL; }
+        if ((sel == s_dc || sel == s_cwi) && cCK && self == (id)cCK && !off) { c->x[0] = 0; c->x[1] = 0; return; }
+    }
     { static SEL s_bfc; if (!s_bfc) s_bfc = sel_registerName("bundleForClass:"); if (sel == s_bfc && c->x[2] > 0x10000 && in_guest(c->x[2]) && guest_bundle_for_class(c, c->x[2])) return; }
     {   // +[NSBundle mainBundle] is the bundle of the guest program (the .app around g_exe_path). CoreFoundation normally derives it from CFProcessPath, but it keeps the first answer it
         // gave, and for VLC that was the folder of rebar (Sparkle then raised "This host has no CFBundleVersion" and the macosx interface did not start).
@@ -1072,6 +1078,7 @@ static void each_method(uint64_t list, MethodFn f, void *ctx) {
 }
 
 static void add_method_cb(const char *name, const char *types, uint64_t imp, void *ctx) {
+    { static const char *want = (const char *)1; if (want == (const char *)1) want = getenv("REBAR_OBJC_TRACE_METHOD"); if (want && strstr(name, want)) fprintf(stderr, "  [objc] add method %s [%s] imp %llx to %s\n", name, types, (unsigned long long)imp, class_getName((Class)ctx)); }
     class_replaceMethod((Class)ctx, sel_registerName(name), (IMP)imp_wrap(imp), types);
 }
 struct find_load { uint64_t imp; };
@@ -1122,6 +1129,12 @@ static void swift_class_ensure_ready(CPU *c, uint64_t cls) {
     const struct { uint32_t flags, istart, isize, res; uint64_t ivl, name, bm, bp, iv, wl, props, init; } *ro = (const void *)class_ro(g);
     if ((ro->flags & 0x40) && in_guest(ro->init)) call_guest(c, ro->init, cls, 0, 0, 0);   // RO_HAS_SWIFT_INITIALIZER: Class (*)(Class, void *)
     swift_class_ready(cls);
+}
+// UIApplicationMain looks the delegate (and the principal class) up by name in the host's runtime, which does not know a Swift class that is still waiting for the Swift runtime to set it
+// up (Telegram's AppDelegate: "No class named AppDelegate is loaded"). Every class of that kind is set up before the call; there are some hundreds at most.
+H(h_UIApplicationMain) {
+    for (int k = 0; k < g_nswift_deferred; k++) swift_class_ensure_ready(c, g_swift_deferred[k]);
+    host_call(c, HOSTFN("UIApplicationMain"), false);
 }
 static void register_class(GClass *c) {
     if (seen_test_and_set((uint64_t)c)) return;
@@ -1268,6 +1281,30 @@ static void swift_register_image(GImage *img) {
     if (reg_types && (s = find_text_section(img->mh, "__swift5_types")) && s->size) reg_types((void *)(s->addr + img->slide), (void *)(s->addr + img->slide + s->size));
 }
 
+// The properties a category declares are told to the runtime too: CALayer (QuartzCore) answers +resolveInstanceMethod: for a @dynamic property of the layer by looking the property up with class_getProperty,
+// and the accessors of ASDK's asyncdisplaykit_asyncLayerTransactions exist nowhere else ("unrecognized selector" without it).
+static void add_category_properties(Class cls, uint64_t list) {
+    if (!list || !cls) return;
+    uint32_t ef = *(uint32_t *)list, cnt = *(uint32_t *)(list + 4), entsize = ef & 0xfffc;
+    if (entsize < 16 || (ef & 0x80000000u)) return;
+    for (uint32_t k = 0; k < cnt && k < 1024; k++) {
+        uint64_t e = list + 8 + (uint64_t)k * entsize;
+        const char *name = *(const char **)e, *attrs = *(const char **)(e + 8);
+        if (!name || !attrs || (uint64_t)name < 0x10000) continue;
+        char buf[512]; snprintf(buf, sizeof buf, "%s", attrs);
+        objc_property_attribute_t at[24]; unsigned n = 0; bool q = false; char *p = buf;
+        while (*p && n < 24) {   // "T@\"NSHashTable\",&,D,N,S..." : the commas inside quotes belong to the type
+            char *start = p;
+            while (*p && (q || *p != ',')) { if (*p == '"') q = !q; p++; }
+            char save = *p; *p = 0;
+            if (*start) { static char vals[24][480]; static __thread int dummy; (void)dummy; at[n].name = strndup(start, 1); at[n].value = strdup(start + 1); n++; }
+            if (save) p++;
+        }
+        class_addProperty(cls, name, at, n);
+        for (unsigned j = 0; j < n; j++) { free((void *)at[j].name); free((void *)at[j].value); }
+    }
+}
+
 // Step 2b, after the classes of every image exist (a category may extend a class of another image).
 static void objc_attach_categories(GImage *img) {
     if (!img->objc_mapped) return;
@@ -1278,11 +1315,13 @@ static void objc_attach_categories(GImage *img) {
         for (uint64_t o = 0; o < s->size; o += 8) {
             GCat *cat = *(GCat **)(SA(s) + o);
             Class cls = (Class)cat->cls;
+            if (getenv("REBAR_OBJC_TRACE")) fprintf(stderr, "  [objc] category on %p %s\n", (void *)cls, cls ? class_getName(cls) : "(null)");
             if (class_dropped((uint64_t)cls)) continue;
             each_method(cat->instanceMethods, imp_register_cb, NULL);
             each_method(cat->classMethods, imp_register_cb, NULL);
             each_method(cat->instanceMethods, add_method_cb, cls);
             each_method(cat->classMethods, add_method_cb, object_getClass((id)cls));
+            add_category_properties(cls, cat->instanceProperties);
             if (cat->protocols) {   // the protocols the category adopts (J2ObjC's checks `[NSString conformsToProtocol:...]` after loading its categories)
                 const uint64_t *pl = (const uint64_t *)cat->protocols; uint64_t np = pl[0];
                 for (uint64_t k = 0; k < np && k < 64; k++) if (in_guest(pl[1 + k])) class_addProtocol(cls, (Protocol *)pl[1 + k]);

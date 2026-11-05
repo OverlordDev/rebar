@@ -92,6 +92,7 @@ static inline int64_t sext(uint64_t v, int bits) { return (int64_t)(v << (64 - b
 static bool g_no_simd_fast;  // REBAR_NO_SIMD_FAST: use only the general AdvSIMD code (to compare, or to bisect a bug)
 static void dump_backtrace(CPU *c);
 static jmp_buf *g_die_jmp;  // set by --simd-selftest, which runs encodings the interpreter may reject
+static __thread int t_tbi_step;   // a load or store with a tag in the top byte of its address faulted in translated code: the interpreter does that one (it masks the tag), see on_segv
 static __thread jmp_buf *t_fault_jb;   // where a guest memory fault, once its signal handler (the guest's own) has run, continues: the wrapper of run_until below
 static uint64_t g_guest_fault_handler[3];   // the guest's SIGSEGV, SIGBUS and SIGILL handlers (0: none), see h_sigaction
 static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr);
@@ -215,7 +216,10 @@ static void do_syscall(CPU *c) {
 
 // ---------------------------------------------------------------- interpreter
 
+// arm64 ignores the top byte of an address (TBI): Swift keeps flags there in the pointer to a bridged object and loads through it as it is
+#define TBI(a) ((a) & 0x00ffffffffffffffull)
 static uint64_t mem_ld(uint64_t a, int size) {
+    a = TBI(a);
     switch (size) {
     case 0: return *(volatile uint8_t *)a;   // (volatile: a load into the zero register is still made and faults on a bad address, which is how HotSpot's null checks and safepoint polls trap)
     case 1: return *(volatile uint16_t *)a;
@@ -224,6 +228,7 @@ static uint64_t mem_ld(uint64_t a, int size) {
     }
 }
 static void mem_st(uint64_t a, int size, uint64_t v) {
+    a = TBI(a);
     switch (size) {
     case 0: *(uint8_t *)a = (uint8_t)v; break;
     case 1: *(uint16_t *)a = (uint16_t)v; break;

@@ -1628,6 +1628,7 @@ static uint8_t *jit_compile_timed(uint64_t pc) {
 }
 // Called by the dispatcher at every control-flow join. True when translated code ran (c->pc has moved on).
 static inline bool jit_try(CPU *c, uint64_t *ticks) {
+    if (__builtin_expect(t_tbi_step, 0)) { t_tbi_step = 0; return false; }
     if (__builtin_expect(t_urg_pending, 0)) urg_deliver_pending(c);
     uint64_t pc = c->pc;
     JEnt *e = jit_probe(pc);
