@@ -126,7 +126,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; bool ffi_abi, ffi_closure; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -901,6 +901,10 @@ H(h_mmap) {  // (addr, len, prot, flags, fd, off)
     off_t off = (off_t)c->x[5];
     uint64_t len = (c->x[1] + GUEST_PAGE - 1) & ~(GUEST_PAGE - 1);
     void *r = mmap(P(0), len, prot, flags, fd, off);
+    if (r == MAP_FAILED && errno == EINVAL && fd >= 0 && !(flags & MAP_ANON)) {   // a POSIX shared memory object is rounded to the host's 4 KB pages, not to the 16 KB the arm64 guest assumes (multiprocessing.shared_memory maps 64 bytes): map what the object holds
+        uint64_t len4 = (c->x[1] + 4095) & ~4095ull;
+        if (len4 < len) { r = mmap(P(0), len4, prot, flags, fd, off); if (r != MAP_FAILED) len = len4; }
+    }
     if (r == MAP_FAILED && (flags & 0x800)) {  // MAP_JIT
         flags &= ~0x800;
         r = mmap(P(0), len, prot, flags, fd, off);
@@ -2355,7 +2359,7 @@ static uint8_t pathmask_for(const char *name) {   // bit k: argument k is a path
 static void stub_call_inner(CPU *c) {
     { static int chk = -1; if (chk < 0) chk = getenv("REBAR_CHECK_ALIGN") != NULL; if (chk && ((uintptr_t)__builtin_frame_address(0) & 15) != 0) { static int n; if (n++ < 6) fprintf(stderr, "[align] stub_call_inner frame %p misaligned (pc %llx, lr %llx)\n", __builtin_frame_address(0), (unsigned long long)c->pc, (unsigned long long)c->x[30]); } }
     if (c->pc - g_stub_base >= g_stub_size) {  // an x86 host function reached through a pointer
-        if (c->pc < 0x10000) die(c, "branch to invalid address", 0);
+        if (c->pc < 0x1000) die(c, "branch to invalid address", 0);   // (libffi's closure trampolines can sit low in the address space: executable host memory is accepted below)
         void *fn = (void *)c->pc;
         // (dladdr is slow, a few microseconds: the answer for a host function is remembered, per thread)
         static __thread struct { uint64_t fn; bool returns_string; const char *enc; bool swift; } t_hostfn_cache[256];
@@ -2364,7 +2368,12 @@ static void stub_call_inner(CPU *c) {
         if (t_hostfn_cache[hci].fn == c->pc) { fn_returns_string = t_hostfn_cache[hci].returns_string; fn_enc = t_hostfn_cache[hci].enc; fn_swift = t_hostfn_cache[hci].swift; }
         else {
             Dl_info di;
-            if (!dladdr(fn, &di)) {  // not inside any host image either: a stray pointer, report where it came from
+            bool host_exec = false;   // runtime-generated host code (libffi's closure trampolines, a host JIT): executable memory the guest does not own, in no image
+            if (!dladdr(fn, &di)) {
+                mach_vm_address_t ra = (mach_vm_address_t)fn; mach_vm_size_t rs = 0; vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t on = 0;
+                if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &on) == KERN_SUCCESS && ra <= (mach_vm_address_t)fn && (bi.protection & VM_PROT_EXECUTE) && !guest_owned_code((uint64_t)fn)) { host_exec = true; memset(&di, 0, sizeof di); }
+            }
+            if (!host_exec && !dladdr(fn, &di)) {  // not inside any host image either: a stray pointer, report where it came from
                 fprintf(stderr, "rebar: branch to 0x%llx, which is neither guest nor host code; x0=%llx x1=%llx x2=%llx x8=%llx x16=%llx x17=%llx\n",
                         (unsigned long long)c->pc, (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2],
                         (unsigned long long)c->x[8], (unsigned long long)c->x[16], (unsigned long long)c->x[17]);
@@ -2464,6 +2473,8 @@ static void stub_call_inner(CPU *c) {
     else if (s->host) {
         uint64_t addr_ptr = c->x[1], size = c->x[2];
         if (s->maps && ((uint32_t)c->x[4] & 1)) c->x[3] |= 0x3fff;  // VM_FLAGS_ANYWHERE: arm64 macOS places mappings on 16KB boundaries
+        if (s->ffi_abi && (uint32_t)c->x[1] == 1) c->x[1] = 2;
+        if (s->ffi_closure && c->x[0] < 128) c->x[0] = 128;
         if (s->txn_mask) for (int k = 0; k < 8; k++) if (((s->txn_mask >> k) & 1) && c->x[k] == 1) c->x[k] = 2;
         t_stk = s->stk; t_swift = s->swift; t_async_call = s->async_host && !g_no_async_tail; host_call(c, s->host, s->sret); t_stk = NULL;
         if (s->maps && (uint32_t)c->x[0] == 0 && !t_landed) own_add(*(uint64_t *)addr_ptr, size);  // vm_map & co.: the guest owns what came back
@@ -2682,6 +2693,8 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     g_stubs[idx].heapret = !strncmp(name, "_realpath", 9) || !strcmp(name, "_strdup") || !strcmp(name, "_strndup") || !strcmp(name, "_getcwd") ? 1 : (!strcmp(name, "_asprintf") || !strcmp(name, "_vasprintf") ? 2 : 0);   // host functions that return memory from the system's malloc (see heapret_fix)
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;
     if (host && !h) g_stubs[idx].swift = (name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S')) || !strcmp(name, "_swift_getAtKeyPath") || !strcmp(name, "_swift_setAtWritableKeyPath") || !strcmp(name, "_swift_modifyAtWritableKeyPath") || !strcmp(name, "_swift_getAtAnyKeyPath") || !strcmp(name, "_swift_getAtPartialKeyPath");   // a Swift symbol: Swift's calling convention (also the key path runtime functions: swiftcc with an indirect result in x8)
+    if (host && !h) g_stubs[idx].ffi_closure = !strcmp(name, "_ffi_closure_alloc");   // the caller sizes the closure by the arm64 ffi_closure (40 bytes); the x86_64 libffi keeps its trampoline table and entry after its own, larger fields
+    if (host && !h) g_stubs[idx].ffi_abi = !strcmp(name, "_ffi_prep_cif") || !strcmp(name, "_ffi_prep_cif_var");   // an arm64 libffi caller passes FFI_DEFAULT_ABI (FFI_SYSV = 1); the host libffi is the x86_64 one, where 1 is no ABI (FFI_UNIX64 = 2 is the default)
     if (host && !h && g_stubs[idx].swift) { g_stubs[idx].txn_mask = transaction_arg_mask(name); if (g_stubs[idx].txn_mask && g_trace_stubs) fprintf(stderr, "[stub] %s: Transaction? arguments %02x\n", name, g_stubs[idx].txn_mask); }
     if (host && !h) g_stubs[idx].maps = !strcmp(name, "_vm_map") || !strcmp(name, "_mach_vm_map") || !strcmp(name, "_vm_remap") || !strcmp(name, "_mach_vm_remap");
     if (host && !h) {

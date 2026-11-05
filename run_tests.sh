@@ -187,6 +187,10 @@ for src in fw_*.swift; do
     else echo "SKIP $fwn (no swiftc?)"; fi
 done
 
+# libc++ (C++20) in one program: streams, filesystem, regex, threads, futures, ranges, format, locale, containers
+for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x cpp_stdlib_$a ] && [ cpp_stdlib_$a -nt cpp_stdlib.cpp ] || clang++ -std=c++20 -O1 -arch $ar cpp_stdlib.cpp -o cpp_stdlib_$a 2>/dev/null; done
+run_to 60 $T/a ./cpp_stdlib_x86; run_to 120 $T/b $R cpp_stdlib_arm; grep -v '^nvrm' $T/b > $T/b2; check cpp_stdlib $T/a $T/b2
+
 printf '8e4da1bc9fdc589d01010101c6c6c6c6\nroundtrip ok\n' > $T/a; run_to 30 $T/b $R t92_arm; grep -v '^nvrm' $T/b > $T/b2; check t92_aesmc_rd $T/a $T/b2
 run_to 30 $T/a ./t93_x86; run_to 30 $T/b $R t93_arm; grep -v '^nvrm' $T/b > $T/b2; check t93_environ_live $T/a $T/b2
 [ -x t94_arm ] || clang -arch arm64 -o t94_arm t94_pagesize.c; printf 'same 1\npages fit in memory 1\n' > $T/a; run_to 30 $T/b $R t94_arm; grep -v '^nvrm' $T/b > $T/b2; check t94_pagesize $T/a $T/b2
@@ -202,6 +206,10 @@ hbcheck brew_sqlite 42 sqlite3 :memory: "select 6*7"
 hbcheck brew_lua 42 lua -e 'print(6*7)'
 [ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
 hbcheck brew_tmux "tmux 3.8" tmux -V
+hbcheck brew_python_ctypes "ctypes 5 [1, 2, 3, 4, 5] 1024.0 42 42-x" python3.13 ctypes_basic.py
+# libffi closures from a C program (the host libffi is x86_64: the arm64 ABI constant and the closure size are translated)
+for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x ffi_closure_$a ] && [ ffi_closure_$a -nt ffi_closure.c ] || clang -arch $ar ffi_closure.c -lffi -lm -o ffi_closure_$a 2>/dev/null; done
+run_to 30 $T/a ./ffi_closure_x86; run_to 60 $T/b $R ffi_closure_arm; grep -v '^nvrm' $T/b > $T/b2; check ffi_closure $T/a $T/b2
 
 # iOS apps from IPAs (tools/ipa.py): iOS-platform arm64 programs packed as .ipa; the UIKit and SwiftUI ones run with rebar-ios from a generated Mac Catalyst host bundle (needs a window server session)
 iosipa() {  # name, source, expected-output-file, swiftc|clang, extra args to the compiler; the app is IosApp, family iPhone, runs 60 s at most
