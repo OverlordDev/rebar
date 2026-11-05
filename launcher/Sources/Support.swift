@@ -48,6 +48,9 @@ enum Proc {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["-axww", "-o", "pid=,pgid=,command="]
+        // (a launcher opened from the Dock has no locale, and ps then writes every non-ASCII byte of a command line as "M-PM^]": a program in a folder with a Cyrillic or accented name was
+        // never found by its path, taken for something an app had left behind and killed a second after it started)
+        p.environment = ["LC_ALL": "en_US.UTF-8", "PATH": "/usr/bin:/bin"]
         let pipe = Pipe()
         p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
         do { try p.run() } catch { return [] }
