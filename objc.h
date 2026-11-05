@@ -167,8 +167,14 @@ static void marshal_call(CPU *c, void *fn, const char *enc, const char *name, bo
             if (t.size <= 16) for (int k = 0; k < t.hfa; k++) PUT_DBL(arm_vec(&a, 8));
             else for (int k = 0; k < t.hfa; k++) stack[ns++] = arm_vec(&a, 8);  // memory class on x86
         } else if (t.hfa && t.hfa_t == 'f') {
-            fprintf(stderr, "rebar: %s passes a float aggregate by value (not forwardable yet)\n", name);
-            exit(127);
+            // arm64: one float per v register (the whole aggregate on the stack when they do not all fit); SysV: two floats per xmm
+            int n = t.hfa; float f[4] = {0, 0, 0, 0};
+            if (a.nv + n <= 8) for (int k = 0; k < n; k++) f[k] = c->vr[a.nv++].f[0];
+            else { a.nv = 8; a.gs = (a.gs + 7) & ~(uint64_t)7; memcpy(f, (void *)a.gs, (size_t)n * 4); a.gs += ((size_t)n * 4 + 7) & ~(size_t)7; }
+            int words = (n + 1) / 2; uint64_t w[2] = {0, 0};
+            for (int k = 0; k < n; k++) { uint32_t b; memcpy(&b, &f[k], 4); w[k / 2] |= (uint64_t)b << (32 * (k % 2)); }
+            if (iv + words <= 8) for (int k = 0; k < words; k++) dbls[iv++] = w[k];
+            else for (int k = 0; k < words; k++) stack[ns++] = w[k];
         } else if (t.size <= 16) {
             int words = (t.size + 7) / 8;
             uint64_t w[2] = {0, 0};
@@ -757,6 +763,66 @@ static bool try_open_arm64_app(CPU *c, id self, SEL sel) {
     uint64_t blk = c->x[4]; if (blk && in_guest(*(uint64_t *)(blk + 16))) call_guest(c, *(uint64_t *)(blk + 16), blk, (uint64_t)running, (uint64_t)err, 0);   // completionHandler(app, error)
     c->x[0] = 0; return true;
 }
+// The fast path of objc_msgSend. Most sends of a graphics program (a Metal encoder: setVertexBuffer:, setFragmentTexture:, drawPrimitives: ...) need none of the work the handler below does for the
+// few selectors with special treatment, and the handler takes the bridge lock three times per send (to enter, around the method lookup and again after the host call): with sixteen threads
+// encoding at once that lock was most of the time of a send. A send that went through the whole handler once and ended in a plain host call is remembered by (class, selector, implementation)
+// in a table that is read without the lock; a repeat is checked against the current implementation and made without taking the lock. REBAR_NO_MSGFAST=1 turns it off.
+static int g_msgfast = -1;
+typedef struct { uint32_t seq; uint32_t rsize; uint64_t cls, sel, imp; char rkind; } MsgFast;
+#define MSGFAST_SLOTS 8192
+static MsgFast g_msgfast_tab[MSGFAST_SLOTS];
+static bool msg_special_sel(SEL sel) {
+    static SEL sp[40]; static int n;
+    if (!n) {
+        static const char *names[] = {"stringWithFormat:", "predicateWithFormat:", "raise:format:", "initWithFormat:", "appendFormat:", "stringByAppendingFormat:", "initWithFormat:arguments:", "predicateWithFormat:arguments:",
+            "initWithFormat:locale:arguments:", "arrayWithObjects:", "dictionaryWithObjectsAndKeys:", "handleFailureInFunction:file:lineNumber:description:", "handleFailureInMethod:object:file:lineNumber:description:",
+            "initWithColorsAndLocations:", "initWithObjects:", "initWithObjectsAndKeys:", "orderedSetWithObjects:", "setWithObjects:", "commit", "set", "setLayer:", "bundleForClass:", "mainBundle", "launch",
+            "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", NULL};
+        int k = 0; for (; names[k] && k < 40; k++) sp[k] = sel_registerName(names[k]);
+        __atomic_store_n(&n, k, __ATOMIC_RELEASE);
+    }
+    int cnt = __atomic_load_n(&n, __ATOMIC_ACQUIRE);
+    for (int k = 0; k < cnt; k++) if (sp[k] == sel) return true;
+    return false;
+}
+static inline unsigned msgfast_slot(uint64_t cls, uint64_t sel) { return (unsigned)(((cls >> 4) * 0x9e3779b97f4a7c15ull ^ (sel >> 2) * 0xc2b2ae3d27d4eb4full) >> 40) & (MSGFAST_SLOTS - 1); }
+static void msgfast_insert(Class cls, SEL sel, IMP imp, const Enc *r) {   // (called with the bridge lock held: one writer)
+    for (int k = 0; k < 2; k++) {
+        MsgFast *e = &g_msgfast_tab[(msgfast_slot((uint64_t)cls, (uint64_t)sel) + (unsigned)k) & (MSGFAST_SLOTS - 1)];
+        if (e->cls && (e->cls != (uint64_t)cls || e->sel != (uint64_t)sel) && k == 0) continue;
+        __atomic_store_n(&e->seq, e->seq | 1, __ATOMIC_RELEASE);
+        e->cls = (uint64_t)cls; e->sel = (uint64_t)sel; e->imp = (uint64_t)imp; e->rkind = r->kind; e->rsize = (uint32_t)r->size;
+        __atomic_store_n(&e->seq, (e->seq | 1) + 1, __ATOMIC_RELEASE);
+        return;
+    }
+    MsgFast *e = &g_msgfast_tab[msgfast_slot((uint64_t)cls, (uint64_t)sel)];   // both slots taken: replace the first
+    __atomic_store_n(&e->seq, e->seq | 1, __ATOMIC_RELEASE);
+    e->cls = (uint64_t)cls; e->sel = (uint64_t)sel; e->imp = (uint64_t)imp; e->rkind = r->kind; e->rsize = (uint32_t)r->size;
+    __atomic_store_n(&e->seq, (e->seq | 1) + 1, __ATOMIC_RELEASE);
+}
+static bool msgsend_fast(CPU *c) {
+    if (__builtin_expect(g_msgfast <= 0, 0)) { if (g_msgfast < 0) g_msgfast = getenv("REBAR_NO_MSGFAST") ? 0 : 1; if (!g_msgfast) return false; }
+    id self = (id)c->x[0]; SEL sel = (SEL)c->x[1];
+    if (__builtin_expect(!self || (uint64_t)sel < 0x10000 || g_gpu_sync || g_dump_layers || g_trace_msg || g_trace || g_nswift_deferred, 0)) return false;
+    Class cls = object_getClass(self);
+    MsgFast snap; bool hit = false;
+    for (int k = 0; k < 2 && !hit; k++) {
+        const MsgFast *e = &g_msgfast_tab[(msgfast_slot((uint64_t)cls, (uint64_t)sel) + (unsigned)k) & (MSGFAST_SLOTS - 1)];
+        uint32_t s1 = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+        if (s1 & 1) continue;
+        snap.cls = e->cls; snap.sel = e->sel; snap.imp = e->imp; snap.rkind = e->rkind; snap.rsize = e->rsize;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1) continue;
+        hit = snap.cls == (uint64_t)cls && snap.sel == (uint64_t)sel;
+    }
+    if (!hit) return false;
+    if ((uint64_t)class_getMethodImplementation(cls, sel) != snap.imp) return false;   // (replaced since: the full path decides again)
+    Enc r = {0}; r.kind = snap.rkind; r.size = (int)snap.rsize;
+    c->pc = c->x[30];
+    host_call(c, p_msgSend, false);
+    normalize_return(c, &r);
+    return true;
+}
 H(h_objc_msgSend) {
     id self = (id)c->x[0];
     SEL sel = (SEL)c->x[1];
@@ -835,6 +901,13 @@ H(h_objc_msgSend) {
             c->x[0] = r0;
             return;
         }
+    }
+    if (g_msgfast != 0 && !msg_special_sel(sel)) {   // a plain send to a host method that returns no structure: the next one can skip the bridge lock (see msgsend_fast)
+        Method m = class_getInstanceMethod(cls, sel);
+        const char *e = m ? method_getTypeEncoding(m) : NULL;
+        Enc r = {0};
+        if (e) enc_parse(e, &r);
+        if (m && e && !strchr(e, '{') && !g_trace_stubs) msgfast_insert(cls, sel, imp_raw, &r);
     }
     send_host(c, cls, sel);
 }

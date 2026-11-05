@@ -1403,10 +1403,21 @@ static CPU *g_prof_cpus[1024];
 static int g_prof_ncpu;
 static const char *g_prof_file;
 static struct { uint64_t key, n; } g_prof_pc[PROF_SLOTS], g_prof_op[PROF_SLOTS], g_prof_stub[4096];
+// REBAR_PROFILE_THREADS=1: besides the totals, the sampler keeps a short table per guest thread (name, CPU use as the kernel counts it,
+// the pcs and imports it is busy in), so a thread that waits can be told from one that works
+#include <mach/thread_info.h>
+typedef struct { uint64_t busy, idle; struct { uint64_t key, n; } pc[512], stub[128]; } ProfThr;
+static int g_prof_threads;
+static mach_port_t g_prof_mach[1024];
+static ProfThr *g_prof_thr[1024];
 static void prof_register(CPU *c) {
     if (!g_prof_file) return;
     int k = __atomic_fetch_add(&g_prof_ncpu, 1, __ATOMIC_RELAXED);
-    if (k < 1024) g_prof_cpus[k] = c;
+    if (k < 1024) { g_prof_mach[k] = mach_thread_self(); g_prof_cpus[k] = c; }
+}
+static void prof_thr_count(typeof(((ProfThr *)0)->pc) tab, int slots, uint64_t key) {
+    unsigned h = (unsigned)((key * 0x9e3779b97f4a7c15ull) >> 52) & (unsigned)(slots - 1);
+    for (int q = 0; q < 16; q++) { unsigned j = (h + q) & (unsigned)(slots - 1); if (!tab[j].key) tab[j].key = key; if (tab[j].key == key) { tab[j].n++; return; } }
 }
 static void prof_count(typeof(g_prof_pc) *tab, uint64_t key) {
     unsigned h = (unsigned)((key * 0x9e3779b97f4a7c15ull) >> 48);
@@ -1441,6 +1452,28 @@ static void prof_dump(uint64_t total, uint64_t idle, uint64_t outside) {
         qsort(rows, n, sizeof rows[0], prof_cmp);
         for (int k = 0; k < n && k < 60; k++) fprintf(f, "stub %s %llu\n", prof_stub_name((int)rows[k][0]), (unsigned long long)rows[k][1]);
     }
+    if (g_prof_threads) {
+        int n = __atomic_load_n(&g_prof_ncpu, __ATOMIC_ACQUIRE); if (n > 1024) n = 1024;
+        int order[1024], m = 0;
+        for (int k = 0; k < n; k++) if (g_prof_thr[k] && g_prof_thr[k]->busy) order[m++] = k;
+        for (int i = 0; i < m; i++) for (int j = i + 1; j < m; j++) if (g_prof_thr[order[j]]->busy > g_prof_thr[order[i]]->busy) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+        for (int i = 0; i < m && i < 16; i++) {
+            int k = order[i]; ProfThr *p = g_prof_thr[k];
+            thread_extended_info_data_t ti; mach_msg_type_number_t cnt = THREAD_EXTENDED_INFO_COUNT; char nm[64] = "";
+            if (thread_info(g_prof_mach[k], THREAD_EXTENDED_INFO, (thread_info_t)&ti, &cnt) == KERN_SUCCESS) snprintf(nm, sizeof nm, "%s", ti.pth_name); else ti.pth_cpu_usage = 0;
+            fprintf(f, "thread %d \"%s\" kernel-cpu %d.%d%% busy %llu idle %llu\n", k, nm, ti.pth_cpu_usage / 10, ti.pth_cpu_usage % 10, (unsigned long long)p->busy, (unsigned long long)p->idle);
+            static uint64_t r2[512][2];
+            for (int t = 0; t < 2; t++) {
+                int slots = t ? 128 : 512, q = 0;
+                for (int j = 0; j < slots; j++) if ((t ? p->stub : p->pc)[j].n) r2[q][0] = (t ? p->stub : p->pc)[j].key, r2[q++][1] = (t ? p->stub : p->pc)[j].n;
+                qsort(r2, q, sizeof r2[0], prof_cmp);
+                for (int j = 0; j < q && j < (t ? 5 : 8); j++) {
+                    if (t) fprintf(f, "  stub %s %llu\n", prof_stub_name((int)r2[j][0]), (unsigned long long)r2[j][1]);
+                    else fprintf(f, "  pc %llx %llu\n", (unsigned long long)r2[j][0], (unsigned long long)r2[j][1]);
+                }
+            }
+        }
+    }
     fclose(f);
     rename(tmp, name);
 }
@@ -1462,8 +1495,14 @@ static void *prof_thread(void *arg) {
             uint64_t tick = c->tick, pc = c->pc;
             uint64_t moved = tick - last[k];
             last[k] = tick;
-            if (moved < 2000) { idle++; continue; }  // (a thread that wakes up for a few instructions every millisecond is not busy)
+            ProfThr *pt = NULL;
+            if (g_prof_threads && k < 1024) {
+                if (!g_prof_thr[k]) { void *m = mmap(NULL, sizeof(ProfThr), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (m != MAP_FAILED) g_prof_thr[k] = m; }
+                pt = g_prof_thr[k];
+            }
+            if (moved < 2000) { idle++; if (pt) pt->idle++; continue; }  // (a thread that wakes up for a few instructions every millisecond is not busy)
             total++;
+            if (pt) { pt->busy++; if (pc - g_stub_base < g_stub_size) prof_thr_count(pt->stub, 128, (pc - g_stub_base) / 16 + 1); else prof_thr_count(pt->pc, 512, pc); }
             if (pc - g_guest_lo >= g_guest_size) {
                 outside++;
                 if (pc - g_stub_base < g_stub_size) {  // inside a call to an imported function
@@ -1486,6 +1525,7 @@ static void *prof_thread(void *arg) {
             if (stat(ctl, &st) == 0 && st.st_mtime != reset_seen) {
                 reset_seen = st.st_mtime;
                 memset(g_prof_pc, 0, sizeof g_prof_pc); memset(g_prof_op, 0, sizeof g_prof_op); memset(g_prof_stub, 0, sizeof g_prof_stub);
+                for (int q = 0; q < 1024; q++) if (g_prof_thr[q]) memset(g_prof_thr[q], 0, sizeof(ProfThr));
                 total = idle = outside = 0;
             }
         }
@@ -1495,6 +1535,7 @@ static void *prof_thread(void *arg) {
 }
 static void prof_start(const char *file) {
     g_prof_file = file;
+    g_prof_threads = getenv("REBAR_PROFILE_THREADS") != NULL;
     pthread_t th;
     pthread_create(&th, NULL, prof_thread, NULL);
     pthread_detach(th);
@@ -1757,6 +1798,8 @@ static void ios_prepare(void) {
 
 int main(int argc, char **argv) {
     int ai = 1;
+    // REBAR_HUD=1: Apple's Metal performance HUD (frames per second, frame time, GPU time, memory) over the program's Metal windows; Metal reads MTL_HUD_ENABLED when the process starts
+    if (getenv("REBAR_HUD") && strcmp(getenv("REBAR_HUD"), "0")) setenv("MTL_HUD_ENABLED", "1", 1);
     // libmalloc's nano zone (the default for small blocks) aborts a guest that runs Chromium or Node ("Non-aligned pointer being freed (2)" while Foundation's
     // path cache rehashes); the cause is not found yet. The zone is chosen when the process starts, so rebar starts itself once more with it off. (The shell
     // the tests run in has it off already, because Electron apps set it for everything they start; a launcher opened from the Dock has not.)
@@ -1852,6 +1895,7 @@ int main(int argc, char **argv) {
     if (getenv("REBAR_OPSTATS")) { pthread_t ot; pthread_create(&ot, NULL, opstats_thread, NULL); pthread_detach(ot); }
 #endif
     g_sp_caller = getenv("REBAR_STUBPROF_CALLER");
+    g_jittime = getenv("REBAR_JITTIME") != NULL;
     if (getenv("REBAR_SLOW_STUB")) { g_slow_ms = atoi(getenv("REBAR_SLOW_STUB")); clock_gettime(CLOCK_MONOTONIC, &g_slow_t0); }
     if (getenv("REBAR_STUBPROF")) stubprof_start(getenv("REBAR_STUBPROF"));
     crypto_init();  // the AES/CRC tables, before there are threads

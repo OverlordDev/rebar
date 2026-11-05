@@ -15,8 +15,8 @@
 
 #include <stddef.h>
 
-#define JIT_ARENA (768ull << 20)
-#define JIT_TAB_BITS 20
+#define JIT_ARENA (1920ull << 20)   // (blocks chain by rel32 jumps and reach the indirect-branch cells by rip-relative displacements: the arena has to stay under 2 GB; a game such as Cyberpunk 2077 fills 768 MB and the rest of its code ran in the interpreter)
+#define JIT_TAB_BITS 22
 #define JIT_IC_BITS 20
 #define JIT_HOT_BITS 20
 #define JIT_PEND_BITS 14
@@ -65,6 +65,8 @@ static uint32_t g_jit_offs[64];   // REBAR_JITDUMP: where in the block's host co
 static uint64_t *g_jit_cnt; static uint64_t g_jit_fbdyn[1 << 12];
 static bool jit_leaf_import(uint64_t target, void **fn, int *nargs, int *zext8);   // bridge.h: an import that translated code may call directly
 static bool g_jit_noleaf;       // REBAR_JIT_NOLEAF=1: every import goes through the dispatcher
+static int g_jittime;
+static uint64_t g_ji_ns, g_ji_maxns;
 static uint64_t g_ji_calls, g_ji_killed, g_ji_pages;   // REBAR_JITCOUNT: jit_invalidate calls, blocks they dropped
 static int g_ind_kind;   // 0 BR, 1 BLR, 2 RET: what emit_indirect is emitting (for the counters)
 static uint64_t g_jr_indk[3], g_jr_missk[3];
@@ -320,7 +322,7 @@ static inline unsigned jit_hash(uint64_t pc) { return (unsigned)((pc >> 2) * 0x9
 // Authoritative lookup; safe against a concurrent insert (an entry is published by writing its code before its pc).
 static inline JEnt *jit_probe(uint64_t pc) {
     unsigned h = jit_hash(pc);
-    for (int k = 0; k < 64; k++) {
+    for (int k = 0; k < 4096; k++) {   // (as far as jit_insert goes: a block placed beyond the end of a shorter search was compiled again at every visit)
         JEnt *e = &g_jit_tab[(h + k) & ((1 << JIT_TAB_BITS) - 1)];
         uint64_t p = __atomic_load_n(&e->pc, __ATOMIC_ACQUIRE);
         if (p == pc) return e;
@@ -1458,6 +1460,7 @@ static uint64_t g_jc_main_compiles, g_jc_bg_compiles;   // blocks translated by 
 static __thread bool t_jc_bg;
 static void vc_end_insn(JC *j);
 static uint8_t *jit_compile(uint64_t pc) {
+    if (__builtin_expect(g_jit_end - g_jit_top < 65536, 0)) return NULL;   // the arena is full: the rest of the program is interpreted (and no thread queues up for the translator lock to learn that)
     if (t_jit_busy) return NULL;   // a guest signal handler that interrupted this thread inside the translator: interpret, do not wait for the lock this thread holds
     t_jit_busy = true; pthread_mutex_lock(&g_jit_mu);   // (the flag first: a signal handler that interrupts the thread right after it has the lock must not try to take it again)
     JEnt *ex = jit_probe(pc);
@@ -1558,6 +1561,7 @@ static void jit_invalidate(uint64_t lo, uint64_t hi) {
         if (t_jit_npend < 8) { t_jit_pend[t_jit_npend].lo = lo; t_jit_pend[t_jit_npend].hi = hi; t_jit_npend++; } else { t_jit_pend[7].lo = 0; t_jit_pend[7].hi = ~0ull; }
         return;
     }
+    struct timespec ji_t0; if (__builtin_expect(g_jittime, 0)) clock_gettime(CLOCK_MONOTONIC, &ji_t0);
     t_jit_busy = true; pthread_mutex_lock(&g_jit_mu);
     g_ji_calls++;
     // a huge range (a reservation of gigabytes) is cheaper to answer by looking at every bucket than at every page in it
@@ -1585,6 +1589,13 @@ static void jit_invalidate(uint64_t lo, uint64_t hi) {
         }
     }
     t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu);
+    if (__builtin_expect(g_jittime, 0)) {
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t ns = (uint64_t)((t1.tv_sec - ji_t0.tv_sec) * 1000000000ll + (t1.tv_nsec - ji_t0.tv_nsec));
+        __atomic_add_fetch(&g_ji_ns, ns, __ATOMIC_RELAXED);
+        uint64_t mx = __atomic_load_n(&g_ji_maxns, __ATOMIC_RELAXED); while (ns > mx && !__atomic_compare_exchange_n(&g_ji_maxns, &mx, ns, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        if (ns > 5000000) fprintf(stderr, "[jit] invalidate %llx-%llx took %.1f ms (%llu bytes)\n", (unsigned long long)lo, (unsigned long long)hi, (double)ns / 1e6, (unsigned long long)(hi - lo));
+    }
     if (t_jit_npend) jit_run_pending();
 }
 
@@ -1596,6 +1607,25 @@ static inline int jit_run(CPU *c, uint8_t *code) {
     return left < 0 ? JIT_BUDGET : JIT_BUDGET - left;
 }
 
+// REBAR_JITTIME=1: once a second, how many blocks the translator compiled and how long it took (all threads together), for hunting stalls where new code is first run
+static uint64_t g_jt_ns, g_jt_n, g_jt_last;
+static uint8_t *jit_compile_timed(uint64_t pc) {
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    uint8_t *code = jit_compile(pc);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    __atomic_add_fetch(&g_jt_ns, (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_jt_n, 1, __ATOMIC_RELAXED);
+    uint64_t now = (uint64_t)b.tv_sec * 1000 + (uint64_t)b.tv_nsec / 1000000, last = __atomic_load_n(&g_jt_last, __ATOMIC_RELAXED);
+    if (now - last >= 1000 && __atomic_compare_exchange_n(&g_jt_last, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        uint64_t ns = __atomic_exchange_n(&g_jt_ns, 0, __ATOMIC_RELAXED), n = __atomic_exchange_n(&g_jt_n, 0, __ATOMIC_RELAXED);
+        static uint64_t lc, lk;
+        uint64_t c2 = g_ji_calls, k2 = g_ji_killed, ins = __atomic_exchange_n(&g_ji_ns, 0, __ATOMIC_RELAXED), mxi = __atomic_exchange_n(&g_ji_maxns, 0, __ATOMIC_RELAXED);
+        if (last) fprintf(stderr, "[jit] %llu blocks compiled, %.1f ms in the translator; %llu invalidations dropped %llu blocks, %.1f ms (longest %.1f ms) (last second, all threads)\n", (unsigned long long)n, (double)ns / 1e6,
+                          (unsigned long long)(c2 - lc), (unsigned long long)(k2 - lk), (double)ins / 1e6, (double)mxi / 1e6);
+        lc = c2; lk = k2;
+    }
+    return code;
+}
 // Called by the dispatcher at every control-flow join. True when translated code ran (c->pc has moved on).
 static inline bool jit_try(CPU *c, uint64_t *ticks) {
     if (__builtin_expect(t_urg_pending, 0)) urg_deliver_pending(c);
@@ -1607,7 +1637,7 @@ static inline bool jit_try(CPU *c, uint64_t *ticks) {
         if (__builtin_expect(g_jit_count, 0)) g_jr_cold++;
         unsigned h = (unsigned)(((pc >> 2) * 0x9E3779B97F4A7C15ull) >> (64 - JIT_HOT_BITS));
         if (g_jit_hot[h] < g_jit_threshold) { g_jit_hot[h]++; return false; }
-        code = jit_compile(pc);
+        if (__builtin_expect(g_jittime, 0)) code = jit_compile_timed(pc); else code = jit_compile(pc);
         if (!code) return false;
     }
     jit_ic_set(pc, code);

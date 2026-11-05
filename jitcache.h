@@ -389,7 +389,7 @@ static void *jc_thread(void *arg) {
             if (li == -2) { g_jce_done[k] = 1; continue; }
             if (li < 0) continue;   // its image is not loaded yet: a later kick
             g_jce_done[k] = 1;
-            if ((size_t)(g_jit_top - g_jit_arena) > JIT_ARENA * 4 / 10) return NULL;   // enough pre-translated code: the arena is for what the program does next
+            if ((size_t)(g_jit_top - g_jit_arena) > (320ull << 20)) return NULL;   // enough pre-translated code: the arena is for what the program does next
             uint64_t pc = g_images[li]->base + g_jce[k].off;
             if (pc >= g_images[li]->end) continue;
             JEnt *e = jit_probe(pc);   // (a racy peek: jit_compile looks again under the lock)

@@ -26,6 +26,7 @@ struct AppSettings: Codable, Equatable {
     var jit = true            // rebar's translator; off = plain interpreter (slow, for troubleshooting)
     var args = ""             // extra command-line arguments
     var env = ""              // extra environment variables, one NAME=value per line
+    var hud = false           // Apple's Metal performance HUD (frames per second, frame time, GPU time, memory) over the program's Metal windows (REBAR_HUD=1)
     var fastEditor = true     // VS Code and its relatives: editor settings that make scrolling cheaper, 60 fps instead of 50 (see FastEditor); on by default, off in the app's settings
 
     init() {}
@@ -38,8 +39,9 @@ struct AppSettings: Codable, Equatable {
         args = try c.decodeIfPresent(String.self, forKey: .args) ?? ""
         env = try c.decodeIfPresent(String.self, forKey: .env) ?? ""
         fastEditor = try c.decodeIfPresent(Bool.self, forKey: .fastEditor) ?? true
+        hud = try c.decodeIfPresent(Bool.self, forKey: .hud) ?? false
     }
-    private enum Keys: String, CodingKey { case gpu, noSandbox, mockKeychain, jit, args, env, fastEditor }
+    private enum Keys: String, CodingKey { case gpu, noSandbox, mockKeychain, jit, args, env, fastEditor, hud }
 }
 
 private struct StoreFile: Codable {
@@ -291,6 +293,7 @@ final class Launcher: NSObject, ObservableObject {
         env["MallocNanoZone"] = "0"
         if s.gpu { env["ANGLE_FEATURE_OVERRIDES_DISABLED"] = "disableMetalOnNvidia" }
         if !s.jit { env["REBAR_JIT"] = "0" }
+        if s.hud { env["REBAR_HUD"] = "1" }
         for line in s.env.split(separator: "\n") {
             guard let eq = line.firstIndex(of: "="), eq != line.startIndex else { continue }
             env[String(line[..<eq]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: eq)...])

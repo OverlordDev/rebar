@@ -1182,6 +1182,7 @@ H(h_semctl)  { RET(semctl((int)c->x[0], (int)c->x[1], (int)c->x[2], *(uint64_t *
 H(h_shm_open) { RET(shm_open(S(0), (int)c->x[1], (mode_t)*(uint64_t *)c->sp)); }
 H(h_sem_open) { RET((uint64_t)sem_open(S(0), (int)c->x[1], (mode_t)((uint64_t *)c->sp)[0], (unsigned)((uint64_t *)c->sp)[1])); }
 H(h_syslog)  { VA_INIT(ap, c->sp); vsyslog((int)c->x[0], S(1), ap); c->x[0] = 0; }
+H(h_vsyslog) { VA_INIT(ap, c->x[2]); vsyslog((int)c->x[0], S(1), ap); c->x[0] = 0; }
 static void exec_list(CPU *c, bool search, bool with_env) {   // execl / execlp / execle: arg0 in x1, the rest of the list on the stack, up to a NULL (and then the environment for execle)
     char *argv[64]; int n = 0; argv[n++] = (char *)c->x[1];
     const uint64_t *st = (const uint64_t *)c->sp;
@@ -1493,7 +1494,7 @@ static const Special k_special[] = {
     {"_SSLGetEnabledCiphers", h_SSLGetEnabledCiphers}, {"_SSLGetSupportedCiphers", h_SSLGetSupportedCiphers}, {"_SSLSetEnabledCiphers", h_SSLSetEnabledCiphers}, {"_SSLGetNegotiatedCipher", h_SSLGetNegotiatedCipher}, {"_munmap", h_munmap}, {"_mprotect", h_mprotect}, {"_madvise", h_madvise},
     {"_vm_protect", h_vm_protect}, {"_mach_vm_protect", h_vm_protect}, {"_vm_allocate", h_vm_allocate},
     {"_mach_vm_allocate", h_vm_allocate}, {"_vm_deallocate", h_vm_deallocate}, {"_mach_vm_deallocate", h_vm_deallocate},
-    {"_vfork", h_vfork}, {"_objc_claimAutoreleasedReturnValue", h_objc_claimAutoreleasedReturnValue}, {"_objc_autoreleaseReturnValue", h_objc_autoreleaseReturnValue}, {"_objc_retainAutoreleasedReturnValue", h_objc_retainAutoreleasedReturnValue}, {"_objc_unsafeClaimAutoreleasedReturnValue", h_objc_unsafeClaimAutoreleasedReturnValue}, {"_uname", h_uname}, {"_thread_get_state", h_thread_get_state}, {"_thread_set_state", h_thread_set_state}, {"_thread_resume", h_thread_resume}, {"_posix_spawnattr_setbinpref_np", h_posix_spawnattr_setbinpref_np}, {"_SSLSetIOFuncs", h_SSLSetIOFuncs}, {"_SecItemAdd", h_SecItemAdd}, {"_SecItemCopyMatching", h_SecItemCopyMatching}, {"_SecItemUpdate", h_SecItemUpdate}, {"_SecItemDelete", h_SecItemDelete}, {"_CGGetActiveDisplayList", h_CGGetActiveDisplayList}, {"_CVDisplayLinkCreateWithActiveCGDisplays", h_CVDisplayLinkCreateWithActiveCGDisplays}, {"_CGDisplayIsActive", h_CGDisplayIsActive}, {"_unw_getcontext", h_unw_getcontext}, {"_unw_init_local", h_unw_init_local}, {"_unw_step", h_unw_step}, {"_unw_get_reg", h_unw_get_reg}, {"_unw_set_reg", h_unw_set_reg}, {"_unw_get_fpreg", h_unw_get_fpreg}, {"_unw_set_fpreg", h_unw_set_fpreg}, {"_unw_is_signal_frame", h_unw_is_signal_frame}, {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_syslog$DARWIN_EXTSN", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
+    {"_vfork", h_vfork}, {"_objc_claimAutoreleasedReturnValue", h_objc_claimAutoreleasedReturnValue}, {"_objc_autoreleaseReturnValue", h_objc_autoreleaseReturnValue}, {"_objc_retainAutoreleasedReturnValue", h_objc_retainAutoreleasedReturnValue}, {"_objc_unsafeClaimAutoreleasedReturnValue", h_objc_unsafeClaimAutoreleasedReturnValue}, {"_uname", h_uname}, {"_thread_get_state", h_thread_get_state}, {"_thread_set_state", h_thread_set_state}, {"_thread_resume", h_thread_resume}, {"_posix_spawnattr_setbinpref_np", h_posix_spawnattr_setbinpref_np}, {"_SSLSetIOFuncs", h_SSLSetIOFuncs}, {"_SecItemAdd", h_SecItemAdd}, {"_SecItemCopyMatching", h_SecItemCopyMatching}, {"_SecItemUpdate", h_SecItemUpdate}, {"_SecItemDelete", h_SecItemDelete}, {"_CGGetActiveDisplayList", h_CGGetActiveDisplayList}, {"_CVDisplayLinkCreateWithActiveCGDisplays", h_CVDisplayLinkCreateWithActiveCGDisplays}, {"_CGDisplayIsActive", h_CGDisplayIsActive}, {"_unw_getcontext", h_unw_getcontext}, {"_unw_init_local", h_unw_init_local}, {"_unw_step", h_unw_step}, {"_unw_get_reg", h_unw_get_reg}, {"_unw_set_reg", h_unw_set_reg}, {"_unw_get_fpreg", h_unw_get_fpreg}, {"_unw_set_fpreg", h_unw_set_fpreg}, {"_unw_is_signal_frame", h_unw_is_signal_frame}, {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_vsyslog", h_vsyslog}, {"_syslog$DARWIN_EXTSN", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
     {"_open$NOCANCEL", h_open}, {"_openat$NOCANCEL", h_openat}, {"_fcntl$NOCANCEL", h_fcntl},   // (the mode / argument of these variadic functions is on the stack on arm64, not in x2 / x3: Bun, Zig and Rust call the $NOCANCEL forms directly)
     {"_exit", h_exit}, {"_atexit", h_atexit}, {"___cxa_atexit", h_cxa_atexit}, {"___cxa_finalize", h_nop},
     {"_qsort", h_qsort}, {"_qsort_r", h_qsort_r}, {"_bsearch", h_bsearch}, {"__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv", h_dir_deref}, {"__ZNKSt3__14__fs10filesystem28recursive_directory_iterator13__dereferenceEv", h_rdir_deref}, {"_tsearch", h_tsearch}, {"_tfind", h_tfind}, {"_tdelete", h_tdelete}, {"_twalk", h_twalk}, {"_lfind", h_lfind}, {"_lsearch", h_lsearch},
@@ -2502,22 +2503,43 @@ static int g_slow_ms;   // REBAR_SLOW_STUB=<ms>: log every import call that take
 static void slow_stub_log(CPU *c, uint64_t off, uint64_t lr0, double ms) {
     if (off >= g_stub_size || off / 16 >= (uint64_t)g_nstubs) return;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (!strcmp(g_stubs[off / 16].name, "_objc_msgSend") && c->x[0] > 0x10000 && c->x[1] > 0x10000) {   // which message to which class
+        fprintf(stderr, "[slow %.0f ms at %.1fs] [%s %s] from guest 0x%llx thread %p\n", ms, (double)(ts.tv_sec - g_slow_t0.tv_sec) + (double)(ts.tv_nsec - g_slow_t0.tv_nsec) / 1e9,
+                class_getName(object_getClass((id)c->x[0])), sel_getName((SEL)c->x[1]), (unsigned long long)lr0, (void *)pthread_self());
+        return;
+    }
     fprintf(stderr, "[slow %.0f ms at %.1fs] %s(0x%llx, 0x%llx, 0x%llx) from guest 0x%llx thread %p\n", ms, (double)(ts.tv_sec - g_slow_t0.tv_sec) + (double)(ts.tv_nsec - g_slow_t0.tv_nsec) / 1e9, g_stubs[off / 16].name,
             (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)lr0, (void *)pthread_self());
 }
+static void h_objc_msgSend(CPU *c);
+static bool msgsend_fast(CPU *c);
 static void stub_call(CPU *c) {
     uint64_t off = c->pc - g_stub_base;
     if (__builtin_expect(g_slow_ms > 0, 0) && !g_stubprof) {
         struct timespec a, b; uint64_t lr0 = c->x[30], x0 = c->x[0], x1 = c->x[1], x2 = c->x[2];
         bool lock0 = off < g_stub_size && off / 16 >= 2 && off / 16 < (uint64_t)g_nstubs && g_stubs[off / 16].handler && g_stubs[off / 16].handler != h_chkstk_darwin, had0 = t_have_gil;
         clock_gettime(CLOCK_MONOTONIC, &a);
+        bool fast0 = off < g_stub_size && off / 16 < (uint64_t)g_nstubs && g_stubs[off / 16].handler == h_objc_msgSend && msgsend_fast(c);   // (timed like the rest: the slow ones are the interesting ones)
+        if (fast0) apply_landing(c);
+        else {
         if (lock0 && !had0) gil_acquire();
         stub_call_inner(c);
+        }
         if (!had0 && t_have_gil) gil_release();
         clock_gettime(CLOCK_MONOTONIC, &b);
         double ms = (double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6;
         if (ms >= g_slow_ms) { uint64_t sv[3] = {c->x[0], c->x[1], c->x[2]}; c->x[0] = x0; c->x[1] = x1; c->x[2] = x2; slow_stub_log(c, off, lr0, ms); c->x[0] = sv[0]; c->x[1] = sv[1]; c->x[2] = sv[2]; }
         return;
+    }
+    if (off < g_stub_size && off / 16 < (uint64_t)g_nstubs && g_stubs[off / 16].handler == h_objc_msgSend && !g_stubprof) {   // objc_msgSend: repeats of a plain send need no bridge lock (msgsend_fast in objc.h)
+        bool had_f = t_have_gil;
+        t_last_stub = &g_stubs[off / 16]; t_last_lr = c->x[30];
+        if (msgsend_fast(c)) {
+            apply_landing(c);
+            if (!had_f && t_have_gil) gil_release();
+            urg_deliver_pending(c);
+            return;
+        }
     }
     bool lock = off < g_stub_size && off / 16 >= 2 && off / 16 < (uint64_t)g_nstubs && g_stubs[off / 16].handler && g_stubs[off / 16].handler != h_chkstk_darwin;   // (the stack probe does nothing: taking the bridge lock for it made 1.4 million calls queue up in Blender's renderer threads)
     bool had = t_have_gil;

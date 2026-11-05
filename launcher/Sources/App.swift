@@ -115,6 +115,8 @@ struct SettingsSheet: View {
             }
             Toggle("Fast mode (JIT)", isOn: $s.jit)
             hint("rebar translates code to machine code on the fly, several times faster. Turn it off only when hunting bugs.")
+            Toggle("Show the Metal performance HUD", isOn: $s.hud)
+            hint("Apple's overlay with frames per second, frame time, GPU time and memory, drawn over the program's Metal windows (games, 3D apps). Programs that do not use Metal show nothing.")
             Text("Command-line arguments").font(.subheadline)
             TextField("for example: --user-data-dir=\"/Users/me/my profile\"", text: $s.args)
             Text("Environment variables (one per line: NAME=value)").font(.subheadline)
