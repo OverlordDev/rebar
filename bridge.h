@@ -502,6 +502,16 @@ void rebar_bridge_enter(uint64_t *f) {
         for (int k = 0; k < 8; k++) { memset(&c->vr[k], 0, 16); c->vr[k].d[0] = f[6 + k]; }
         c->x[8] = f[20]; c->x[20] = f[21]; c->x[21] = f[22]; c->x[22] = f[25];   // Swift: indirect result address, context, error (all but the error are discarded when the CPU is restored below)
     }
+    if (sigent == SIGURG) {   // Go's preemption signal: its handler reads (and, to preempt, rewrites) the arm64 ucontext, which the host does not have. It is given one of its own whose pc is 0, a place that is not Go code:
+        // the handler then does its bookkeeping (preemptGen, pendingPreemptSignals, which exec waits for on Darwin) and leaves the goroutine alone; the scheduler preempts cooperatively.
+        static __thread uint8_t uctx[64], mctx[816];
+        memset(uctx, 0, sizeof uctx); memset(mctx, 0, sizeof mctx);
+        *(uint64_t *)(uctx + 48) = (uint64_t)mctx; *(uint64_t *)(uctx + 40) = 816;
+        uint64_t *ss = (uint64_t *)(mctx + 16);
+        for (int k = 0; k < 29; k++) ss[k] = saved.x[k];
+        ss[29] = saved.x[29]; ss[30] = saved.x[30]; ss[31] = saved.sp; ss[32] = 0;
+        c->x[2] = (uint64_t)uctx;
+    }
     if (sigent > 0 && sigent < 32 && ((g_sig_onstack >> sigent) & 1) && t_gss_on && !(c->sp > t_gss_sp && c->sp <= t_gss_sp + t_gss_size)) c->sp = (t_gss_sp + t_gss_size) & ~0xfull;
     uint64_t swifterror_in = f[22];
     c->x[30] = stub_addr(STUB_RET);
@@ -595,7 +605,7 @@ H(h_vsprintf_chk)  { VA_INIT(ap, c->x[4]); RET(vsnprintf(P(0), c->x[2], S(3), ap
 static bool fatal_sig(int sig) { return sig == SIGILL || sig == SIGTRAP || sig == SIGFPE || sig == SIGBUS || sig == SIGSEGV; }
 // SIGURG is what Go's runtime sends itself to preempt a goroutine: its handler reads and rewrites the arm64 ucontext, which the host does not have (it would corrupt the x86 frame
 // and the program spins in signal handlers), so the handler is never installed and the signal stays ignored by default; the scheduler then preempts cooperatively.
-static bool guest_cannot_handle(int sig) { return sig == SIGURG; }
+static bool guest_cannot_handle(int sig) { (void)sig; return false; }   // (SIGURG used to be dropped here; see rebar_bridge_enter: its handler is given an arm64 ucontext of its own)
 static uint32_t g_guest_fault_flags[3];
 H(h_sigaction) {
     int sig = (int)c->x[0];
