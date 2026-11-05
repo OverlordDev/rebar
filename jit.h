@@ -137,8 +137,22 @@ static inline void rex(JC *j, int w, int reg, int rm, int byte) {
     if (r != 0x40 || (byte && (reg >= 4 || rm >= 4))) e1(j, r);
 }
 static inline void modrm_rr(JC *j, int reg, int rm) { e1(j, 0xC0 | ((reg & 7) << 3) | (rm & 7)); }
+// The access records of a block are built in a scratch array and then copied to a private bump allocator: a guest that makes its own allocator the process's default malloc zone
+// (jemalloc in rustc does) would otherwise be handed rebar's own pointers to realloc and free.
+#define JSITE_SCRATCH 1024
+static __thread JSite t_site_scratch[JSITE_SCRATCH];
+static JSite *g_jsite_cur, *g_jsite_end;
+static JSite *jsites_final(JSite *src, int n) {   // under g_jit_mu
+    if (n <= 0) return NULL;
+    if (g_jsite_cur + n > g_jsite_end) {
+        size_t chunk = 1u << 20; void *m = mmap(NULL, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (m == MAP_FAILED) abort();
+        g_jsite_cur = m; g_jsite_end = (JSite *)((uint8_t *)m + chunk);
+    }
+    JSite *r = g_jsite_cur; g_jsite_cur += n; memcpy(r, src, (size_t)n * sizeof(JSite)); return r;
+}
 static void jsite_add(JC *j, int base, int idx, int scale, int32_t disp) {
-    if (j->nsites == j->capsites) { j->capsites = j->capsites ? j->capsites * 2 : 64; j->sites = realloc(j->sites, (size_t)j->capsites * sizeof(JSite)); }
+    if (j->nsites == j->capsites) return;   // (cannot happen: a block has at most 40 instructions)
     JSite *s = &j->sites[j->nsites++];
     s->at = j->p; s->pc = j->pc; memcpy(s->reg_of, j->rc_reg_of, 8); s->dirty = j->rc_dirty; s->base = (int8_t)base; s->idx = (int8_t)idx; s->scale = (uint8_t)scale; s->disp = disp;
     for (int k = 0; k < 8; k++) if (j->fresh & (1u << k)) { s->reg_of[k] = 0; s->dirty &= (uint8_t)~(1u << k); }
@@ -1169,9 +1183,16 @@ static JI emit_ldst_vec(JC *j, uint32_t i) {
         if (q) op_rm(j, 0, 1, 0x10, 0, RCX, disp);   // movups xmm0, [rcx+disp]
         else emit_load_sized(j, size, 1, RCX, disp);
         if (q) { rex(j, 0, 0, R15, 0); e1(j, 0x0F); e1(j, 0x11); modrm_mem(j, 0, R15, vo); }  // movups [vr], xmm0
-        else { mov_mr(j, R15, vo, RAX, 1); mov_ri_nf(j, RSI, 0); mov_mr(j, R15, vo + 8, RSI, 1); }
+        else {   // movq xmm15, rax ; movups [vr], xmm15: one 16-byte store (the upper half cleared)
+            e1(j, 0x66); rex(j, 1, 15, RAX, 0); e1(j, 0x0F); e1(j, 0x6E); modrm_rr(j, 15, RAX);
+            rex(j, 0, 15, R15, 0); e1(j, 0x0F); e1(j, 0x11); modrm_mem(j, 15, R15, vo);
+        }
     } else {
-        if (q) { rex(j, 0, 0, R15, 0); e1(j, 0x0F); e1(j, 0x10); modrm_mem(j, 0, R15, vo); op_rm(j, 0, 1, 0x11, 0, RCX, disp); }
+        if (q) {   // movq xmm0, [vr] ; movhps xmm0, [vr+8] (two 8-byte loads: see ld_q) ; movups [rcx+disp], xmm0
+            e1(j, 0xF3); rex(j, 0, 0, R15, 0); e1(j, 0x0F); e1(j, 0x7E); modrm_mem(j, 0, R15, vo);
+            rex(j, 0, 0, R15, 0); e1(j, 0x0F); e1(j, 0x16); modrm_mem(j, 0, R15, vo + 8);
+            op_rm(j, 0, 1, 0x11, 0, RCX, disp);
+        }
         else { mov_rm(j, RAX, R15, vo, 1); st_sized(j, RCX, disp, RAX, bytes); }
     }
     if (wb) st_xsp(j, rn, RDX);
@@ -1189,6 +1210,16 @@ static JI emit_ldst_vec(JC *j, uint32_t i) {
 static void emit_leaf_call_body(JC *j, void *fn, int nargs, int zext8) {
     static const uint8_t argreg[6] = {RDI, RSI, RDX, RCX, R8, R9};
     rc_flush(j);
+    if (zext8 & 6) {   // a libm function: d0, d1 (or s0, s1) in, d0 (s0) out; the rest of V0 is cleared like any scalar FP result
+        bool dbl = zext8 & 2;
+        for (int k = 0; k < nargs; k++) ld_s(j, k, k, dbl);
+        mov_ri_nf(j, RAX, (uint64_t)fn); call_reg(j, RAX);
+        if (dbl) { sse_m(j, 0x66, 0xD6, 0, R15, GVR(0)); }                                   // movq [V0], xmm0
+        else { e1(j, 0x66); rex(j, 0, 0, RAX, 0); e1(j, 0x0F); e1(j, 0x7E); modrm_rr(j, 0, RAX); mov_mr(j, R15, GVR(0), RAX, 1); }   // movd eax, xmm0 ; mov [V0], rax (zero extended)
+        mov_m64_zero(j, R15, GVR(0) + 8);
+        rc_clear(j);
+        return;
+    }
     for (int k = 0; k < nargs; k++) { int sl = j->rc_slot_of[k] - 1; if (sl >= 0 && sl < g_npin) mov_rr(j, argreg[k], RC_HOST[sl], 1); else mov_rm(j, argreg[k], R15, GXR(k), 1); }   // (a pinned register is not in memory)
     mov_ri_nf(j, RAX, (uint64_t)fn); call_reg(j, RAX);
     if (zext8) movzx_rr(j, RAX, RAX, 1);                          // (a bool result leaves the upper bits of rax undefined)
@@ -1400,13 +1431,25 @@ static bool jit_needs_budget(uint64_t pc, int maxn) {   // could a loop go throu
     }
     return false;
 }
+// REBAR_JIT_CACHE (jitcache.h): the start pc of every translated block, in translation order, is remembered and written to ~/Library/Caches/rebar at exit; the next run of the program
+// translates them in the background before the guest reaches them
+static uint64_t *g_jc_pcs; static size_t g_jc_n, g_jc_cap; static bool g_jc_rec;
+// growing an array of the translator's with mmap: realloc would hand rebar's pointers to the guest's allocator when the guest has made its own the default malloc zone
+static void *jgrow(void *old, size_t oldbytes, size_t newbytes) {
+    void *m = mmap(NULL, newbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) abort();
+    if (old) { memcpy(m, old, oldbytes); munmap(old, oldbytes); }
+    return m;
+}
+static uint64_t g_jc_main_compiles, g_jc_bg_compiles;   // blocks translated by a guest thread / by the pre-translation thread (REBAR_JIT_CACHE_DEBUG)
+static __thread bool t_jc_bg;
 static uint8_t *jit_compile(uint64_t pc) {
     if (t_jit_busy) return NULL;   // a guest signal handler that interrupted this thread inside the translator: interpret, do not wait for the lock this thread holds
     t_jit_busy = true; pthread_mutex_lock(&g_jit_mu);   // (the flag first: a signal handler that interrupts the thread right after it has the lock must not try to take it again)
     JEnt *ex = jit_probe(pc);
     if (ex) { uint8_t *code = ex->code; t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu); return code; }
     if (g_jit_end - g_jit_top < 65536 || ((g_jit_nonly || g_jit_nskip) && !jit_allowed(pc))) { jit_insert(pc, NULL); t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu); return NULL; }
-    JC j; memset(&j, 0, sizeof j); rc_pin_apply(&j);
+    JC j; memset(&j, 0, sizeof j); rc_pin_apply(&j); j.sites = t_site_scratch; j.capsites = JSITE_SCRATCH;
     uint8_t *start = (uint8_t *)(((uintptr_t)g_jit_top + (g_jit_align - 1)) & ~(uintptr_t)(g_jit_align - 1)) + g_jit_align;   // (the guest pc sits in the 8 bytes before the code)
     memcpy(start - 8, &pc, 8);
     j.p = start; j.limit = g_jit_end; j.blockpc = pc;
@@ -1456,7 +1499,8 @@ static uint8_t *jit_compile(uint64_t pc) {
     if (counts) *nptr = (uint8_t)n;
     g_jit_top = j.p;
     g_jit_nblocks++; g_jit_ninsns += n;
-    if (g_jit_reg_n == g_jit_reg_cap) { g_jit_reg_cap = g_jit_reg_cap ? g_jit_reg_cap * 2 : 65536; g_jit_reg = realloc(g_jit_reg, g_jit_reg_cap * sizeof(JReg)); }
+    if (g_jit_reg_n == g_jit_reg_cap) { size_t nc = g_jit_reg_cap ? g_jit_reg_cap * 2 : 65536; g_jit_reg = jgrow(g_jit_reg, g_jit_reg_cap * sizeof(JReg), nc * sizeof(JReg)); g_jit_reg_cap = nc; }
+    j.sites = jsites_final(t_site_scratch, j.nsites);   // (the records stay for the life of the block)
     g_jit_reg[g_jit_reg_n++] = (JReg){start, (uint32_t)(j.p - start), (uint32_t)n, pc, precise, j.sites, (uint32_t)j.nsites};
     if (g_jit_map) fprintf(g_jit_map, "%llx %u %llx %d\n", (unsigned long long)start, (unsigned)(j.p - start), (unsigned long long)pc, n);
     if (g_jit_dump) {   // REBAR_JITDUMP=<file>: "pc n bytes guest-words... | x86-bytes" for every block (analysis aid)
@@ -1482,6 +1526,11 @@ static uint8_t *jit_compile(uint64_t pc) {
             *pp = w->next; jpool_free(0, w);
         } else pp = &w->next;
     }
+    if (g_jc_rec && g_jc_n < (4u << 20)) {
+        if (g_jc_n == g_jc_cap) { size_t nc = g_jc_cap ? g_jc_cap * 2 : 65536; g_jc_pcs = jgrow(g_jc_pcs, g_jc_cap * sizeof *g_jc_pcs, nc * sizeof *g_jc_pcs); g_jc_cap = nc; }
+        g_jc_pcs[g_jc_n++] = pc;
+    }
+    if (t_jc_bg) g_jc_bg_compiles++; else g_jc_main_compiles++;
     t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu);
     if (t_jit_npend) jit_run_pending();
     return start;
@@ -1630,7 +1679,7 @@ static void jit_init(void) {
     if (getenv("REBAR_JIT_FLAGSKIP")) { char *e; g_flagskip_lo = strtoull(getenv("REBAR_JIT_FLAGSKIP"), &e, 16); if (*e == '-') g_flagskip_hi = strtoull(e + 1, NULL, 16); }
     if (getenv("REBAR_JIT_FLAGDBG")) { g_fl_dbg = true; atexit(fl_dbg_dump); }
     if (getenv("REBAR_JITCOUNT")) { g_jit_count = true; g_jit_cnt = calloc(1u << 20, 8); }
-    if (getenv("REBAR_JITMAP")) { char nm[PATH_MAX]; snprintf(nm, sizeof nm, "%s.%d", getenv("REBAR_JITMAP"), (int)getpid()); g_jit_map = fopen(nm, "w"); if (g_jit_map) setvbuf(g_jit_map, NULL, _IOLBF, 0); }
+    if (getenv("REBAR_JITMAP")) { char nm[PATH_MAX]; snprintf(nm, sizeof nm, "%s.%d", getenv("REBAR_JITMAP"), (int)getpid()); g_jit_map = fopen(nm, "w"); if (g_jit_map) setvbuf(g_jit_map, NULL, _IOFBF, 1 << 22); }
     if (getenv("REBAR_JITDUMP")) { char nm[PATH_MAX]; snprintf(nm, sizeof nm, "%s.%d", getenv("REBAR_JITDUMP"), (int)getpid()); g_jit_dump = fopen(nm, "w"); }
     jit_parse_ranges("REBAR_JIT_ONLY", &g_jit_nonly, g_jit_only); jit_parse_ranges("REBAR_JIT_SKIP", &g_jit_nskip, g_jit_skip);
     if (getenv("REBAR_JIT_THRESHOLD")) g_jit_threshold = (unsigned)atoi(getenv("REBAR_JIT_THRESHOLD"));

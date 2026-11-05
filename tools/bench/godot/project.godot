@@ -1,0 +1,4 @@
+config_version=5
+[application]
+config/name="bench"
+run/main_scene="res://main.tscn"

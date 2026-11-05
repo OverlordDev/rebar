@@ -1609,14 +1609,12 @@ static void hostprof_sample(int sig, siginfo_t *si, void *uc) {
     }
 }
 static int hp_cmp(const void *a, const void *b) { uint64_t x = ((const uint64_t *)a)[1], y = ((const uint64_t *)b)[1]; return x < y ? 1 : x > y ? -1 : 0; }
-static void *hostprof_thread(void *arg) {
-    (void)arg;
+static void hostprof_write(void) {
     static uint64_t rows[HP_SLOTS][2];
-    for (;;) {
-        sleep(2);
+    {
         char name[PATH_MAX], tmp[PATH_MAX];
         snprintf(name, sizeof name, "%s.%d", g_hp_file, (int)getpid()); snprintf(tmp, sizeof tmp, "%s.tmp", name);
-        FILE *f = fopen(tmp, "w"); if (!f) continue;
+        FILE *f = fopen(tmp, "w"); if (!f) return;
         int n = 0; uint64_t total = 0;
         for (int k = 0; k < HP_SLOTS; k++) if (g_hp[k].n) { rows[n][0] = g_hp[k].key; rows[n++][1] = g_hp[k].n; total += g_hp[k].n; }
         qsort(rows, n, sizeof rows[0], hp_cmp);
@@ -1624,8 +1622,8 @@ static void *hostprof_thread(void *arg) {
         for (int k = 0; k < n && k < (g_hp_rows ? g_hp_rows : 600); k++) { Dl_info di; const char *fn = (rows[k][0] - (uint64_t)g_jit_arena < JIT_ARENA) ? "<translated code>" : dladdr((void *)rows[k][0], &di) && di.dli_sname ? di.dli_sname : "?"; fprintf(f, "%llx %llu %s\n", (unsigned long long)rows[k][0], (unsigned long long)rows[k][1], fn); }
         fclose(f); rename(tmp, name);
     }
-    return NULL;
 }
+static void *hostprof_thread(void *arg) { (void)arg; for (;;) { sleep(2); hostprof_write(); } return NULL; }
 static void hostprof_start(const char *file) {
     g_hp_file = file; if (getenv("REBAR_HOSTPROF_ROWS")) g_hp_rows = atoi(getenv("REBAR_HOSTPROF_ROWS")); g_hp_main_only = getenv("REBAR_HOSTPROF_MAIN") != NULL;
     struct sigaction sa; memset(&sa, 0, sizeof sa);
@@ -1633,10 +1631,12 @@ static void hostprof_start(const char *file) {
     sigaction(SIGPROF, &sa, NULL);
     struct itimerval it = {{0, 1000}, {0, 1000}};
     setitimer(ITIMER_PROF, &it, NULL);
+    atexit(hostprof_write);
     pthread_t th; pthread_create(&th, NULL, hostprof_thread, NULL); pthread_detach(th);
 }
 
 #include "bridge.h"
+#include "jitcache.h"
 static const char *prof_stub_name(int key) { int idx = key - 1; return idx >= 0 && idx < g_nstubs && g_stubs[idx].name ? g_stubs[idx].name : "?"; }
 
 static void usr2_backtrace(int sig) {
@@ -1874,6 +1874,7 @@ int main(int argc, char **argv) {
     if (getenv("REBAR_IOS_UI")) ios_prepare();   // an iOS app: UIKit (Mac Catalyst) asks AppKit for something this macOS does not have
     GImage *mainimg = load_image(real, NULL, true);  // maps the executable and, recursively, its guest dylibs
     if (!mainimg->have_entry) { fprintf(stderr, "rebar: no LC_MAIN (LC_UNIXTHREAD not supported yet)\n"); return 1; }
+    jitcache_init(real);
 
     if (getenv("REBAR_IMAGES"))
         for (int k = 0; k < g_nimages; k++)

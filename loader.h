@@ -384,6 +384,7 @@ static void start_images(CPU *c, int first) {
     for (int k = first; k < g_nimages; k++) objc_map_image(g_images[k]);
     for (int k = first; k < g_nimages; k++) objc_attach_categories(g_images[k]);
     for (int k = first; k < g_nimages; k++) swift_register_image(g_images[k]);
+    jitcache_kick(g_nimages);   // the code of these images is final: the translator may start on the blocks it remembers
     GImage *order[MAX_IMAGES]; bool seen[MAX_IMAGES] = {0};
     int n = 0;
     for (int k = 0; k < first; k++) seen[k] = true;

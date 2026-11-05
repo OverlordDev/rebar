@@ -13,10 +13,13 @@ static void sse_m(JC *j, int prefix, int opc, int xr, int base, int32_t disp) { 
 static void sse_r(JC *j, int prefix, int opc, int xr, int xm) { if (prefix) e1(j, prefix); rex(j, 0, xr, xm, 0); e1(j, 0x0F); e1(j, opc); modrm_rr(j, xr, xm); }
 static void sse_rex_w_m(JC *j, int prefix, int opc, int reg, int base, int32_t disp) { if (prefix) e1(j, prefix); rex(j, 1, reg, base, 0); e1(j, 0x0F); e1(j, opc); modrm_mem(j, reg, base, disp); }
 static void ld_s(JC *j, int xr, int n, int dbl) { sse_m(j, dbl ? 0xF2 : 0xF3, 0x10, xr, R15, GVR(n)); }   // movss / movsd xmm, [V[n]]: the upper bits of xmm are cleared
-static void ld_q(JC *j, int xr, int n) { sse_m(j, 0, 0x10, xr, R15, GVR(n)); }                           // movups xmm, [V[n]]
+// A vector register is read as two 8-byte halves (movq + movhps), not with one 16-byte movups: many templates write a register as two 8-byte stores (or a 4-byte lane
+// store after a 16-byte one), and a 16-byte load that spans two earlier stores cannot be forwarded from the store buffer (a stall of a dozen cycles on every dot product)
+static void ld_q(JC *j, int xr, int n) { sse_m(j, 0xF3, 0x7E, xr, R15, GVR(n)); sse_m(j, 0, 0x16, xr, R15, GVR(n) + 8); }   // movq xmm, [V[n]] ; movhps xmm, [V[n]+8]
 static void st_q(JC *j, int n, int xr) { sse_m(j, 0, 0x11, xr, R15, GVR(n)); }                           // movups [V[n]], xmm
 static void mov_m64_zero(JC *j, int base, int32_t disp) { rex(j, 1, 0, base, 0); e1(j, 0xC7); modrm_mem(j, 0, base, disp); e4(j, 0); }
-static void st_v64z(JC *j, int rd, int src) { mov_mr(j, R15, GVR(rd), src, 1); mov_m64_zero(j, R15, GVR(rd) + 8); }   // V[rd] = src (64 bits), upper half cleared
+static void movq_xg(JC *j, int xr, int gr);
+static void st_v64z(JC *j, int rd, int src) { movq_xg(j, 15, src); sse_m(j, 0, 0x11, 15, R15, GVR(rd)); }   // V[rd] = src (64 bits), upper half cleared: one 16-byte store (xmm15 is the scratch)   // V[rd] = src (64 bits), upper half cleared
 static void movq_xg(JC *j, int xr, int gr) { e1(j, 0x66); rex(j, 1, xr, gr, 0); e1(j, 0x0F); e1(j, 0x6E); modrm_rr(j, xr, gr); }   // movq xmm, r64
 static void v_const(JC *j, int xr, uint64_t v) { mov_ri_nf(j, RCX, v); movq_xg(j, xr, RCX); }                                   // the low 64 bits of xmm xr = v, the rest cleared (rcx is scratch)
 static void setcc_r(JC *j, int cc, int reg) { e1(j, 0x0F); e1(j, 0x90 + cc); modrm_rr(j, 0, reg); }                      // al, cl, dl only (no REX)

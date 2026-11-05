@@ -46,11 +46,10 @@ static void v_store_pattern(JC *j, int rd, bool q) {   // V[rd] = rax in the low
 static JI emit_modimm(JC *j, uint32_t i) {
     int q = B(i, 30, 30), op = B(i, 29, 29), cmode = B(i, 15, 12), rd = B(i, 4, 0);
     bool orr = (cmode & 9) == 1 || (cmode & 13) == 9;
-    CPU *tmp = calloc(1, sizeof(CPU));
+    static __thread CPU t_modimm_cpu; CPU *tmp = &t_modimm_cpu; memset(tmp, 0, sizeof *tmp);   // (not calloc: the translator also runs on a thread of ours, which must not call a guest's allocator)
     if (orr) for (int k = 0; k < 2; k++) tmp->vr[rd].d[k] = op ? ~0ull : 0;   // BIC clears the immediate's bits of all ones, ORR sets them in zero: the result is the operand to use
     simd_modimm(tmp, i);
     uint64_t lo = tmp->vr[rd].d[0], hi = tmp->vr[rd].d[1];
-    free(tmp);
     if (!orr) {
         mov_ri_nf(j, RAX, lo); mov_mr(j, R15, GVR(rd), RAX, 1);
         if (q && hi != lo) mov_ri_nf(j, RAX, hi);
@@ -413,6 +412,24 @@ static JI emit_vmisc2(JC *j, uint32_t i) {
         fix_here(j, done);
         return JI_OK;
     }
+    bool rev64 = !U && op == 0 && size <= 2, rev32 = U && op == 0 && size <= 1, rev16 = !U && op == 1 && size == 0;
+    if (rev64 || rev32 || rev16) {   // REV64 / REV32 / REV16: the elements of each 8 / 4 / 2 byte group in reverse order
+        int group = rev64 ? 8 : rev32 ? 4 : 2, es = 1 << size;
+        if (es >= group) return JI_NO;
+        ld_q(j, 0, rn);
+        if (group == 8 && es == 4) { e1(j, 0x66); e1(j, 0x0F); e1(j, 0x70); e1(j, 0xC0); e1(j, 0xB1); }   // pshufd xmm0, xmm0, 0xb1: the two floats / words of each qword swap
+        else {
+            if (!g_have_ssse3) return JI_NO;
+            uint8_t mask[16];
+            for (int p = 0; p < 16; p++) { int g0 = p / group * group, w = p % group, e = w / es, b = w % es; mask[p] = (uint8_t)(g0 + (group / es - 1 - e) * es + b); }
+            uint64_t lo, hi; memcpy(&lo, mask, 8); memcpy(&hi, mask + 8, 8);
+            v_const(j, 1, lo); v_const(j, 2, hi); sse_r(j, 0x66, 0x6C, 1, 2);                              // punpcklqdq xmm1, xmm2: the shuffle mask
+            sse38_r(j, 0x00, 0, 1);                                                                       // pshufb xmm0, xmm1
+        }
+        if (!q) v_zero_upper(j, 0);
+        st_q(j, rd, 0);
+        return JI_OK;
+    }
     if (g_have_sse41 && (op == 0x18 || op == 0x19) && !(U && op == 0x18)) {   // FRINTN FRINTP FRINTM FRINTZ (U = 0), FRINTX FRINTI (U = 1): roundps / roundpd; a NaN lane goes to the helper
         int sz = size & 1, hi = size >> 1;
         if (!q && sz) return JI_NO;
@@ -772,6 +789,15 @@ static JI emit_fredv(JC *j, uint32_t i) {
     return JI_OK;
 }
 
+static JI emit_fabd_s(JC *j, uint32_t i) {   // FABD Sd, Sn, Sm / Dd, Dn, Dm: |n - m|
+    int dbl = B(i, 22, 22), rm = B(i, 20, 16), rn = B(i, 9, 5), rd = B(i, 4, 0);
+    ld_s(j, 0, rn, dbl);
+    sse_m(j, dbl ? 0xF2 : 0xF3, 0x5C, 0, R15, GVR(rm));                                                   // subss / subsd xmm0, [m]
+    v_const(j, 3, dbl ? 0x7fffffffffffffffull : 0x7fffffffull); sse_r(j, 0, 0x54, 0, 3);                    // andps: the absolute value
+    canon_nan(j, dbl);
+    st_q(j, rd, 0);
+    return JI_OK;
+}
 static JI emit_neon(JC *j, uint32_t i) {
     if ((i & 0xff7ffc00) == 0x6e30f800 || (i & 0xff7ffc00) == 0x6e30c800) return emit_fredv(j, i);   // FMAXV / FMINV / FMAXNMV / FMINNMV (4S)
     if ((i & 0xbfe0fc00) == 0x2ea04400) return emit_ushl_s(j, i);                 // USHL (32-bit lanes)
@@ -787,6 +813,7 @@ static JI emit_neon(JC *j, uint32_t i) {
     if ((i & 0xbfbffc00) == 0x0e217800 || (i & 0xbfbffc00) == 0x0e216800) return emit_fcvtln(j, i);
     if ((i & 0x9fe0fc00) == 0x0e809400) return emit_dot(j, i, false);
     if ((i & 0x9fc0f400) == 0x0f80e000) return emit_dot(j, i, true);
+    if ((i & 0xffa0fc00) == 0x7ea0d400) return emit_fabd_s(j, i);                 // FABD (scalar)
     if ((i & 0xffbffc00) == 0x7e30d800) return emit_faddp_s(j, i);
     if ((i & 0xffe0fc00) == 0x6ee04400) return emit_ushl_2d(j, i);
     if ((i & 0x9ff80400) == 0x0f000400) return emit_modimm(j, i);

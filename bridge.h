@@ -3220,4 +3220,5 @@ static void apply_classic_binds(GImage *img) {
 }
 
 #include "unwind.h"
+static void jitcache_kick(int upto);
 #include "loader.h"
