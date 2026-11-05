@@ -221,6 +221,11 @@ hbcheck brew_sqlite 42 sqlite3 :memory: "select 6*7"
 hbcheck brew_lua 42 lua -e 'print(6*7)'
 [ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
 hbcheck brew_tmux "tmux 3.8" tmux -V
+# a shell script run as `rebar script`: the host shell runs it, the arm64 programs it starts run under rebar (the exec shim)
+if [ -x "$HB/bin/python3.13" ]; then
+    printf '#!/bin/sh\nexec "%s/bin/python3.13" -c "import sys; print(\\"hostscript\\", 6 * 7)"\n' "$HB" > $T/host.sh; chmod +x $T/host.sh
+    echo "hostscript 42" > $T/a; REBAR_PATHMAP=/opt/homebrew=$HB run_to 30 $T/b $R $T/host.sh; grep -v '^nvrm' $T/b | head -1 > $T/b2; check host_shell_script $T/a $T/b2
+fi
 # GObject signals without a marshaller go through libffi (glib's generic closure marshal), GVariant, GMainLoop, GError, UTF-8
 if [ -f "$HB/lib/libgobject-2.0.dylib" ]; then
     clang -arch arm64 -I$HB/include/glib-2.0 -I$HB/lib/glib-2.0/include -L$HB/lib -lgobject-2.0 -lglib-2.0 -Wl,-rpath,$HB/lib glib_gobject.c -o glib_gobject_arm 2>/dev/null

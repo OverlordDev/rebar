@@ -1750,6 +1750,11 @@ int main(int argc, char **argv) {
             char *interp = sb + 2; while (*interp == ' ') interp++;
             char *iarg = interp; while (*iarg && *iarg != ' ') iarg++;
             if (*iarg) { *iarg++ = 0; while (*iarg == ' ') iarg++; }
+            if (*interp && !needs_rebar(interp) && !getenv("REBAR_NO_EXECSHIM")) {   // a script for a host interpreter (/bin/sh, /usr/bin/env): the host runs it, with the exec shim, so that the arm64 programs it starts run under rebar
+                proc_pidpath(getpid(), g_self_path, sizeof g_self_path);
+                char shim[PATH_MAX]; rebar_lib_path("librebar_exec.dylib", shim, sizeof shim);
+                if (access(shim, R_OK) == 0) { snprintf(g_shim_path, sizeof g_shim_path, "%s", shim); execve(argv[ai], argv + ai, env_with_shim(environ)); }
+            }
             if (*interp && needs_rebar(interp)) {
                 char **nv = calloc((size_t)argc + 4, sizeof *nv); int k = 0;
                 for (int j = 0; j < ai; j++) nv[k++] = argv[j];
