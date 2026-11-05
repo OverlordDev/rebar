@@ -126,7 +126,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -1760,6 +1760,7 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
     { const uint64_t hv[] = {r_rax(uc), r_rbx(uc), r_rcx(uc), r_rdx(uc), r_rsi(uc), r_rdi(uc), r_r8(uc), r_r9(uc), r_r10(uc), r_r11(uc), r_r12(uc), r_r13(uc), r_r14(uc), r_r15(uc)};
       static const char *hn[] = {"rax","rbx","rcx","rdx","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"};
       for (int k = 0; k < 14; k++) { GImage *gi = image_by_addr(hv[k]); if (gi && gi->path) fprintf(stderr, "  %s = %llx is in %s +0x%llx\n", hn[k], (unsigned long long)hv[k], gi->path, (unsigned long long)(hv[k] - gi->base)); } }
+    if (t_cpu && getenv("REBAR_DUMP_REGS_MEM")) for (int k = 0; k < 3; k++) { uint64_t base = (k == 0 ? t_cpu->x[1] : k == 1 ? t_cpu->x[20] : t_cpu->x[0]); if (base > 0x10000 && base < 0x7fffffffffffull) { fprintf(stderr, "  mem at x%d=%llx:", k == 0 ? 1 : k == 1 ? 20 : 0, (unsigned long long)base); mach_vm_size_t got = 0; uint64_t w[24]; if (mach_vm_read_overwrite(mach_task_self(), base, sizeof w, (mach_vm_address_t)w, &got) == KERN_SUCCESS) for (int j = 0; j < 24; j++) fprintf(stderr, " %llx", (unsigned long long)w[j]); fprintf(stderr, "\n"); } }
     if (t_cpu) { fprintf(stderr, "  guest registers (pc %llx):", (unsigned long long)t_cpu->pc); for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)t_cpu->x[k]); fprintf(stderr, " sp=%llx\n", (unsigned long long)t_cpu->sp); }
     if (t_ring_n) { const RingEnt *e = &t_ring[(t_ring_n - 1) & 127]; fprintf(stderr, "  last import: %s(0x%llx, 0x%llx, 0x%llx)\n", e->name, (unsigned long long)e->x0, (unsigned long long)e->x1, (unsigned long long)e->x2); }
     dump_recent_imports();
@@ -2223,6 +2224,42 @@ static void *stubprof_thread(void *arg) {
 }
 static void stubprof_start(const char *file) { g_stubprof = file; pthread_t th; pthread_create(&th, NULL, stubprof_thread, NULL); pthread_detach(th); }
 static struct timespec g_slow_t0;
+// An arm64 guest passes Optional<SwiftUI.Transaction>.none as 1: Transaction is a frozen struct in the SDK, so the compiler lays Optional out itself, and on arm64 the first extra inhabitant
+// of a struct around a class reference is 1, while the x86_64 SwiftUI (compiled with x86_64's pointer layout) wants 2 (Query(sort:) stored the 1 as a pointer and crashed on the first copy).
+// For a Swift import whose demangled signature takes a `Transaction?` the argument register with 1 in it is turned into 2.
+static bool param_is_optional_transaction(const char *seg, const char *end) {   // "label: Swift.Optional<SwiftUI.Transaction>" or "label: SwiftUI.Transaction?"
+    size_t n = (size_t)(end - seg);
+    if (n >= 20 && !strncmp(end - 20, "SwiftUI.Transaction?", 20)) return true;
+    for (const char *q = seg; q + 29 <= end; q++) if (!strncmp(q, "Optional<SwiftUI.Transaction>", 29)) return true;
+    return false;
+}
+static uint8_t transaction_arg_mask(const char *mangled) {
+    if (!strstr(mangled, "11TransactionVSg")) return 0;
+    static char *(*demangle)(const char *, size_t, char *, size_t *, uint32_t);
+    if (!demangle) demangle = (char *(*)(const char *, size_t, char *, size_t *, uint32_t))dlsym(RTLD_DEFAULT, "swift_demangle");
+    if (!demangle) { void *h = dlopen("/usr/lib/swift/libswiftCore.dylib", RTLD_NOW | RTLD_GLOBAL); if (h) demangle = (char *(*)(const char *, size_t, char *, size_t *, uint32_t))dlsym(h, "swift_demangle"); }
+    if (!demangle) return 0;
+    const char *m = mangled[0] == '_' ? mangled + 1 : mangled;
+    char *d = demangle(m, strlen(m), NULL, NULL, 0);
+    if (!d) return 0;
+    uint8_t mask = 0; int depth = 0, idx = 0; const char *p = d, *start = NULL;
+    for (; *p; p++) {   // the first '(' outside angle brackets opens the parameter list
+        if (*p == '<') depth++; else if (*p == '>') depth--; else if (*p == '(' && depth == 0) { start = p + 1; break; }
+    }
+    if (start) {
+        depth = 0; const char *seg = start;
+        for (p = start; *p; p++) {
+            char ch = *p;
+            if (ch == '<' || ch == '(' || ch == '[') depth++;
+            else if ((ch == '>' || ch == ']') && depth > 0) depth--;
+            else if (ch == ')' && depth == 0) { if (idx < 8 && param_is_optional_transaction(seg, p)) mask |= 1u << idx; break; }
+            else if (ch == ')') depth--;
+            else if (ch == ',' && depth == 0) { if (idx < 8 && param_is_optional_transaction(seg, p)) mask |= 1u << idx; idx++; seg = p + 1; }
+        }
+    }
+    free(d);
+    return mask;
+}
 static int g_slow_ms;   // REBAR_SLOW_STUB=<ms>: log every import call that takes longer (name, arguments, caller, thread, when)
 static void slow_stub_log(CPU *c, uint64_t off, uint64_t lr0, double ms) {
     if (off >= g_stub_size || off / 16 >= (uint64_t)g_nstubs) return;
@@ -2398,7 +2435,7 @@ static void stub_call_inner(CPU *c) {
         void *d = send((void *)c->x[0], selreg("description")); const char *u = d ? (const char *)send(d, selreg("UTF8String")) : NULL;
         fprintf(stderr, "[catch] %s\n", u ? u : "?");
     }
-    if (g_trace_stubs && trace_stub_wanted(s->name)) { char b[300]; int n = snprintf(b, sizeof b, "[stub] %s(%llx,%llx,%llx,%llx,%llx) sp=%llx lr=%llx\n", s->name, (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3], (unsigned long long)c->x[4], (unsigned long long)c->sp, (unsigned long long)c->x[30]); write(2, b, n); }
+    if (g_trace_stubs && trace_stub_wanted(s->name)) { char b[300]; int n = snprintf(b, sizeof b, "[stub] %s(%llx,%llx,%llx,%llx,%llx) sp=%llx lr=%llx x8=%llx\n", s->name, (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3], (unsigned long long)c->x[4], (unsigned long long)c->sp, (unsigned long long)c->x[30], (unsigned long long)c->x[8]); write(2, b, n); }
     if (g_trace_stubs && trace_stub_wanted(s->name) && (!strcmp(s->name, "_dlsym") || !strcmp(s->name, "_dlopen") || !strcmp(s->name, "_sysctlbyname") || !strcmp(s->name, "_getenv"))) {   // the names these calls look for
         const char *arg = !strcmp(s->name, "_dlsym") ? (const char *)c->x[1] : (const char *)c->x[0];
         if (arg > (const char *)0x10000 && (uint64_t)arg < 0x7fffffffffffull) fprintf(stderr, "   %s(\"%.120s\")\n", s->name, arg);
@@ -2423,6 +2460,7 @@ static void stub_call_inner(CPU *c) {
     else if (s->host) {
         uint64_t addr_ptr = c->x[1], size = c->x[2];
         if (s->maps && ((uint32_t)c->x[4] & 1)) c->x[3] |= 0x3fff;  // VM_FLAGS_ANYWHERE: arm64 macOS places mappings on 16KB boundaries
+        if (s->txn_mask) for (int k = 0; k < 8; k++) if (((s->txn_mask >> k) & 1) && c->x[k] == 1) c->x[k] = 2;
         t_stk = s->stk; t_swift = s->swift; t_async_call = s->async_host && !g_no_async_tail; host_call(c, s->host, s->sret); t_stk = NULL;
         if (s->maps && (uint32_t)c->x[0] == 0 && !t_landed) own_add(*(uint64_t *)addr_ptr, size);  // vm_map & co.: the guest owns what came back
     }
@@ -2640,6 +2678,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     g_stubs[idx].heapret = !strncmp(name, "_realpath", 9) || !strcmp(name, "_strdup") || !strcmp(name, "_strndup") || !strcmp(name, "_getcwd") ? 1 : (!strcmp(name, "_asprintf") || !strcmp(name, "_vasprintf") ? 2 : 0);   // host functions that return memory from the system's malloc (see heapret_fix)
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;
     if (host && !h) g_stubs[idx].swift = (name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S')) || !strcmp(name, "_swift_getAtKeyPath") || !strcmp(name, "_swift_setAtWritableKeyPath") || !strcmp(name, "_swift_modifyAtWritableKeyPath") || !strcmp(name, "_swift_getAtAnyKeyPath") || !strcmp(name, "_swift_getAtPartialKeyPath");   // a Swift symbol: Swift's calling convention (also the key path runtime functions: swiftcc with an indirect result in x8)
+    if (host && !h && g_stubs[idx].swift) { g_stubs[idx].txn_mask = transaction_arg_mask(name); if (g_stubs[idx].txn_mask && g_trace_stubs) fprintf(stderr, "[stub] %s: Transaction? arguments %02x\n", name, g_stubs[idx].txn_mask); }
     if (host && !h) g_stubs[idx].maps = !strcmp(name, "_vm_map") || !strcmp(name, "_mach_vm_map") || !strcmp(name, "_vm_remap") || !strcmp(name, "_mach_vm_remap");
     if (host && !h) {
         StrSpec *sp = g_stubs[idx].str = str_spec_for(name);

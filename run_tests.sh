@@ -226,6 +226,7 @@ if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
         # NavigationStack path pushes while the previous push still animates (UIKit's objc_opt_respondsToSelector(obj, BOOL) call poisoned a method cache), Layout, Grid, Canvas, TimelineView, Combine, Stepper (needs the iPad idiom: SwiftUI's default Stepper style recurses forever for the iPhone idiom, natively too)
         REBAR_IOS_FAMILY=2; export REBAR_IOS_FAMILY
         iosipa ios_swiftui3_ipa ios_swiftui3.swift 'combine [0, 1, 2, 3, 4, 5, 6] render 40x40 stored 41\nui path 0 tab 0 step 5 text hello expanded true drag 12\n' swiftc
+        iosipa ios_swiftui4_ipa ios_swiftui4.swift 'notes 2 fetch 2 settings x 7 sel one\n' swiftc
         unset REBAR_IOS_FAMILY
         # a store-style app: compiled storyboard, asset catalog, UIWindowSceneDelegate from the scene manifest, resources, localization
         if xcrun -f ibtool >/dev/null 2>&1 && xcrun -f actool >/dev/null 2>&1; then

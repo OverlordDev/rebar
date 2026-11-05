@@ -1,26 +1,32 @@
+// SwiftData and the SwiftUI Query wrapper: Optional<SwiftUI.Transaction> is laid out differently by the arm64 compiler (none is 1) and by the x86_64 SwiftUI (none is 2), so a Query built by an arm64 program crashed when copied.
 import Foundation
 import SwiftData
-import CoreData
-@Model final class Person { var name: String; var age: Int; @Relationship(deleteRule: .cascade) var pets: [Pet] = []; init(name: String, age: Int) { self.name = name; self.age = age } }
-@Model final class Pet { var name: String; var owner: Person?; init(name: String) { self.name = name } }
+import SwiftUI
+
+@Model final class Note { var title: String; var n: Int; init(title: String, n: Int) { self.title = title; self.n = n } }
+
+@inline(never) func copyIt<T>(_ x: T) -> T { let y = x; return y }
+
 @MainActor func run() throws {
-    let cfg = ModelConfiguration(isStoredInMemoryOnly: true)
-    let container = try ModelContainer(for: Person.self, Pet.self, configurations: cfg); let ctx = container.mainContext
-    let a = Person(name: "Ann", age: 33), b = Person(name: "Bob", age: 41), c = Person(name: "Cy", age: 19)
-    [a, b, c].forEach { ctx.insert($0) }; a.pets.append(Pet(name: "Rex")); a.pets.append(Pet(name: "Tom")); b.pets.append(Pet(name: "Fido")); try ctx.save()
-    let all = try ctx.fetch(FetchDescriptor<Person>(sortBy: [SortDescriptor(\.age)])); print("fetch", all.map { "\($0.name):\($0.age):\($0.pets.count)" })
-    let older = try ctx.fetch(FetchDescriptor<Person>(predicate: #Predicate { $0.age > 30 }, sortBy: [SortDescriptor(\.name, order: .reverse)])); print("predicate", older.map { $0.name })
-    print("count", try ctx.fetchCount(FetchDescriptor<Pet>()))
-    b.age = 42; try ctx.save(); print("update", try ctx.fetch(FetchDescriptor<Person>(predicate: #Predicate { $0.name == "Bob" })).first!.age)
-    ctx.delete(a); try ctx.save(); print("cascade", try ctx.fetchCount(FetchDescriptor<Person>()), try ctx.fetchCount(FetchDescriptor<Pet>()))
-    var d = FetchDescriptor<Person>(sortBy: [SortDescriptor(\.age)]); d.fetchLimit = 1; print("limit", try ctx.fetch(d).map { $0.name })
-    try ctx.transaction { ctx.insert(Person(name: "Dee", age: 50)) }; print("transaction", try ctx.fetchCount(FetchDescriptor<Person>()))
+    let q = Query<Note, [Note]>(sort: \Note.title)
+    let q2 = copyIt(q)
+    _ = q2
+    print("query copied")
+    let d = Query<Note, [Note]>(filter: #Predicate<Note> { $0.n > 1 }, sort: \Note.n, order: .reverse)
+    _ = copyIt(d)
+    print("query with filter copied")
+    let container = try ModelContainer(for: Note.self, configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+    let ctx = container.mainContext
+    for (i, t) in ["b", "c", "a"].enumerated() { ctx.insert(Note(title: t, n: i)) }
+    try ctx.save()
+    let all = try ctx.fetch(FetchDescriptor<Note>(sortBy: [SortDescriptor(\Note.title)]))
+    print("fetched", all.map(\.title))
+    let big = try ctx.fetch(FetchDescriptor<Note>(predicate: #Predicate { $0.n >= 1 }, sortBy: [SortDescriptor(\Note.n)]))
+    print("filtered", big.map(\.title), "count", try ctx.fetchCount(FetchDescriptor<Note>()))
+    all[0].n = 99
+    try ctx.save()
+    print("changed", try ctx.fetch(FetchDescriptor<Note>(predicate: #Predicate { $0.n == 99 })).map(\.title))
+    ctx.delete(all[1]); try ctx.save()
+    print("after delete", try ctx.fetchCount(FetchDescriptor<Note>()))
 }
-try MainActor.assumeIsolated { try run() }
-// Core Data underneath, with a programmatic model
-let model = NSManagedObjectModel(); let e = NSEntityDescription(); e.name = "Item"; e.managedObjectClassName = "NSManagedObject"
-let at = NSAttributeDescription(); at.name = "title"; at.attributeType = .stringAttributeType; let an = NSAttributeDescription(); an.name = "n"; an.attributeType = .integer64AttributeType; e.properties = [at, an]; model.entities = [e]
-let pc = NSPersistentContainer(name: "T", managedObjectModel: model); let sd = NSPersistentStoreDescription(); sd.type = NSInMemoryStoreType; pc.persistentStoreDescriptions = [sd]
-var lerr: Error?; pc.loadPersistentStores { _, e in lerr = e }; print("coredata store", lerr == nil)
-let mc = pc.viewContext; for i in 1...5 { let o = NSEntityDescription.insertNewObject(forEntityName: "Item", into: mc); o.setValue("t\(i)", forKey: "title"); o.setValue(i * i, forKey: "n") }; try mc.save()
-let fr = NSFetchRequest<NSManagedObject>(entityName: "Item"); fr.predicate = NSPredicate(format: "n > 4"); fr.sortDescriptors = [NSSortDescriptor(key: "n", ascending: false)]; print("coredata fetch", try mc.fetch(fr).map { $0.value(forKey: "title") as! String })
+MainActor.assumeIsolated { try! run() }
