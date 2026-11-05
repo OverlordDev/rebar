@@ -192,6 +192,9 @@ for cn in cpp_path_iter cpp_filesystem; do
     for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x ${cn}_$a ] && [ ${cn}_$a -nt $cn.cpp ] || clang++ -std=c++20 -O1 -arch $ar $cn.cpp -o ${cn}_$a 2>/dev/null; done
     run_to 30 $T/a ./${cn}_x86; run_to 60 $T/b $R ${cn}_arm; grep -v '^nvrm' $T/b > $T/b2; check $cn $T/a $T/b2
 done
+# Objective-C runtime and Foundation in one program: struct returns, runtime classes, swizzling, forwarding, blocks, weak, exceptions, GCD, operations, KVC, predicates, formatters
+for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x objc_torture_$a ] && [ objc_torture_$a -nt objc_torture.m ] || clang -fobjc-arc -arch $ar -framework Foundation -framework CoreGraphics objc_torture.m -o objc_torture_$a 2>/dev/null; done
+run_to 60 $T/a ./objc_torture_x86; run_to 120 $T/b $R objc_torture_arm; grep -v '^nvrm' $T/b > $T/b2; check objc_torture $T/a $T/b2
 # libc++ (C++20) in one program: streams, filesystem, regex, threads, futures, ranges, format, locale, containers
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x cpp_stdlib_$a ] && [ cpp_stdlib_$a -nt cpp_stdlib.cpp ] || clang++ -std=c++20 -O1 -arch $ar cpp_stdlib.cpp -o cpp_stdlib_$a 2>/dev/null; done
 run_to 60 $T/a ./cpp_stdlib_x86; run_to 120 $T/b $R cpp_stdlib_arm; grep -v '^nvrm' $T/b > $T/b2; check cpp_stdlib $T/a $T/b2
