@@ -1586,7 +1586,9 @@ static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
     ss[29] = c->x[29]; ss[30] = c->x[30]; ss[31] = c->sp; ss[32] = c->pc;
     *(uint32_t *)(mctx + 16 + 33 * 8) = (c->n ? 1u << 31 : 0) | (c->z ? 1u << 30 : 0) | (c->c ? 1u << 29 : 0) | (c->v ? 1u << 28 : 0);
     CPU before = *c;
-    c->sp = (c->sp - 512) & ~0xfull;
+    // a handler registered with SA_ONSTACK runs on the thread's alternate signal stack, as the kernel would run it (Go's sigtrampgo checks that sp is on the signal stack and gives up otherwise)
+    if ((g_guest_fault_flags[hk] & SA_ONSTACK) && t_gss_on && !(c->sp > t_gss_sp && c->sp <= t_gss_sp + t_gss_size)) c->sp = (t_gss_sp + t_gss_size - 512) & ~0xfull;
+    else c->sp = (c->sp - 512) & ~0xfull;
     call_guest(c, g_guest_fault_handler[hk], (uint64_t)sig, (uint64_t)sinfo, (uint64_t)uctx, 0);
     *c = before;
     for (int k = 0; k < 29; k++) c->x[k] = ss[k];

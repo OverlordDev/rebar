@@ -206,6 +206,13 @@ hbcheck brew_sqlite 42 sqlite3 :memory: "select 6*7"
 hbcheck brew_lua 42 lua -e 'print(6*7)'
 [ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
 hbcheck brew_tmux "tmux 3.8" tmux -V
+# Go: runtime panics from faults (nil dereference, nil map, index, divide by zero) are recovered: the guest's SIGSEGV handler has to run on its alternate signal stack
+if [ -x "$HB/bin/go" ]; then
+    gd=$T/go_panics; rm -rf $gd; mkdir -p $gd; cp go_panics.go $gd/main.go; printf 'module gopanics\ngo 1.21\n' > $gd/go.mod
+    RABS=$(cd .. && pwd)/rebar; ( cd $gd && REBAR_PATHMAP=/opt/homebrew=$HB GOCACHE=$T/gocache "$RABS" "$HB/bin/go" build -o gopanics . >/dev/null 2>&1 )
+    printf 'nil deref: runtime error: invalid memory address or nil pointer dereference\nnil map: assignment to entry in nil map\nindex: runtime error: index out of range [3] with length 0\ndiv: runtime error: integer divide by zero\nnil iface: runtime error: invalid memory address or nil pointer dereference\nwrite nil: runtime error: invalid memory address or nil pointer dereference\n' > $T/a
+    run_to 60 $T/b $R $gd/gopanics; grep -v '^nvrm' $T/b > $T/b2; check go_panics $T/a $T/b2
+fi
 hbcheck brew_python_ctypes "ctypes 5 [1, 2, 3, 4, 5] 1024.0 42 42-x" python3.13 ctypes_basic.py
 # libffi closures from a C program (the host libffi is x86_64: the arm64 ABI constant and the closure size are translated)
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x ffi_closure_$a ] && [ ffi_closure_$a -nt ffi_closure.c ] || clang -arch $ar ffi_closure.c -lffi -lm -o ffi_closure_$a 2>/dev/null; done
