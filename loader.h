@@ -21,11 +21,15 @@ static const uint8_t *arm64_slice_or_null(const uint8_t *file, size_t len) {
     if (magic == FAT_CIGAM) {
         const struct fat_header *fh = (const void *)file;
         const struct fat_arch *fa = (const void *)(fh + 1);
+        const uint8_t *arme = NULL;   // (an arm64e slice is used only when there is no plain arm64 one)
         for (uint32_t k = 0; k < __builtin_bswap32(fh->nfat_arch); k++)
             if ((cpu_type_t)__builtin_bswap32(fa[k].cputype) == CPU_TYPE_ARM64) {
                 uint32_t off = __builtin_bswap32(fa[k].offset);
-                if (off < len) return file + off;
+                if (off >= len) continue;
+                if ((__builtin_bswap32(fa[k].cpusubtype) & 0xff) == 2) { if (!arme) arme = file + off; continue; }
+                return file + off;
             }
+        if (arme) return arme;
     }
     return NULL;
 }

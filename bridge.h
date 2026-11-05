@@ -948,13 +948,14 @@ static bool needs_rebar(const char *path) {
     if (magic == FAT_CIGAM) {
         const struct fat_header *fh = (const void *)buf;
         const struct fat_arch *fa = (const void *)(fh + 1);
-        bool arm = false, x86 = false;
+        bool arm = false, arme = false, x86 = false;
         uint32_t na = __builtin_bswap32(fh->nfat_arch);
         for (uint32_t k = 0; k < na && (const uint8_t *)(fa + k + 1) <= buf + n; k++) {
             cpu_type_t t = (cpu_type_t)__builtin_bswap32(fa[k].cputype);
-            if (t == CPU_TYPE_ARM64 && (__builtin_bswap32(fa[k].cpusubtype) & 0xff) != 2) arm = true;   // (an arm64e slice, as in the system tools, needs pointer authentication: rebar cannot run it)
+            if (t == CPU_TYPE_ARM64) { if ((__builtin_bswap32(fa[k].cpusubtype) & 0xff) == 2) arme = true; else arm = true; }   // (arm64e: pointer authentication is a no-op here; a file with arm64e and x86_64 slices, as the system tools, runs natively)
             if (t == CPU_TYPE_X86_64) x86 = true;
         }
+        arm = arm || arme;
         static int all_arm = -1; if (all_arm < 0) all_arm = getenv("REBAR_ALL_ARM64") != NULL;   // REBAR_ALL_ARM64=1: a universal binary that is started runs its arm64 slice under rebar too (to test an app's arm64 build on a Mac that could run the x86_64 one)
         return arm && (!x86 || all_arm);
     }
@@ -3030,8 +3031,9 @@ static void apply_chained_fixups(GImage *img) {
         if (!si->seg_info_offset[s]) continue;
         const struct dyld_chained_starts_in_segment *sg =
             (const void *)((const uint8_t *)si + si->seg_info_offset[s]);
-        if (sg->pointer_format != DYLD_CHAINED_PTR_64 && sg->pointer_format != DYLD_CHAINED_PTR_64_OFFSET) {
-            fprintf(stderr, "rebar: unsupported chained pointer format %u (arm64e?)\n", sg->pointer_format);
+        bool e64 = sg->pointer_format == 1 || sg->pointer_format == 9 || sg->pointer_format == 12;   // DYLD_CHAINED_PTR_ARM64E, _USERLAND, _USERLAND24 (arm64e: pointer authentication codes are never made here, the signed pointers are plain ones)
+        if (sg->pointer_format != DYLD_CHAINED_PTR_64 && sg->pointer_format != DYLD_CHAINED_PTR_64_OFFSET && !e64) {
+            fprintf(stderr, "rebar: unsupported chained pointer format %u\n", sg->pointer_format);
             exit(1);
         }
         for (uint32_t pg = 0; pg < sg->page_count; pg++) {
@@ -3041,6 +3043,20 @@ static void apply_chained_fixups(GImage *img) {
             uint64_t *p = (uint64_t *)(base + sg->segment_offset + (uint64_t)pg * sg->page_size + ps);
             for (;;) {
                 uint64_t raw = *p;
+                if (e64) {
+                    bool auth = raw >> 63, bind = (raw >> 62) & 1; uint32_t nx = (raw >> 51) & 0x7ff;
+                    if (bind) {
+                        uint32_t ordn = sg->pointer_format == 12 ? (uint32_t)(raw & 0xffffff) : (uint32_t)(raw & 0xffff);
+                        int64_t inl = auth ? 0 : (int64_t)((raw >> 32) & 0x7ffff); if (!auth && (inl & 0x40000)) inl -= 0x80000;
+                        *p = bound[ordn] + addend[ordn] + inl;
+                    } else {
+                        uint64_t target = auth ? (raw & 0xffffffffull) : (raw & 0x7ffffffffffull), high8 = auth ? 0 : (raw >> 43) & 0xff;
+                        *p = (sg->pointer_format == 1 ? target + img->slide : base + target) | (high8 << 56);
+                    }
+                    if (!nx) break;
+                    p = (uint64_t *)((uint8_t *)p + nx * 8);
+                    continue;
+                }
                 uint32_t next = (raw >> 51) & 0xfff;
                 if (raw >> 63) {
                     uint32_t ordn = raw & 0xffffff;
