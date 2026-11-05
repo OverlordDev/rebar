@@ -1636,6 +1636,10 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
         int n = snprintf(b, sizeof b, "rebar: signal %d code=%d at host pc %llx (si_addr %p), rsp %llx\n", sig, si->si_code,
                          (unsigned long long)uc->uc_mcontext->__ss.__rip, si->si_addr, (unsigned long long)uc->uc_mcontext->__ss.__rsp);
         write(2, b, n);
+        if (getenv("REBAR_FRAMES")) {   // (a trap in host code, e.g. libsystem aborting on a recursive lock: the frame pointer chain, as raw addresses)
+            uint64_t fp = uc->uc_mcontext->__ss.__rbp; char fb[64];
+            for (int k = 0; k < 40 && fp > 0x1000 && !(fp & 7); k++) { uint64_t *f = (uint64_t *)fp; int m = snprintf(fb, sizeof fb, "  frame %d %llx\n", k, (unsigned long long)f[1]); write(2, fb, m); if (f[0] <= fp) break; fp = f[0]; }
+        }
         if ((uint64_t)si->si_addr != uc->uc_mcontext->__ss.__rip) _exit(140 + sig);
     }
     if (!t_altstack) ensure_altstack();
