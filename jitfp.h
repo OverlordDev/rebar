@@ -12,11 +12,50 @@ static bool g_have_sse41, g_have_fma, g_have_avx2;
 static void sse_m(JC *j, int prefix, int opc, int xr, int base, int32_t disp) { if (prefix) e1(j, prefix); rex(j, 0, xr, base, 0); e1(j, 0x0F); e1(j, opc); modrm_mem(j, xr, base, disp); }
 static void sse_r(JC *j, int prefix, int opc, int xr, int xm) { if (prefix) e1(j, prefix); rex(j, 0, xr, xm, 0); e1(j, 0x0F); e1(j, opc); modrm_rr(j, xr, xm); }
 static void sse_rex_w_m(JC *j, int prefix, int opc, int reg, int base, int32_t disp) { if (prefix) e1(j, prefix); rex(j, 1, reg, base, 0); e1(j, 0x0F); e1(j, opc); modrm_mem(j, reg, base, disp); }
-static void ld_s(JC *j, int xr, int n, int dbl) { sse_m(j, dbl ? 0xF2 : 0xF3, 0x10, xr, R15, GVR(n)); }   // movss / movsd xmm, [V[n]]: the upper bits of xmm are cleared
+// ---- the vector register cache.  A guest vector register that was stored from an xmm register (st_q) is also kept in one of xmm8..xmm13 for the rest of the block, so that the next
+// instruction that reads it takes it from there instead of from memory (a store-forward round trip of ~5 cycles on every link of a chain of floating-point operations).  The memory copy is
+// always written too, so nothing ever has to be written back: a fault, a helper, a side exit all see the registers in memory.  Everything that writes a vector register's memory in any other
+// way (any modrm_mem on the CPU structure's vector area) drops that entry at the end of the instruction (vc_end_insn); a helper call drops all of them (emit_helper).  An st_q inside a forward
+// branch region (open_fwd) does not enter the cache: the store is not on every path.
+static int vc_find(JC *j, int n) { for (int s = 0; s < VC_N; s++) if (j->vc_reg_of[s] == n + 1) return s; return -1; }
+static void vc_clear(JC *j) { memset(j->vc_reg_of, 0, sizeof j->vc_reg_of); j->vc_touch = j->vc_keep = 0; }
+static void vc_end_insn(JC *j) {
+    uint32_t drop = j->vc_touch & ~j->vc_keep;
+    for (int s = 0; s < VC_N; s++) if (j->vc_reg_of[s] && ((drop >> (j->vc_reg_of[s] - 1)) & 1)) j->vc_reg_of[s] = 0;
+    j->vc_touch = j->vc_keep = 0; j->open_fwd = 0;
+}
+static void sse_r(JC *j, int prefix, int opc, int xr, int xm);
+static void vc_set(JC *j, int n, int xr) {   // V[n] has just been stored from xmm xr (0..7): keep a copy
+    int s = vc_find(j, n);
+    if (s < 0) { for (int q = 0; q < VC_N; q++) if (!j->vc_reg_of[q]) { s = q; break; }
+        if (s < 0) { s = 0; for (int q = 1; q < VC_N; q++) if (j->vc_age[q] < j->vc_age[s]) s = q; } }
+    j->vc_reg_of[s] = (uint8_t)(n + 1); j->vc_age[s] = ++j->vc_tick;
+    sse_r(j, 0, 0x28, 8 + s, xr);   // movaps xmm(8+s), xr
+    j->vc_keep |= 1u << n;
+}
+static void ld_s(JC *j, int xr, int n, int dbl) {   // movss / movsd xmm, [V[n]]: the upper bits of xmm are cleared
+    int s = vc_find(j, n);
+    if (s >= 0) {
+        j->vc_age[s] = ++j->vc_tick;
+        if (dbl) sse_r(j, 0xF3, 0x7E, xr, 8 + s);                                   // movq xr, xmm: the upper 64 bits cleared
+        else { sse_r(j, 0, 0x57, xr, xr); sse_r(j, 0xF3, 0x10, xr, 8 + s); }       // xorps xr, xr ; movss xr, xmm: only the low lane
+        return;
+    }
+    sse_m(j, dbl ? 0xF2 : 0xF3, 0x10, xr, R15, GVR(n));
+}
+// the operand of a scalar operation: op xr, V[n] (the low lane) from the cache when it is there
+static void sse_vm(JC *j, int prefix, int opc, int xr, int n) {
+    int s = vc_find(j, n);
+    if (s >= 0) { j->vc_age[s] = ++j->vc_tick; sse_r(j, prefix, opc, xr, 8 + s); } else sse_m(j, prefix, opc, xr, R15, GVR(n));
+}
 // A vector register is read as two 8-byte halves (movq + movhps), not with one 16-byte movups: many templates write a register as two 8-byte stores (or a 4-byte lane
 // store after a 16-byte one), and a 16-byte load that spans two earlier stores cannot be forwarded from the store buffer (a stall of a dozen cycles on every dot product)
-static void ld_q(JC *j, int xr, int n) { sse_m(j, 0xF3, 0x7E, xr, R15, GVR(n)); sse_m(j, 0, 0x16, xr, R15, GVR(n) + 8); }   // movq xmm, [V[n]] ; movhps xmm, [V[n]+8]
-static void st_q(JC *j, int n, int xr) { sse_m(j, 0, 0x11, xr, R15, GVR(n)); }                           // movups [V[n]], xmm
+static void ld_q(JC *j, int xr, int n) {   // movq xmm, [V[n]] ; movhps xmm, [V[n]+8]
+    int s = vc_find(j, n);
+    if (s >= 0) { j->vc_age[s] = ++j->vc_tick; sse_r(j, 0, 0x28, xr, 8 + s); return; }
+    sse_m(j, 0xF3, 0x7E, xr, R15, GVR(n)); sse_m(j, 0, 0x16, xr, R15, GVR(n) + 8);
+}
+static void st_q(JC *j, int n, int xr) { sse_m(j, 0, 0x11, xr, R15, GVR(n)); if (j->open_fwd == 0 && xr < 8) vc_set(j, n, xr); }   // movups [V[n]], xmm (and a copy in the cache)
 static void mov_m64_zero(JC *j, int base, int32_t disp) { rex(j, 1, 0, base, 0); e1(j, 0xC7); modrm_mem(j, 0, base, disp); e4(j, 0); }
 static void movq_xg(JC *j, int xr, int gr);
 static void st_v64z(JC *j, int rd, int src) { movq_xg(j, 15, src); sse_m(j, 0, 0x11, 15, R15, GVR(rd)); }   // V[rd] = src (64 bits), upper half cleared: one 16-byte store (xmm15 is the scratch)   // V[rd] = src (64 bits), upper half cleared
@@ -107,8 +146,8 @@ static JI emit_fp2(JC *j, uint32_t i) {   // two sources: FMUL FDIV FADD FSUB FN
     if (type > 1 || (op > 3 && op != 8)) return JI_NO;
     static const int opc[9] = {0x59, 0x5E, 0x58, 0x5C, 0, 0, 0, 0, 0x59};
     int pre = type ? 0xF2 : 0xF3;
-    sse_m(j, pre, 0x10, 0, R15, GVR(rn));
-    sse_m(j, pre, opc[op], 0, R15, GVR(rm));
+    ld_s(j, 0, rn, type);
+    sse_vm(j, pre, opc[op], 0, rm);
     if (op == 8) {   // FNMUL: the product, negated (a NaN stays the default NaN)
         sse_r(j, type ? 0x66 : 0, 0x2E, 0, 0);
         Fix nan = jcc_fwd(j, CC_P);
@@ -173,7 +212,7 @@ static JI emit_fp1(JC *j, uint32_t i) {   // one source: FMOV FABS FNEG FSQRT FC
 static void jfcmp_flags(JC *j, int type, int rn, int rm, bool zero) {   // N Z C V (in memory) from the comparison of Vn with Vm or with 0.0
     ld_s(j, 0, rn, type);
     if (zero) { sse_r(j, 0, 0x57, 1, 1); sse_r(j, type ? 0x66 : 0, 0x2E, 0, 1); }          // xorps xmm1, xmm1; ucomis[sd] xmm0, xmm1
-    else sse_m(j, type ? 0x66 : 0, 0x2E, 0, R15, GVR(rm));                                   // ucomis[sd] xmm0, [m]
+    else sse_vm(j, type ? 0x66 : 0, 0x2E, 0, rm);                                              // ucomis[sd] xmm0, [m]
     // x86: unordered ZF=PF=CF=1, less CF=1, equal ZF=1, greater none.  ARM: less N, equal ZC, greater C, unordered CV.
     setcc_m(j, CC_P, R15, GV);                      // V = unordered
     setcc_r(j, CC_NP, RCX); setcc_r(j, CC_B, RAX); setcc_r(j, CC_E, RDX);

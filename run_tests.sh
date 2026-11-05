@@ -208,10 +208,10 @@ clang -arch arm64 -march=armv8.5-a -O1 frintts.c -o frintts_arm 2>/dev/null; run
 clang -arch arm64 -march=armv8.6-a+fp16+fp16fml+i8mm+bf16+rcpc+rdm+fcma+flagm+pauth -O1 isa_ext.c -o isa_ext_arm 2>/dev/null; run_to 60 $T/b $R isa_ext_arm; grep -v '^nvrm' $T/b > $T/b2; check isa_ext isa_ext.expected $T/b2
 # newer extensions (CSSC, HBC, CPA, CASP, LSE128, THE/RCW, LRCPC2/3, MOPS, MTE arithmetic) and the saturating shift / SQDMLAL / USQADD / URECPE / FRECPX forms: C model vs inline asm, expected all zeros
 clang -arch arm64 -march=armv9.5-a+fp16+rcpc3+cssc+lse128+mops+hbc+the+cpa+memtag+pauth-lr+d128+lse -O1 isa_ext2.c -o isa_ext2_arm 2>/dev/null; run_to 60 $T/b $R isa_ext2_arm; grep -v '^nvrm' $T/b > $T/b2; check isa_ext2 isa_ext2.expected $T/b2
-# translation cache: the second run of a program finds its block list in REBAR_JIT_CACHE_DIR, translates from it in the background and prints the same output
+# translation cache: the second run of a program maps the code snapshot (and block list) it finds in REBAR_JIT_CACHE_DIR, restores its blocks from it and prints the same output
 CD=$(mktemp -d); clang -arch arm64 -march=armv8.6-a+fp16+rcpc3+cssc+lse128+mops+hbc+the+cpa+memtag+pauth-lr+d128+lse -O1 isa_ext2.c -o isa_ext2_c 2>/dev/null
 REBAR_JIT_CACHE_DIR=$CD $R isa_ext2_c > $T/c1 2>&1; REBAR_JIT_CACHE_DIR=$CD REBAR_JIT_CACHE_DEBUG=1 $R isa_ext2_c > $T/c2 2>&1
-grep -q "cached" $T/c2 && grep -v "^\[jitcache\]" $T/c2 | grep -v '^nvrm' > $T/c2b && grep -v '^nvrm' $T/c1 > $T/c1b; check jit_cache $T/c1b $T/c2b; rm -rf $CD
+grep -q "[1-9][0-9]* restored from the snapshot" $T/c2 && grep -v "^\[jitcache\]" $T/c2 | grep -v '^nvrm' > $T/c2b && grep -v '^nvrm' $T/c1 > $T/c1b; check jit_cache $T/c1b $T/c2b; rm -rf $CD
 # libc++ (C++20) in one program: streams, filesystem, regex, threads, futures, ranges, format, locale, containers
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x cpp_stdlib_$a ] && [ cpp_stdlib_$a -nt cpp_stdlib.cpp ] || clang++ -std=c++20 -O1 -arch $ar cpp_stdlib.cpp -o cpp_stdlib_$a 2>/dev/null; done
 run_to 60 $T/a ./cpp_stdlib_x86; run_to 120 $T/b $R cpp_stdlib_arm; grep -v '^nvrm' $T/b > $T/b2; check cpp_stdlib $T/a $T/b2

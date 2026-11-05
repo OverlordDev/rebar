@@ -170,6 +170,18 @@ static bool jit_leaf_import(uint64_t target, void **fn, int *nargs, int *zext8) 
             *fn = s->host; *nargs = ok[k].nargs; *zext8 = ok[k].zext8;
             return true;
         }
+    // libm: the arguments are in d0 / d1 (s0 / s1), the result in d0 (s0), which is where the x86 convention puts them too (xmm0 / xmm1): *zext8 = 2 (double) or 4 (float), *nargs = how many
+    if (!s->narrow && !getenv("REBAR_NO_LEAF_LIBM")) {
+        static const char *const f1[] = {"sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "cbrt", "erf", "erfc", "tgamma", "lgamma", NULL};
+        static const char *const f2[] = {"atan2", "pow", "fmod", "hypot", "remainder", "copysign", "nextafter", "fdim", NULL};
+        const char *nm = s->name + 1; size_t len = strlen(nm);
+        bool isf = len > 1 && nm[len - 1] == 'f'; char base[16];
+        if (s->name[0] == '_' && len < sizeof base) {
+            snprintf(base, sizeof base, "%.*s", (int)(isf ? len - 1 : len), nm);
+            for (int q = 0; f1[q]; q++) if (!strcmp(base, f1[q])) { *fn = s->host; *nargs = 1; *zext8 = isf ? 4 : 2; return *fn != NULL; }
+            for (int q = 0; f2[q]; q++) if (!strcmp(base, f2[q])) { *fn = s->host; *nargs = 2; *zext8 = isf ? 4 : 2; return *fn != NULL; }
+        }
+    }
     return false;
 }
 
