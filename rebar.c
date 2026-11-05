@@ -1743,6 +1743,22 @@ int main(int argc, char **argv) {
     crypto_init();  // the AES/CRC tables, before there are threads
     stubs_init();
     reserve_guest_region();
+    {   // a script whose interpreter is an arm64 program (#!/path/to/interpreter [argument]): run the interpreter with the script as its argument, as the kernel would
+        int sfd = open(argv[ai], O_RDONLY); char sb[512]; ssize_t sn = sfd >= 0 ? read(sfd, sb, sizeof sb - 1) : -1; if (sfd >= 0) close(sfd);
+        if (sn > 2 && sb[0] == '#' && sb[1] == '!') {
+            sb[sn] = 0; char *nl = strchr(sb, '\n'); if (nl) *nl = 0;
+            char *interp = sb + 2; while (*interp == ' ') interp++;
+            char *iarg = interp; while (*iarg && *iarg != ' ') iarg++;
+            if (*iarg) { *iarg++ = 0; while (*iarg == ' ') iarg++; }
+            if (*interp && needs_rebar(interp)) {
+                char **nv = calloc((size_t)argc + 4, sizeof *nv); int k = 0;
+                for (int j = 0; j < ai; j++) nv[k++] = argv[j];
+                nv[k++] = strdup(interp); if (*iarg) nv[k++] = strdup(iarg);
+                for (int j = ai; j < argc; j++) nv[k++] = argv[j];
+                argv = nv; argc = k;
+            }
+        }
+    }
     char real[PATH_MAX];
     if (!realpath(argv[ai], real)) { perror(argv[ai]); return 1; }
     snprintf(g_exe_path, sizeof g_exe_path, "%s", real);

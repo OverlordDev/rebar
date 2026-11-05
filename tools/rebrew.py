@@ -106,7 +106,12 @@ def relocate_tree(root):
                 try:
                     with open(p, "rb") as fh: data = fh.read()
                 except OSError: continue
-                if b"@@HOMEBREW" in data and b"\0" not in data[:4096]:
+                if data.startswith(b"#!") and b"@@HOMEBREW" in data.split(b"\n", 1)[0] and b"\0" in data[:4096]:   # a bytecode program (OCaml's ocaml, ocamlc, ...): only its #! line holds a placeholder
+                    first, rest = data.split(b"\n", 1)
+                    mode = os.stat(p).st_mode; os.chmod(p, mode | 0o200)
+                    with open(p, "wb") as fh: fh.write(subst(first.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape") + b"\n" + rest)
+                    os.chmod(p, mode)
+                elif b"@@HOMEBREW" in data and b"\0" not in data[:4096]:
                     mode = os.stat(p).st_mode; os.chmod(p, mode | 0o200)
                     with open(p, "wb") as fh: fh.write(subst(data.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape"))
                     os.chmod(p, mode)
@@ -144,6 +149,12 @@ def install(name, seen):
             for e in os.listdir(src):
                 dst = os.path.join(PREFIX, sub, e)
                 if os.path.lexists(dst): os.remove(dst)
+                os.symlink(os.path.relpath(os.path.join(src, e), os.path.join(PREFIX, sub)), dst)
+        elif sub in ("lib", "include", "share", "etc"):   # (programs built for /opt/homebrew look for their files in <prefix>/lib/<name>, <prefix>/share/<name>: OCaml's stdlib, git's templates, ...); first formula wins
+            os.makedirs(os.path.join(PREFIX, sub), exist_ok=True)
+            for e in os.listdir(src):
+                dst = os.path.join(PREFIX, sub, e)
+                if os.path.lexists(dst): continue
                 os.symlink(os.path.relpath(os.path.join(src, e), os.path.join(PREFIX, sub)), dst)
     print("rebrew: installed %s (%d Mach-O files relocated)" % (f["name"], nm))
 
