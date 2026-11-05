@@ -436,7 +436,10 @@ static void find_sigtramp(void) {
     struct sigaction sa, old;
     memset(&sa, 0, sizeof sa); sa.sa_sigaction = sigtramp_probe; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
     if (sigaction(SIGUSR2, &sa, &old)) return;
+    sigset_t one, prev; sigemptyset(&one); sigaddset(&one, SIGUSR2);
+    pthread_sigmask(SIG_UNBLOCK, &one, &prev);   // (a process started with SIGUSR2 blocked, e.g. by a guest's fork+exec, would keep the signal pending and die of it when the guest unblocks the mask later)
     raise(SIGUSR2);
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
     sigaction(SIGUSR2, &old, NULL);
 }
 
@@ -1063,8 +1066,10 @@ static void do_spawn(CPU *c, bool search) {  // (pid*, path, file_actions, attr,
         return;
     }
     char **env = env_with_shim((char *const *)c->x[5]);
+    const char *spath = (const char *)c->x[1];
     if (search) spawn = HOSTFN("posix_spawnp");   // (a program that is not arm64 is found by the host's own PATH search)
-    int r = spawn((pid_t *)c->x[0], (const char *)c->x[1], (const void *)c->x[2], (const void *)c->x[3], (char *const *)c->x[4], env);
+    if (getenv("REBAR_LOG_SPAWN")) { FILE *lf = fopen(getenv("REBAR_LOG_SPAWN"), "a"); if (lf) { fprintf(lf, "[spawn %d] %s%s argv:", getpid(), spath, search ? " (search)" : ""); for (char *const *a = (char *const *)c->x[4]; a && *a; a++) fprintf(lf, " '%s'", *a); fprintf(lf, "\n"); fclose(lf); } }
+    int r = spawn((pid_t *)c->x[0], spath, (const void *)c->x[2], (const void *)c->x[3], (char *const *)c->x[4], env);
     env_free_shim(env, (char *const *)c->x[5]);
     RET(r);
 }
@@ -1074,6 +1079,7 @@ H(h_posix_spawnp) { do_spawn(c, true); }
 static void do_exec(CPU *c, const char *file, char *const *argv, char *const *envp, bool search) {
     char resolved[PATH_MAX];
     char **v = NULL;
+    if (getenv("REBAR_LOG_SPAWN")) { FILE *lf = fopen(getenv("REBAR_LOG_SPAWN"), "a"); if (lf) { fprintf(lf, "[exec %d] %s%s argv:", getpid(), file, search ? " (search)" : ""); for (char *const *a = argv; a && *a; a++) fprintf(lf, " '%s'", *a); fprintf(lf, "\n"); fclose(lf); } }
     if (exec_shim(file, search, argv, (char **)&v, resolved)) {
         execve(g_self_path, v, envp ? envp : environ);
         free(v);
