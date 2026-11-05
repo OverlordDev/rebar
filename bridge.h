@@ -502,16 +502,6 @@ void rebar_bridge_enter(uint64_t *f) {
         for (int k = 0; k < 8; k++) { memset(&c->vr[k], 0, 16); c->vr[k].d[0] = f[6 + k]; }
         c->x[8] = f[20]; c->x[20] = f[21]; c->x[21] = f[22]; c->x[22] = f[25];   // Swift: indirect result address, context, error (all but the error are discarded when the CPU is restored below)
     }
-    if (sigent == SIGURG) {   // Go's preemption signal: its handler reads (and, to preempt, rewrites) the arm64 ucontext, which the host does not have. It is given one of its own whose pc is 0, a place that is not Go code:
-        // the handler then does its bookkeeping (preemptGen, pendingPreemptSignals, which exec waits for on Darwin) and leaves the goroutine alone; the scheduler preempts cooperatively.
-        static __thread uint8_t uctx[64], mctx[816];
-        memset(uctx, 0, sizeof uctx); memset(mctx, 0, sizeof mctx);
-        *(uint64_t *)(uctx + 48) = (uint64_t)mctx; *(uint64_t *)(uctx + 40) = 816;
-        uint64_t *ss = (uint64_t *)(mctx + 16);
-        for (int k = 0; k < 29; k++) ss[k] = saved.x[k];
-        ss[29] = saved.x[29]; ss[30] = saved.x[30]; ss[31] = saved.sp; ss[32] = 0;
-        c->x[2] = (uint64_t)uctx;
-    }
     if (sigent > 0 && sigent < 32 && ((g_sig_onstack >> sigent) & 1) && t_gss_on && !(c->sp > t_gss_sp && c->sp <= t_gss_sp + t_gss_size)) c->sp = (t_gss_sp + t_gss_size) & ~0xfull;
     uint64_t swifterror_in = f[22];
     c->x[30] = stub_addr(STUB_RET);
@@ -605,10 +595,52 @@ H(h_vsprintf_chk)  { VA_INIT(ap, c->x[4]); RET(vsnprintf(P(0), c->x[2], S(3), ap
 static bool fatal_sig(int sig) { return sig == SIGILL || sig == SIGTRAP || sig == SIGFPE || sig == SIGBUS || sig == SIGSEGV; }
 // SIGURG is what Go's runtime sends itself to preempt a goroutine: its handler reads and rewrites the arm64 ucontext, which the host does not have (it would corrupt the x86 frame
 // and the program spins in signal handlers), so the handler is never installed and the signal stays ignored by default; the scheduler then preempts cooperatively.
-static bool guest_cannot_handle(int sig) { (void)sig; return false; }   // (SIGURG used to be dropped here; see rebar_bridge_enter: its handler is given an arm64 ucontext of its own)
+// Go's preemption signal (SIGURG). Its handler reads the arm64 ucontext, which a host signal frame does not have, and it must not run on top of host code that holds a lock (a nested run there
+// deadlocked go build), so the guest's handler is not the host's: a host handler runs it, at once when the thread is executing guest code, otherwise (inside a call into the host, or holding
+// the bridge lock) when that call is done. The handler is given an arm64 ucontext of its own whose pc is 0, a place that is not Go code: it does its bookkeeping (preemptGen,
+// pendingPreemptSignals, which exec waits for on Darwin) and leaves the goroutine alone; the scheduler preempts cooperatively.
+static uint64_t g_urg_handler;
+static __thread siginfo_t t_urg_si;
+static void run_urg(CPU *c) {
+    CPU saved = *c;
+    static __thread uint8_t uctx[64], mctx[816];
+    memset(uctx, 0, sizeof uctx); memset(mctx, 0, sizeof mctx);
+    *(uint64_t *)(uctx + 48) = (uint64_t)mctx; *(uint64_t *)(uctx + 40) = 816;
+    uint64_t *ss = (uint64_t *)(mctx + 16);
+    for (int k = 0; k < 31; k++) ss[k] = saved.x[k];
+    ss[31] = saved.sp; ss[32] = 0;
+    if (t_gss_on && !(c->sp > t_gss_sp && c->sp <= t_gss_sp + t_gss_size)) c->sp = (t_gss_sp + t_gss_size - 256) & ~0xfull; else c->sp = (c->sp - 512) & ~0xfull;
+    c->x[0] = SIGURG; c->x[1] = (uint64_t)&t_urg_si; c->x[2] = (uint64_t)uctx;
+    c->x[30] = stub_addr(STUB_RET); c->pc = g_urg_handler;
+    bool held = gil_release();
+    run_until(c, stub_addr(STUB_RET));
+    if (held) gil_acquire(); else if (t_have_gil) gil_release();
+    *c = saved;
+}
+static void urg_host_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)uc;
+    CPU *c = t_cpu;
+    if (!c || !g_urg_handler) return;
+    t_urg_si = *si; t_urg_pending = 1;   // (never run from here: the thread may hold a lock the guest handler's code needs; see urg_deliver_pending)
+}
+static void urg_deliver_pending(CPU *c) { if (__builtin_expect(t_urg_pending, 0) && !t_have_gil && !t_hc && !t_jit_busy) { t_urg_pending = 0; run_urg(c); } }
+static bool guest_cannot_handle(int sig) { static int ign = -1; if (ign < 0) ign = getenv("REBAR_IGNORE_SIGURG") != NULL; return ign && sig == SIGURG; }   // (SIGURG used to be dropped here; see rebar_bridge_enter: its handler is given an arm64 ucontext of its own)
 static uint32_t g_guest_fault_flags[3];
 H(h_sigaction) {
     int sig = (int)c->x[0];
+    if (sig == SIGURG && !getenv("REBAR_IGNORE_SIGURG")) {
+        if (c->x[2]) { struct sigaction *o = P(2); memset(o, 0, sizeof *o); o->sa_sigaction = (void (*)(int, siginfo_t *, void *))g_urg_handler; }
+        if (c->x[1]) {
+            const struct sigaction *n = P(1);
+            g_urg_handler = (uint64_t)n->sa_sigaction;
+            struct sigaction h; memset(&h, 0, sizeof h);
+            if (g_urg_handler <= 1) { h.sa_handler = g_urg_handler ? SIG_IGN : SIG_DFL; g_urg_handler = 0; }
+            else { h.sa_sigaction = urg_host_handler; h.sa_flags = SA_SIGINFO | SA_RESTART; }
+            sigemptyset(&h.sa_mask); sigaction(SIGURG, &h, NULL);
+        }
+        RET(0);
+        return;
+    }
     if (guest_cannot_handle(sig)) {
         if (c->x[2]) memset(P(2), 0, sizeof(struct sigaction));
         RET(0);
@@ -929,6 +961,7 @@ H(h_mmap) {  // (addr, len, prot, flags, fd, off)
         uint8_t *end = al + len, *top = base + len + GUEST_PAGE;
         if (top > end) munmap(end, (size_t)(top - end));
     }
+    if (r == MAP_FAILED && errno == EINVAL && c->x[1] >= (1ull << 47)) errno = ENOMEM;   // (a length no address space holds: the arm64 kernel says ENOMEM where this one says EINVAL)
     if (r != MAP_FAILED) own_add((uint64_t)r, len);
     if (g_trace_mem && ((uint64_t)r != (uint64_t)-1 ? g_trace_mem - (uint64_t)r < len : g_trace_mem - c->x[0] < len))
         fprintf(stderr, "[mem] mmap(hint 0x%llx, len 0x%llx, prot %d, flags 0x%x) = %p from 0x%llx\n", (unsigned long long)c->x[0], (unsigned long long)c->x[1], prot, flags, r, (unsigned long long)c->x[30]);
@@ -1655,7 +1688,7 @@ static uint64_t host_reg_of(const _STRUCT_X86_THREAD_STATE64 *r, int n) {
     switch (n) { case 0: return r->__rax; case 1: return r->__rcx; case 2: return r->__rdx; case 3: return r->__rbx; case 5: return r->__rbp; case 6: return r->__rsi; case 7: return r->__rdi;
                  case 8: return r->__r8; case 9: return r->__r9; case 10: return r->__r10; case 11: return r->__r11; case 12: return r->__r12; case 13: return r->__r13; case 14: return r->__r14; default: return 0; }
 }
-static bool jit_recover_state(ucontext_t *uc, const JReg *jb) {
+static bool jit_recover_state(ucontext_t *uc, const JReg *jb, uint64_t *ea) {
     if (!t_cpu || !jb->sites || getenv("REBAR_NO_JIT_RECOVER")) return false;
     uint64_t rip = uc->uc_mcontext->__ss.__rip;
     const JSite *hit = NULL;
@@ -1671,6 +1704,7 @@ static bool jit_recover_state(ucontext_t *uc, const JReg *jb) {
         if (g == 31) t_cpu->sp = v; else if (g < 31) t_cpu->x[g] = v;
     }
     t_cpu->pc = hit->pc;
+    { uint64_t a = host_reg_of(r, hit->base) + (uint64_t)(int64_t)hit->disp; if (hit->idx >= 0) a += host_reg_of(r, hit->idx) << hit->scale; *ea = a; }   // (the address the access used: a general protection fault, as for a non-canonical address, reports none)
     return true;
 }
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
@@ -1738,12 +1772,12 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
             return;
         }
     }
-    bool jit_exact = false;   // a fault in a block that is not precise: rebuild the guest state from the access record, if there is one
-    if (g_jit_on && t_cpu && t_fault_jb && (sig == SIGSEGV || sig == SIGBUS) && (uint64_t)si->si_addr != rip) { const JReg *jb0 = jit_block_of(rip); if (jb0 && !jb0->precise) jit_exact = jit_recover_state(uc, jb0); }
+    bool jit_exact = false; uint64_t jit_ea = 0;   // a fault in a block that is not precise: rebuild the guest state from the access record, if there is one
+    if (g_jit_on && t_cpu && t_fault_jb && (sig == SIGSEGV || sig == SIGBUS) && (uint64_t)si->si_addr != rip) { const JReg *jb0 = jit_block_of(rip); if (jb0 && !jb0->precise) jit_exact = jit_recover_state(uc, jb0, &jit_ea); }
     if (g_mach_exc_port && t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && (jit_exact || !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise)) && t_cpu->pc - g_stub_base >= g_stub_size)
         deliver_mach_exception(t_cpu, sig, (uint64_t)si->si_addr);   // (returns only when nothing could be delivered)
     if (t_cpu && t_fault_jb && (uint64_t)si->si_addr != rip && (sig == SIGSEGV || sig == SIGBUS) && g_guest_fault_handler[sig == SIGSEGV ? 0 : 1] && (jit_exact || !(g_jit_on && jit_block_of(rip) && !jit_block_of(rip)->precise)) && t_cpu->pc - g_stub_base >= g_stub_size)   // (not in a stub's host handler: a fault there is rebar's own and must not run guest code with its locks held)
-        deliver_guest_signal(t_cpu, sig, si->si_code, (uint64_t)si->si_addr);   // (does not return: it continues at the pc the guest's handler chose)
+        deliver_guest_signal(t_cpu, sig, jit_exact && !si->si_addr ? 1 : si->si_code, jit_exact && !si->si_addr ? jit_ea : (uint64_t)si->si_addr);   // (does not return: it continues at the pc the guest's handler chose)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }  // REBAR_FAULT_LOG=<file>: fault reports of helper processes whose stderr is lost
     { const JReg *jb = g_jit_on ? jit_block_of(rip) : NULL;
       if (jb) {
@@ -2479,6 +2513,7 @@ static void stub_call(CPU *c) {
     if (lock && !had) gil_acquire();
     stub_call_inner(c);
     if (!had && t_have_gil) gil_release();  // (also when an exception that arrived from the host took the lock meanwhile)
+    urg_deliver_pending(c);
 }
 // The host's seekoff / seekpos of a stream buffer (reached through the vtable of a buffer the host created, such as an ofstream's filebuf: tellp() ends there) return a 136-byte
 // std::fpos by value and seekpos takes one; the type encodings let forward_enc do the sret and by-value conversions.

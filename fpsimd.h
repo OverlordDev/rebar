@@ -91,6 +91,15 @@ static double fp_round(double v, int mode) {
     }
 }
 
+// FRINT32Z / FRINT32X / FRINT64Z / FRINT64X (FEAT_FRINTTS): round to an integral value that fits a signed 32 / 64-bit integer; a value that does not (or a NaN, an infinity) gives the most negative one.
+// Z rounds toward zero, X with the rounding mode in force (to nearest even here).
+static double frint_ts(double v, int bits, bool toward_zero) {
+    double lim = ldexp(1.0, bits - 1);
+    if (isnan(v) || isinf(v)) return -lim;
+    double r = toward_zero ? trunc(v) : rint(v);
+    return (r >= lim || r < -lim) ? -lim : r;
+}
+
 static uint64_t fcvt_int(double v, int mode, bool uns, int bits) {
     if (isnan(v)) return 0;
     double r = fp_round(v, mode);
@@ -300,6 +309,9 @@ static void fp_scalar(CPU *c, uint32_t i) {
             case 11: fpw(c, rdn, type, fp_round(a, 3)); return;
             case 12: fpw(c, rdn, type, fp_round(a, 4)); return;
             case 14: case 15: fpw(c, rdn, type, fp_round(a, 0)); return;
+            case 16: case 17: case 18: case 19:   // FRINT32Z FRINT32X FRINT64Z FRINT64X: single and double only
+                if (type > 1) die(c, "unsupported fp 1-source", i);
+                fpw(c, rdn, type, frint_ts(a, op >= 18 ? 64 : 32, !(op & 1))); return;
             default: die(c, "unsupported fp 1-source", i);
             }
         }
@@ -691,7 +703,9 @@ static void simd_misc2(CPU *c, uint32_t i, bool scalar, bool h16) {
                 else r = f2raw(U ? (double)(uint64_t)a : (double)(int64_t)a, 8);
             } else fr = U ? 1.0 / sqrt(fa) : 1.0 / fa;  // FRSQRTE / FRECPE (exact, not the table estimate)
             break;
+        case 30: if (hi || es < 4) die(c, "unsupported simd misc2", i); fr = frint_ts(fa, 32, !U); break;   // FRINT32Z / FRINT32X
         case 31:
+            if (!hi && es >= 4) { fr = frint_ts(fa, 64, !U); break; }   // FRINT64Z / FRINT64X
             if (!(hi && U)) die(c, "unsupported simd misc2", i);
             fr = sqrt(fa); break;
         default: die(c, "unsupported simd fp misc2", i);

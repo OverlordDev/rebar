@@ -72,7 +72,7 @@ static uint64_t g_jr_ind, g_jr_indmiss;   // REBAR_JITCOUNT: indirect branches e
 static uint64_t g_jr_runs, g_jr_stub, g_jr_budget, g_jr_other, g_jr_found, g_jr_cold;   // REBAR_JITCOUNT: why translated code returned to the dispatcher
 static uint32_t g_jit_fb_key[1 << 12]; static uint64_t g_jit_fb_n[1 << 12];   // instructions that got a helper call instead of a template, by encoding class
 
-typedef struct { uint8_t *at; uint64_t pc; uint8_t reg_of[8]; uint8_t dirty; } JSite;   // a guest memory access in translated code: where its ModRM byte is, the guest pc, and which guest registers the cache held (and had not stored back) just before it
+typedef struct { uint8_t *at; uint64_t pc; uint8_t reg_of[8]; uint8_t dirty; int8_t base, idx; uint8_t scale; int32_t disp; } JSite;   // a guest memory access in translated code: where its ModRM byte is, the guest pc, and which guest registers the cache held (and had not stored back) just before it
 typedef struct { uint8_t *code; uint32_t len; uint32_t n; uint64_t pc; bool precise; JSite *sites; uint32_t nsites; } JReg;   // precise: every memory access of the block leaves the CPU structure exact first (see g_jit_precise_lo)
 static uint64_t g_jit_precise_lo, g_jit_precise_hi;   // guest code in [lo, hi) is translated in the precise form: the pc and the registers are stored before each load / store, so that a fault in it can be given to the guest's signal handler
 static JReg *g_jit_reg;       // every block ever translated, in code-address order (for profiling and fault reports)
@@ -137,14 +137,14 @@ static inline void rex(JC *j, int w, int reg, int rm, int byte) {
     if (r != 0x40 || (byte && (reg >= 4 || rm >= 4))) e1(j, r);
 }
 static inline void modrm_rr(JC *j, int reg, int rm) { e1(j, 0xC0 | ((reg & 7) << 3) | (rm & 7)); }
-static void jsite_add(JC *j) {
+static void jsite_add(JC *j, int base, int idx, int scale, int32_t disp) {
     if (j->nsites == j->capsites) { j->capsites = j->capsites ? j->capsites * 2 : 64; j->sites = realloc(j->sites, (size_t)j->capsites * sizeof(JSite)); }
     JSite *s = &j->sites[j->nsites++];
-    s->at = j->p; s->pc = j->pc; memcpy(s->reg_of, j->rc_reg_of, 8); s->dirty = j->rc_dirty;
+    s->at = j->p; s->pc = j->pc; memcpy(s->reg_of, j->rc_reg_of, 8); s->dirty = j->rc_dirty; s->base = (int8_t)base; s->idx = (int8_t)idx; s->scale = (uint8_t)scale; s->disp = disp;
     for (int k = 0; k < 8; k++) if (j->fresh & (1u << k)) { s->reg_of[k] = 0; s->dirty &= (uint8_t)~(1u << k); }
 }
 static void modrm_mem(JC *j, int reg, int base, int32_t disp) {
-    if (base != R15) jsite_add(j);   // (a memory operand that is not the CPU structure: a guest access, or the code's own cells)
+    if (base != R15) jsite_add(j, base, -1, 0, disp);   // (a memory operand that is not the CPU structure: a guest access, or the code's own cells)
     int mod = (disp == 0 && (base & 7) != 5) ? 0 : (disp >= -128 && disp <= 127) ? 1 : 2;
     e1(j, (mod << 6) | ((reg & 7) << 3) | ((base & 7) == 4 ? 4 : (base & 7)));
     if ((base & 7) == 4) e1(j, 0x24);
@@ -1037,7 +1037,7 @@ static void mem_op(JC *j, int w, int twobyte, uint8_t opc, int reg, Mem m, int b
     if (twobyte) e1(j, 0x0F);
     e1(j, opc);
     if (m.idx < 0) { modrm_mem(j, reg, m.base, m.disp); return; }
-    jsite_add(j);
+    jsite_add(j, m.base, m.idx, m.scale, m.disp);
     int mod = (m.disp == 0 && (m.base & 7) != 5) ? 0 : (m.disp >= -128 && m.disp <= 127) ? 1 : 2;
     e1(j, (mod << 6) | ((reg & 7) << 3) | 4);
     e1(j, (m.scale << 6) | ((m.idx & 7) << 3) | (m.base & 7));
@@ -1382,6 +1382,8 @@ static bool jit_allowed(uint64_t pc) {
     return true;
 }
 
+static __thread int t_urg_pending;   // a SIGURG (Go's preemption signal) arrived: its guest handler runs at the next safe point (urg_deliver_pending in bridge.h)
+static void urg_deliver_pending(CPU *c);
 static __thread bool t_jit_busy;   // this thread is inside jit_compile / jit_invalidate and holds g_jit_mu
 static __thread struct { uint64_t lo, hi; } t_jit_pend[8]; static __thread int t_jit_npend;   // invalidations asked for from a signal handler that interrupted the translator
 static void jit_invalidate(uint64_t lo, uint64_t hi);
@@ -1400,7 +1402,7 @@ static bool jit_needs_budget(uint64_t pc, int maxn) {   // could a loop go throu
 }
 static uint8_t *jit_compile(uint64_t pc) {
     if (t_jit_busy) return NULL;   // a guest signal handler that interrupted this thread inside the translator: interpret, do not wait for the lock this thread holds
-    pthread_mutex_lock(&g_jit_mu); t_jit_busy = true;
+    t_jit_busy = true; pthread_mutex_lock(&g_jit_mu);   // (the flag first: a signal handler that interrupts the thread right after it has the lock must not try to take it again)
     JEnt *ex = jit_probe(pc);
     if (ex) { uint8_t *code = ex->code; t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu); return code; }
     if (g_jit_end - g_jit_top < 65536 || ((g_jit_nonly || g_jit_nskip) && !jit_allowed(pc))) { jit_insert(pc, NULL); t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu); return NULL; }
@@ -1492,7 +1494,7 @@ static void jit_invalidate(uint64_t lo, uint64_t hi) {
         if (t_jit_npend < 8) { t_jit_pend[t_jit_npend].lo = lo; t_jit_pend[t_jit_npend].hi = hi; t_jit_npend++; } else { t_jit_pend[7].lo = 0; t_jit_pend[7].hi = ~0ull; }
         return;
     }
-    pthread_mutex_lock(&g_jit_mu); t_jit_busy = true;
+    t_jit_busy = true; pthread_mutex_lock(&g_jit_mu);
     g_ji_calls++;
     // a huge range (a reservation of gigabytes) is cheaper to answer by looking at every bucket than at every page in it
     bool all = ((hi - 1) >> 12) - (lo >> 12) >= (1u << JIT_PAGE_BITS);
@@ -1532,6 +1534,7 @@ static inline int jit_run(CPU *c, uint8_t *code) {
 
 // Called by the dispatcher at every control-flow join. True when translated code ran (c->pc has moved on).
 static inline bool jit_try(CPU *c, uint64_t *ticks) {
+    if (__builtin_expect(t_urg_pending, 0)) urg_deliver_pending(c);
     uint64_t pc = c->pc;
     JEnt *e = jit_probe(pc);
     uint8_t *code;

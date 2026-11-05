@@ -202,6 +202,8 @@ run_to 60 $T/a ./objc_torture_x86; run_to 120 $T/b $R objc_torture_arme; grep -v
 run_to 60 $T/a ./cpp_stdlib_x86; run_to 120 $T/b $R cpp_stdlib_arme; grep -v '^nvrm' $T/b > $T/b2; check arm64e_cpp $T/a $T/b2
 [ -x fw_swift_foundation_arme ] && [ fw_swift_foundation_arme -nt fw_swift_foundation.swift ] || swiftc -O -target arm64e-apple-macos15.0 -o fw_swift_foundation_arme fw_swift_foundation.swift 2>/dev/null
 run_to 60 $T/a ./fw_swift_foundation_x86; run_to 120 $T/b $R fw_swift_foundation_arme; grep -v '^nvrm' $T/b | grep -v '^rebar: warning' > $T/b2; check arm64e_swift $T/a $T/b2
+# FEAT_FRINTTS (FRINT32Z/32X/64Z/64X): the expected output follows the architecture manual's pseudocode (no arm64 machine to compare with)
+clang -arch arm64 -march=armv8.5-a -O1 frintts.c -o frintts_arm 2>/dev/null; run_to 30 $T/b $R frintts_arm; grep -v '^nvrm' $T/b > $T/b2; check frintts frintts.expected $T/b2
 # libc++ (C++20) in one program: streams, filesystem, regex, threads, futures, ranges, format, locale, containers
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x cpp_stdlib_$a ] && [ cpp_stdlib_$a -nt cpp_stdlib.cpp ] || clang++ -std=c++20 -O1 -arch $ar cpp_stdlib.cpp -o cpp_stdlib_$a 2>/dev/null; done
 run_to 60 $T/a ./cpp_stdlib_x86; run_to 120 $T/b $R cpp_stdlib_arm; grep -v '^nvrm' $T/b > $T/b2; check cpp_stdlib $T/a $T/b2
