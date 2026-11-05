@@ -209,6 +209,9 @@ hbcheck brew_tmux "tmux 3.8" tmux -V
 hbcheck brew_python_ctypes "ctypes 5 [1, 2, 3, 4, 5] 1024.0 42 42-x" python3.13 ctypes_basic.py
 # libffi closures from a C program (the host libffi is x86_64: the arm64 ABI constant and the closure size are translated)
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x ffi_closure_$a ] && [ ffi_closure_$a -nt ffi_closure.c ] || clang -arch $ar ffi_closure.c -lffi -lm -o ffi_closure_$a 2>/dev/null; done
+# libxml2's SAX2 startElementNs has nine arguments: the ninth is on the arm64 callee's stack
+for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x libxml2_sax_$a ] && [ libxml2_sax_$a -nt libxml2_sax.c ] || clang -arch $ar -I$(xcrun --show-sdk-path)/usr/include/libxml2 libxml2_sax.c -lxml2 -o libxml2_sax_$a 2>/dev/null; done
+run_to 30 $T/a ./libxml2_sax_x86; run_to 60 $T/b $R libxml2_sax_arm; grep -v '^nvrm' $T/b > $T/b2; check libxml2_sax $T/a $T/b2
 run_to 30 $T/a ./ffi_closure_x86; run_to 60 $T/b $R ffi_closure_arm; grep -v '^nvrm' $T/b > $T/b2; check ffi_closure $T/a $T/b2
 
 # iOS apps from IPAs (tools/ipa.py): iOS-platform arm64 programs packed as .ipa; the UIKit and SwiftUI ones run with rebar-ios from a generated Mac Catalyst host bundle (needs a window server session)

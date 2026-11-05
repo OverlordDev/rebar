@@ -126,7 +126,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; bool ffi_abi, ffi_closure; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; bool ffi_abi, ffi_closure, cb9; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -1339,6 +1339,7 @@ H(h_nsgetexepath) {
 // and this thread already has the image's block it returns block + offset without leaving the translated code; otherwise (first access of the descriptor, or of the thread)
 // it falls through to this handler, which makes the block, fills in the key and answers.
 H(h_DNSServiceProcessResult) { t_cb_stackargs++; host_call(c, HOSTFN("DNSServiceProcessResult"), false); t_cb_stackargs--; }
+
 H(h_pthread_setspecific) {
     uint64_t key = c->x[0], val = c->x[1];
     host_call(c, HOSTFN("pthread_setspecific"), false);
@@ -2476,7 +2477,7 @@ static void stub_call_inner(CPU *c) {
         if (s->ffi_abi && (uint32_t)c->x[1] == 1) c->x[1] = 2;
         if (s->ffi_closure && c->x[0] < 128) c->x[0] = 128;
         if (s->txn_mask) for (int k = 0; k < 8; k++) if (((s->txn_mask >> k) & 1) && c->x[k] == 1) c->x[k] = 2;
-        t_stk = s->stk; t_swift = s->swift; t_async_call = s->async_host && !g_no_async_tail; host_call(c, s->host, s->sret); t_stk = NULL;
+        t_stk = s->stk; t_swift = s->swift; t_async_call = s->async_host && !g_no_async_tail; if (s->cb9) t_cb_stackargs++; host_call(c, s->host, s->sret); if (s->cb9) t_cb_stackargs--; t_stk = NULL;
         if (s->maps && (uint32_t)c->x[0] == 0 && !t_landed) own_add(*(uint64_t *)addr_ptr, size);  // vm_map & co.: the guest owns what came back
     }
     else {
@@ -2693,6 +2694,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     g_stubs[idx].heapret = !strncmp(name, "_realpath", 9) || !strcmp(name, "_strdup") || !strcmp(name, "_strndup") || !strcmp(name, "_getcwd") ? 1 : (!strcmp(name, "_asprintf") || !strcmp(name, "_vasprintf") ? 2 : 0);   // host functions that return memory from the system's malloc (see heapret_fix)
     if (host && !h && returns_class_by_value(name)) g_stubs[idx].sret = true;
     if (host && !h) g_stubs[idx].swift = (name[0] == '_' && name[1] == '$' && (name[2] == 's' || name[2] == 'S')) || !strcmp(name, "_swift_getAtKeyPath") || !strcmp(name, "_swift_setAtWritableKeyPath") || !strcmp(name, "_swift_modifyAtWritableKeyPath") || !strcmp(name, "_swift_getAtAnyKeyPath") || !strcmp(name, "_swift_getAtPartialKeyPath");   // a Swift symbol: Swift's calling convention (also the key path runtime functions: swiftcc with an indirect result in x8)
+    if (host && !h) g_stubs[idx].cb9 = lib && (strstr(lib, "libxml2") || strstr(lib, "libexpat") || strstr(lib, "libxslt"));   // these parsers call SAX / declaration handlers with nine arguments (startElementNs, expat's EntityDeclHandler): the ninth is on the arm64 callee's stack
     if (host && !h) g_stubs[idx].ffi_closure = !strcmp(name, "_ffi_closure_alloc");   // the caller sizes the closure by the arm64 ffi_closure (40 bytes); the x86_64 libffi keeps its trampoline table and entry after its own, larger fields
     if (host && !h) g_stubs[idx].ffi_abi = !strcmp(name, "_ffi_prep_cif") || !strcmp(name, "_ffi_prep_cif_var");   // an arm64 libffi caller passes FFI_DEFAULT_ABI (FFI_SYSV = 1); the host libffi is the x86_64 one, where 1 is no ABI (FFI_UNIX64 = 2 is the default)
     if (host && !h && g_stubs[idx].swift) { g_stubs[idx].txn_mask = transaction_arg_mask(name); if (g_stubs[idx].txn_mask && g_trace_stubs) fprintf(stderr, "[stub] %s: Transaction? arguments %02x\n", name, g_stubs[idx].txn_mask); }
