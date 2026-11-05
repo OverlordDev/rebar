@@ -1804,6 +1804,16 @@ int main(int argc, char **argv) {
         if (ai + 5 < argc && !strcmp(argv[ai + 4], "scan") && !scan_load(argv[ai + 5])) return 2;
         return jit_selftest(ai + 1 < argc ? atol(argv[ai + 1]) : 200000, ai + 2 < argc ? strtoull(argv[ai + 2], NULL, 0) : 0, ai + 3 < argc && strcmp(argv[ai + 3], "-") ? argv[ai + 3] : NULL, ai + 4 < argc && (!strcmp(argv[ai + 4], "tails") || !strcmp(argv[ai + 4], "scan")));
     }
+    if (ai < argc && !strcmp(argv[ai], "--jit-coverage")) {   // words on stdin: for each, whether the translator has a template (TEMPLATE), calls a helper for it (HELPER; REPLAY: a template with a helper on a rare path) or gives up (NO)
+        jit_init(); g_jit_on = true; uint32_t w; static uint8_t buf[1 << 16];
+        while (scanf("%x", &w) == 1) {
+            JC j; memset(&j, 0, sizeof j); j.p = buf; j.limit = buf + sizeof buf - 512; j.pc = 0x100000000ull; j.sites = t_site_scratch; j.capsites = JSITE_SCRATCH; j.insn_left = 8;
+            int cls = B(w, 28, 25); bool simd = cls == 0x7 || cls == 0xf; uint64_t before = g_emit_helpers;
+            JI r = simd ? ((B(w, 31, 24) & 0x7f) == 0x1e || B(w, 31, 24) == 0x1f ? emit_fp_scalar(&j, w) : emit_neon(&j, w)) : jit_emit(&j, w);
+            printf("%08x %s\n", w, r == JI_NO ? (simd ? "HELPER" : "NO") : g_emit_helpers == before ? "TEMPLATE" : "TEMPLATE+RARE");
+        }
+        return 0;
+    }
     if (ai < argc && !strcmp(argv[ai], "--probe-insns")) { CPU cpu0 = {0}; t_cpu = &cpu0; return probe_insns(); }
     if (ai < argc && !strcmp(argv[ai], "--simd-selftest")) {
         CPU cpu0 = {0}; t_cpu = &cpu0;

@@ -660,7 +660,9 @@ static void jit_h_vls(CPU *c, uint32_t i) {   // SIMD&FP loads and stores: the f
 }
 #define VC_N 6
 static void vc_clear(JC *j); static void vc_set(JC *j, int n, int xr); static int vc_find(JC *j, int n);
+static uint64_t g_emit_helpers;   // helper calls emitted so far (--jit-coverage)
 static void emit_helper(JC *j, void *fn, uint32_t i) {  // fn(c, insn) with c->pc set, for one instruction
+    g_emit_helpers++;
     vc_clear(j);   // (the C function clobbers xmm8..xmm13 and may write any vector register)
     rc_flush(j); rc_sync_out(j);
     mov_ri_nf(j, RAX, j->pc); mov_mr(j, R15, GPC, RAX, 1);

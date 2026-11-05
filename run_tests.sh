@@ -212,6 +212,9 @@ clang -arch arm64 -march=armv9.5-a+fp16+rcpc3+cssc+lse128+mops+hbc+the+cpa+memta
 CD=$(mktemp -d); clang -arch arm64 -march=armv8.6-a+fp16+rcpc3+cssc+lse128+mops+hbc+the+cpa+memtag+pauth-lr+d128+lse -O1 isa_ext2.c -o isa_ext2_c 2>/dev/null
 REBAR_JIT_CACHE_DIR=$CD $R isa_ext2_c > $T/c1 2>&1; REBAR_JIT_CACHE_DIR=$CD REBAR_JIT_CACHE_DEBUG=1 $R isa_ext2_c > $T/c2 2>&1
 grep -q "[1-9][0-9]* restored from the snapshot" $T/c2 && grep -v "^\[jitcache\]" $T/c2 | grep -v '^nvrm' > $T/c2b && grep -v '^nvrm' $T/c1 > $T/c1b; check jit_cache $T/c1b $T/c2b; rm -rf $CD
+# the JIT's NEON templates against the interpreter: ~630 forms (widening, pairwise, halving, shifts, multiplies by element, conversions) on random data, JIT on and off must print the same checksums
+python3 ../tools/neonforms.py > $T/nf.c 2>/dev/null && clang -arch arm64 -O0 -march=armv8.2-a+fp16 $T/nf.c -o $T/nf_arm 2>/dev/null
+REBAR_JIT_CACHE=0 REBAR_JIT=0 $R $T/nf_arm 2>&1 | grep -v '^nvrm' > $T/nf0; REBAR_JIT_CACHE=0 REBAR_JIT_THRESHOLD=1 $R $T/nf_arm 2>&1 | grep -v '^nvrm' > $T/nf1; [ -s $T/nf0 ] && check neon_forms_jit $T/nf0 $T/nf1
 # libc++ (C++20) in one program: streams, filesystem, regex, threads, futures, ranges, format, locale, containers
 for a in arm x86; do ar=arm64; [ $a = x86 ] && ar=x86_64; [ -x cpp_stdlib_$a ] && [ cpp_stdlib_$a -nt cpp_stdlib.cpp ] || clang++ -std=c++20 -O1 -arch $ar cpp_stdlib.cpp -o cpp_stdlib_$a 2>/dev/null; done
 run_to 60 $T/a ./cpp_stdlib_x86; run_to 120 $T/b $R cpp_stdlib_arm; grep -v '^nvrm' $T/b > $T/b2; check cpp_stdlib $T/a $T/b2
@@ -250,7 +253,7 @@ fi
 # Node (V8, workers, crypto, zlib, http, fs including recursive rm through std::filesystem, wasm, Intl)
 if [ -x "$HB/bin/node" ]; then
     printf 'fs hello 5\nwatch ok\nzlib 300 brotli\ncrypto 2d711642 8 2b90e4\ned25519 true\naesgcm secret\nhttp echo:ping\nnet tcp!\nchild hi 3\nworker 42\natomics 5\nwasm 42\nintl 1.234.567,891 1970/1/1 SS 1\nregex 11 a_b_\nbigint 265252859812191058636308480000000\njit 28665 true\nfetch hi\ndns ::1\ntimers ok\nhrtime true darwin arm64\n' > $T/a
-    REBAR_PATHMAP=/opt/homebrew=$HB run_to 120 $T/b $R "$HB/bin/node" node_features.js; grep -v '^nvrm' $T/b > $T/b2; check node_features $T/a $T/b2
+    REBAR_PATHMAP=/opt/homebrew=$HB run_to 120 $T/b $R "$HB/bin/node" node_features.js; grep -v '^nvrm' $T/b > $T/b2; check node_features $T/a $T/b2 's/^dns ::1/dns 127.0.0.1/'
 fi
 # Rust (rustc built for arm64): panics unwind through guest frames running drop glue (a guest personality routine asks for the LSDA and the IP), catch_unwind, threads, std
 if [ -x "$HB/bin/rustc" ]; then

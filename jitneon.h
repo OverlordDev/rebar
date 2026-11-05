@@ -12,6 +12,8 @@ static void sse3a_r(JC *j, int opc, int xr, int xm, int imm) { e1(j, 0x66); rex(
 static void sse_shift_imm(JC *j, int opc, int ext, int xm, int imm) { e1(j, 0x66); rex(j, 0, 0, xm, 0); e1(j, 0x0F); e1(j, opc); modrm_rr(j, ext, xm); e1(j, (uint8_t)imm); }   // 66 0F 71/72/73 /ext ib
 static void v_zero_upper(JC *j, int xr) { sse_r(j, 0xF3, 0x7E, xr, xr); }                      // movq xr, xr: the upper 64 bits become zero
 static void v_ld_lo(JC *j, int xr, int n) { sse_m(j, 0xF3, 0x7E, xr, R15, GVR(n)); }            // movq xr, [V[n]]: the low 64 bits, the rest cleared
+static void v_c128(JC *j, int xr, uint64_t v) { v_const(j, xr, v); sse_r(j, 0x66, 0x6C, xr, xr); }   // the 64-bit constant in both halves of xmm xr (punpcklqdq), rcx is scratch
+static const uint8_t pk_add[4] = {0xFC, 0xFD, 0xFE, 0xD4}, pk_sub[4] = {0xF8, 0xF9, 0xFA, 0xFB};      // paddb/w/d/q, psubb/w/d/q (by log2 of the lane size in bytes)
 
 static void sse_ri(JC *j, int prefix, int opc, int xr, int xm, int imm) { if (prefix) e1(j, prefix); rex(j, 0, xr, xm, 0); e1(j, 0x0F); e1(j, opc); modrm_rr(j, xr, xm); e1(j, (uint8_t)imm); }   // an SSE instruction with an immediate byte (pshufd 66 0F 70, shufps 0F C6)
 static void v_narrow(JC *j, int desz) {   // the elements of xmm0 narrowed to desz bytes each, into its low 64 bits (the upper half is junk)
@@ -349,6 +351,43 @@ static JI emit_smisc2(JC *j, uint32_t i) {
 }
 
 // ---- two registers, miscellaneous: XTN, NOT, compares against zero, FABS / FNEG, SCVTF / UCVTF and FCVTZS / FCVTZU on single-precision lanes, SHLL
+// xmm0 holds floats that are to become 32-bit integers (already rounded): cvttps2dq, then a lane that x86 answers differently from the architecture (NaN or out of range: the "integer
+// indefinite" 0x80000000; for the unsigned forms any negative result too) sends the instruction to the helper, which redoes it exactly.
+static JI v_cvttps_tail(JC *j, uint32_t i, int U, int q, int rd) {
+    sse_r(j, 0xF3, 0x5B, 1, 0);                                          // cvttps2dq xmm1, xmm0
+    if (!U) { v_const(j, 2, 0x8000000080000000ull); sse_r(j, 0x66, 0x6C, 2, 2); sse_r(j, 0x66, 0x76, 2, 1); sse_r(j, 0, 0x50, RAX, 2); }   // lanes that are the "integer indefinite"
+    else sse_r(j, 0, 0x50, RAX, 1);                                      // the sign bits of the results
+    if (!q) alu_ri(j, 4, RAX, 3, 0);
+    alu_rr(j, 0x85, RAX, RAX, 0);
+    Fix rare = jcc_fwd(j, CC_NE);
+    if (!q) v_zero_upper(j, 1);
+    st_q(j, rd, 1);
+    Fix done = jmp_fwd(j);
+    fix_here(j, rare);
+    emit_helper(j, jit_h_simd, i);
+    fix_here(j, done);
+    return JI_OK;
+}
+// FCVTZS / FCVTZU with a fixed-point fraction (32-bit lanes): the input is scaled by 2^fbits first (exact).
+static JI emit_vfcvt_fixed(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), U = B(i, 29, 29), immh = B(i, 22, 19), immhb = B(i, 22, 16), rn = B(i, 9, 5), rd = B(i, 4, 0);
+    if (immh < 4 || immh > 7) return JI_NO;
+    int fbits = 64 - immhb;
+    ld_q(j, 0, rn);
+    uint64_t f = (uint64_t)(uint32_t)((127 + fbits) << 23); v_c128(j, 2, f | (f << 32));
+    sse_r(j, 0, 0x59, 0, 2);                                             // mulps
+    return v_cvttps_tail(j, i, U, q, rd);
+}
+// SHL on bytes: a word shift and a mask.
+static JI emit_vshl8(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), immhb = B(i, 22, 16), rn = B(i, 9, 5), rd = B(i, 4, 0), n = immhb - 8;
+    ld_q(j, 0, rn);
+    if (n) sse_shift_imm(j, 0x71, 6, 0, n);
+    v_c128(j, 1, (uint64_t)((0xffu << n) & 0xffu) * 0x0101010101010101ull); sse_r(j, 0x66, 0xDB, 0, 1);
+    if (!q) v_zero_upper(j, 0);
+    st_q(j, rd, 0);
+    return JI_OK;
+}
 static JI emit_vmisc2(JC *j, uint32_t i) {
     int q = B(i, 30, 30), U = B(i, 29, 29), size = B(i, 23, 22), op = B(i, 16, 12), rn = B(i, 9, 5), rd = B(i, 4, 0);
     if (!U && op == 0x12 && size < 3) {   // XTN / XTN2
@@ -396,21 +435,12 @@ static JI emit_vmisc2(JC *j, uint32_t i) {
         st_q(j, rd, 0);
         return JI_OK;
     }
-    if (op == 0x1b && size == 2) {        // FCVTZS / FCVTZU, 32-bit lanes: a lane that x86 answers differently (NaN, out of range, negative for the unsigned form) goes to the helper
+    if ((op == 0x1b || op == 0x1a) && (size == 0 || size == 2)) {   // FCVTZS FCVTZU (toward zero), FCVTMS FCVTMU (down), FCVTNS FCVTNU (nearest even), FCVTPS FCVTPU (up), 32-bit lanes
+        int rmode = op == 0x1b ? (size == 2 ? -1 : 0x09) : (size == 0 ? 0x08 : 0x0A);   // the roundps mode that comes first (-1: none, cvttps2dq truncates)
+        if (rmode >= 0 && !g_have_sse41) return JI_NO;
         ld_q(j, 0, rn);
-        sse_r(j, 0xF3, 0x5B, 1, 0);                                          // cvttps2dq xmm1, xmm0
-        if (!U) { v_const(j, 2, 0x8000000080000000ull); sse_r(j, 0x66, 0x6C, 2, 2); sse_r(j, 0x66, 0x76, 2, 1); sse_r(j, 0, 0x50, RAX, 2); }   // lanes that are the "integer indefinite"
-        else sse_r(j, 0, 0x50, RAX, 1);                                      // the sign bits of the results
-        if (!q) alu_ri(j, 4, RAX, 3, 0);
-        alu_rr(j, 0x85, RAX, RAX, 0);
-        Fix rare = jcc_fwd(j, CC_NE);
-        if (!q) v_zero_upper(j, 1);
-        st_q(j, rd, 1);
-        Fix done = jmp_fwd(j);
-        fix_here(j, rare);
-        emit_helper(j, jit_h_simd, i);
-        fix_here(j, done);
-        return JI_OK;
+        if (rmode >= 0) sse3a_r(j, 0x08, 0, 0, rmode);                       // roundps xmm0, xmm0
+        return v_cvttps_tail(j, i, U, q, rd);
     }
     bool rev64 = !U && op == 0 && size <= 2, rev32 = U && op == 0 && size <= 1, rev16 = !U && op == 1 && size == 0;
     if (rev64 || rev32 || rev16) {   // REV64 / REV32 / REV16: the elements of each 8 / 4 / 2 byte group in reverse order
@@ -798,7 +828,170 @@ static JI emit_fabd_s(JC *j, uint32_t i) {   // FABD Sd, Sn, Sm / Dd, Dn, Dm: |n
     st_q(j, rd, 0);
     return JI_OK;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// Widening, pairwise, halving and shift-by-immediate integer forms that games and media code run in their inner loops (found with --jit-coverage: each of these went through
+// the helper).  All of them are checked against the interpreter on random data by the differential test samples/neon_forms.c.
+
+// The three-different group: SADDL UADDL, SADDW UADDW, SSUBL USUBL, SSUBW USUBW, SABAL UABAL, SABDL UABDL, SMLAL UMLAL, SMLSL UMLSL, SMULL UMULL (and the "2" forms): the narrow
+// elements (the low half of the register, the high half for "2") are widened with pmovsx / pmovzx and the operation is made on the wide lanes.
+static JI emit_vwiden3(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), U = B(i, 29, 29), size = B(i, 23, 22), rm = B(i, 20, 16), op = B(i, 15, 12), rn = B(i, 9, 5), rd = B(i, 4, 0);
+    bool wide_n = op == 1 || op == 3;
+    if (size == 3 || !g_have_sse41 || !(op <= 3 || op == 5 || op == 7 || op == 8 || op == 10 || op == 12)) return JI_NO;
+    if (size == 2 && (op == 5 || op == 7) && !g_have_avx2) return JI_NO;   // (the absolute difference of 64-bit lanes needs pcmpgtq)
+    if (size == 0 && (op == 5 || op == 7) && !g_have_ssse3) return JI_NO;
+    if (size == 1 && (op == 5 || op == 7) && !g_have_ssse3) return JI_NO;
+    int mv = (U ? 0x30 : 0x20) + (size == 0 ? 0 : size == 1 ? 3 : 5);   // pmovzx / pmovsx bw, wd, dq
+    ld_q(j, 0, rn);
+    if (!wide_n) { if (q) sse_shift_imm(j, 0x73, 3, 0, 8); sse38_r(j, mv, 0, 0); }
+    ld_q(j, 1, rm); if (q) sse_shift_imm(j, 0x73, 3, 1, 8); sse38_r(j, mv, 1, 1);
+    int ws = size + 1;   // log2 of the wide lane size in bytes
+    switch (op) {
+    case 0: case 1: sse_r(j, 0x66, pk_add[ws], 0, 1); break;
+    case 2: case 3: sse_r(j, 0x66, pk_sub[ws], 0, 1); break;
+    case 5: case 7: {   // absolute difference (accumulated for SABAL / UABAL)
+        sse_r(j, 0x66, pk_sub[ws], 0, 1);
+        if (ws == 1) sse38_r(j, 0x1D, 0, 0);         // pabsw
+        else if (ws == 2) sse38_r(j, 0x1E, 0, 0);    // pabsd
+        else { sse_r(j, 0x66, 0xEF, 3, 3); sse38_r(j, 0x37, 3, 0); sse_r(j, 0x66, 0xEF, 0, 3); sse_r(j, 0x66, pk_sub[3], 0, 3); }   // d = a - b; m = (0 > d); |d| = (d ^ m) - m
+        break; }
+    default:            // 8, 10, 12: the products
+        if (ws == 1) sse_r(j, 0x66, 0xD5, 0, 1);           // pmullw
+        else if (ws == 2) sse38_r(j, 0x40, 0, 1);          // pmulld
+        else if (U) sse_r(j, 0x66, 0xF4, 0, 1);            // pmuludq
+        else sse38_r(j, 0x28, 0, 1);                       // pmuldq
+        break;
+    }
+    if (op == 5 || op == 8) { ld_q(j, 3, rd); sse_r(j, 0x66, pk_add[ws], 0, 3); }
+    else if (op == 10) { ld_q(j, 3, rd); sse_r(j, 0x66, pk_sub[ws], 3, 0); sse_r(j, 0, 0x28, 0, 3); }
+    st_q(j, rd, 0);
+    return JI_OK;
+}
+
+// SADDLP UADDLP / SADALP UADALP: the sum of each pair of neighbouring elements, into lanes twice as wide (and added to Vd for the accumulating forms).
+static JI emit_vpaddl(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), U = B(i, 29, 29), size = B(i, 23, 22), op = B(i, 16, 12), rn = B(i, 9, 5), rd = B(i, 4, 0);
+    if (size == 3 || (size == 2 && !U && !g_have_sse41)) return JI_NO;
+    if (q) ld_q(j, 0, rn); else ld_s(j, 0, rn, 1);       // (a 64-bit source: the upper half is zero)
+    sse_r(j, 0, 0x28, 1, 0);                              // xmm1 = xmm0
+    if (size == 0) {
+        if (U) { sse_shift_imm(j, 0x71, 2, 1, 8); sse_r(j, 0x66, 0x76, 2, 2); sse_shift_imm(j, 0x71, 2, 2, 8); sse_r(j, 0x66, 0xDB, 0, 2); }   // hi = x >> 8; lo = x & 0x00ff
+        else { sse_shift_imm(j, 0x71, 4, 1, 8); sse_shift_imm(j, 0x71, 6, 0, 8); sse_shift_imm(j, 0x71, 4, 0, 8); }                          // hi = x >>a 8; lo = (x << 8) >>a 8
+        sse_r(j, 0x66, 0xFD, 0, 1);
+    } else if (size == 1) {
+        if (U) { sse_shift_imm(j, 0x72, 2, 1, 16); sse_r(j, 0x66, 0x76, 2, 2); sse_shift_imm(j, 0x72, 2, 2, 16); sse_r(j, 0x66, 0xDB, 0, 2); }
+        else { sse_shift_imm(j, 0x72, 4, 1, 16); sse_shift_imm(j, 0x72, 6, 0, 16); sse_shift_imm(j, 0x72, 4, 0, 16); }
+        sse_r(j, 0x66, 0xFE, 0, 1);
+    } else {
+        if (U) { sse_shift_imm(j, 0x73, 2, 1, 32); sse_r(j, 0x66, 0x76, 2, 2); sse_shift_imm(j, 0x73, 2, 2, 32); sse_r(j, 0x66, 0xDB, 0, 2); }
+        else { sse_ri(j, 0x66, 0x70, 1, 0, 0x0D); sse38_r(j, 0x25, 1, 1); sse_ri(j, 0x66, 0x70, 0, 0, 0x08); sse38_r(j, 0x25, 0, 0); }   // hi = sext(dwords 1, 3); lo = sext(dwords 0, 2)
+        sse_r(j, 0x66, 0xD4, 0, 1);
+    }
+    if (op == 0x06) { ld_q(j, 3, rd); if (!q) v_zero_upper(j, 3); sse_r(j, 0x66, pk_add[size + 1], 0, 3); }
+    st_q(j, rd, 0);
+    return JI_OK;
+}
+
+// SHADD UHADD (op 0), SRHADD URHADD (op 2): halving adds.  a + b without overflow: (a & b) + ((a ^ b) >> 1); rounding: (a | b) - ((a ^ b) >> 1) (both with the shift of the signedness
+// of the instruction); the unsigned rounding forms of bytes and words are pavgb / pavgw.
+static JI emit_vhadd(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), U = B(i, 29, 29), size = B(i, 23, 22), rm = B(i, 20, 16), op = B(i, 15, 11), rn = B(i, 9, 5), rd = B(i, 4, 0);
+    if (size == 3) return JI_NO;
+    ld_q(j, 0, rn); ld_q(j, 1, rm);
+    if (op == 2 && U && size < 2) { sse_r(j, 0x66, size == 0 ? 0xE0 : 0xE3, 0, 1); if (!q) v_zero_upper(j, 0); st_q(j, rd, 0); return JI_OK; }
+    sse_r(j, 0, 0x28, 2, 0);                                   // xmm2 = a
+    sse_r(j, 0x66, op == 0 ? 0xDB : 0xEB, 2, 1);               // a & b  /  a | b
+    sse_r(j, 0x66, 0xEF, 0, 1);                                // xmm0 = a ^ b
+    if (size == 0) {   // a byte shifted right by one: a word shift and a mask (and the sign bit put back for the signed forms)
+        if (!U) { sse_r(j, 0, 0x28, 4, 0); v_c128(j, 5, 0x8080808080808080ull); sse_r(j, 0x66, 0xDB, 4, 5); }
+        sse_shift_imm(j, 0x71, 2, 0, 1); v_c128(j, 5, 0x7f7f7f7f7f7f7f7full); sse_r(j, 0x66, 0xDB, 0, 5);
+        if (!U) sse_r(j, 0x66, 0xEB, 0, 4);
+    } else sse_shift_imm(j, size == 1 ? 0x71 : 0x72, U ? 2 : 4, 0, 1);
+    sse_r(j, 0x66, op == 0 ? pk_add[size] : pk_sub[size], op == 0 ? 0 : 2, op == 0 ? 2 : 0);   // hadd: xmm0 += xmm2; rhadd: xmm2 -= xmm0
+    if (op != 0) sse_r(j, 0, 0x28, 0, 2);
+    if (!q) v_zero_upper(j, 0);
+    st_q(j, rd, 0);
+    return JI_OK;
+}
+
+// SSHR USHR (op 0), SSRA USRA (2), SRSHR URSHR (4), SRSRA URSRA (6) by an immediate, every lane size.  The rounding forms are (x >> n) + bit n-1 of x, which cannot overflow.
+static void v_shr(JC *j, int xr, int es, int n, bool sgn, int tmp) {   // xmm xr = xmm xr >> n (1..es) per lane of es bits (16, 32, 64); tmp is a scratch xmm
+    if (es == 16 || es == 32) { sse_shift_imm(j, es == 16 ? 0x71 : 0x72, sgn ? 4 : 2, xr, n); return; }   // (a count of the lane width gives 0, or the sign for psra)
+    if (!sgn) { sse_shift_imm(j, 0x73, 2, xr, n); return; }
+    sse_r(j, 0x66, 0xEF, tmp, tmp); sse38_r(j, 0x37, tmp, xr);                // tmp = (0 > x): the sign mask
+    if (n == 64) { sse_r(j, 0, 0x28, xr, tmp); return; }
+    sse_shift_imm(j, 0x73, 2, xr, n); sse_shift_imm(j, 0x73, 6, tmp, 64 - n); sse_r(j, 0x66, 0xEB, xr, tmp);   // (x >> n) | (sign << (64 - n))
+}
+static JI emit_vshr(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), U = B(i, 29, 29), immh = B(i, 22, 19), immhb = B(i, 22, 16), op = B(i, 15, 11), rn = B(i, 9, 5), rd = B(i, 4, 0);
+    int es = immh >= 8 ? 64 : immh >= 4 ? 32 : immh >= 2 ? 16 : 8;
+    if (!immh || (!q && es == 64)) return JI_NO;
+    bool sgn = !U, rnd = op == 4 || op == 6, acc = op == 2 || op == 6;
+    if (es == 64 && sgn && !g_have_avx2) return JI_NO;
+    int n = 2 * es - immhb, lg = es == 8 ? 0 : es == 16 ? 1 : es == 32 ? 2 : 3;
+    ld_q(j, 0, rn);
+    if (rnd) sse_r(j, 0, 0x28, 5, 0);                       // xmm5 = x (for the rounding bit)
+    if (es == 8) {
+        uint64_t keep = n >= 8 ? 0 : (0xffull >> n) * 0x0101010101010101ull;
+        if (sgn) { sse_r(j, 0x66, 0xEF, 3, 3); sse_r(j, 0x66, 0x64, 3, 0); }                   // xmm3 = (0 > x) per byte: the sign mask
+        if (n < 8) sse_shift_imm(j, 0x71, 2, 0, n);
+        v_c128(j, 4, keep); sse_r(j, 0x66, 0xDB, 0, 4);                                         // the low 8-n bits of each byte
+        if (sgn) { sse_r(j, 0x66, 0xDF, 4, 3); sse_r(j, 0x66, 0xEB, 0, 4); }                    // | (sign & ~keep)
+    } else v_shr(j, 0, es, n, sgn, 3);
+    if (rnd) {   // + the bit that was shifted out last
+        if (n > 1) { if (es == 8) sse_shift_imm(j, 0x71, 2, 5, n - 1); else v_shr(j, 5, es, n - 1, false, 4); }
+        v_c128(j, 4, es == 8 ? 0x0101010101010101ull : es == 16 ? 0x0001000100010001ull : es == 32 ? 0x0000000100000001ull : 1ull);
+        sse_r(j, 0x66, 0xDB, 5, 4); sse_r(j, 0x66, pk_add[lg], 0, 5);
+    }
+    if (acc) { ld_q(j, 3, rd); sse_r(j, 0x66, pk_add[lg], 0, 3); }
+    if (!q) v_zero_upper(j, 0);
+    st_q(j, rd, 0);
+    return JI_OK;
+}
+
+// MUL / MLA / MLS by element (16- and 32-bit lanes).
+static JI emit_vindexed_int(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), U = B(i, 29, 29), size = B(i, 23, 22), L = B(i, 21, 21), M = B(i, 20, 20), op = B(i, 15, 12), H = B(i, 11, 11), rn = B(i, 9, 5), rd = B(i, 4, 0);
+    if (!((!U && op == 8) || (U && (op == 0 || op == 4))) || (size != 1 && size != 2) || (size == 2 && !g_have_sse41)) return JI_NO;
+    int rm, idx;
+    if (size == 1) { rm = B(i, 19, 16); idx = (H << 2) | (L << 1) | M; } else { rm = (M << 4) | B(i, 19, 16); idx = (H << 1) | L; }
+    ld_q(j, 2, rm);
+    if (size == 1) {
+        if (idx < 4) sse_ri(j, 0xF2, 0x70, 2, 2, idx * 0x55), sse_ri(j, 0x66, 0x70, 2, 2, 0x00);   // pshuflw: word idx in words 0..3; pshufd: dword 0 everywhere
+        else sse_ri(j, 0xF3, 0x70, 2, 2, (idx - 4) * 0x55), sse_ri(j, 0x66, 0x70, 2, 2, 0xAA);
+    } else sse_ri(j, 0x66, 0x70, 2, 2, idx * 0x55);
+    ld_q(j, 0, rn);
+    if (size == 1) sse_r(j, 0x66, 0xD5, 0, 2); else sse38_r(j, 0x40, 0, 2);   // pmullw / pmulld
+    if (op != 8) {
+        ld_q(j, 3, rd); if (!q) v_zero_upper(j, 3);
+        if (op == 0) sse_r(j, 0x66, pk_add[size], 0, 3); else { sse_r(j, 0x66, pk_sub[size], 3, 0); sse_r(j, 0, 0x28, 0, 3); }
+    }
+    if (!q) v_zero_upper(j, 0);
+    st_q(j, rd, 0);
+    return JI_OK;
+}
+
+// FABD (vector): |a - b|, with the NaN rules of the other floating-point arithmetic.
+static JI emit_vfabd(JC *j, uint32_t i) {
+    int q = B(i, 30, 30), sz = B(i, 22, 22), rm = B(i, 20, 16), rn = B(i, 9, 5);
+    if (!q && sz) return JI_NO;
+    ld_q(j, 0, rn); ld_q(j, 1, rm);
+    sse_r(j, sz ? 0x66 : 0, 0x5C, 0, 1);                                        // subps / subpd
+    v_c128(j, 2, sz ? 0x7fffffffffffffffull : 0x7fffffff7fffffffull); sse_r(j, 0, 0x54, 0, 2);   // andps: the absolute value
+    v_nan_check_or_helper(j, i, sz, q, false);
+    return JI_OK;
+}
+
 static JI emit_neon(JC *j, uint32_t i) {
+    if ((i & 0x9f200c00) == 0x0e200000) { JI r = emit_vwiden3(j, i); if (r != JI_NO) return r; }                                  // the three-different group (widening add, subtract, absolute difference, multiply)
+    if ((i & 0x9f200400) == 0x0e200400 && (B(i, 15, 11) == 0 || B(i, 15, 11) == 2)) { JI r = emit_vhadd(j, i); if (r != JI_NO) return r; }   // SHADD UHADD SRHADD URHADD
+    if ((i & 0x9f3e0c00) == 0x0e200800 && (B(i, 16, 12) == 0x02 || B(i, 16, 12) == 0x06)) { JI r = emit_vpaddl(j, i); if (r != JI_NO) return r; }   // SADDLP UADDLP SADALP UADALP
+    if ((i & 0x9f800400) == 0x0f000400 && (B(i, 15, 11) == 0 || B(i, 15, 11) == 2 || B(i, 15, 11) == 4 || B(i, 15, 11) == 6)) { JI r = emit_vshr(j, i); if (r != JI_NO) return r; }   // right shifts by an immediate, rounding and accumulating
+    if ((i & 0x9f800400) == 0x0f000400 && B(i, 15, 11) == 0x1f) { JI r = emit_vfcvt_fixed(j, i); if (r != JI_NO) return r; }                                // FCVTZS FCVTZU with fixed-point bits
+    if ((i & 0x9f800400) == 0x0f000400 && B(i, 15, 11) == 0x0a && B(i, 22, 19) == 1 && !B(i, 29, 29)) { JI r = emit_vshl8(j, i); if (r != JI_NO) return r; }   // SHL on bytes
+    if ((i & 0x9f000400) == 0x0f000000) { JI r = emit_vindexed_int(j, i); if (r != JI_NO) return r; }                              // MUL MLA MLS by element
+    if ((i & 0xbfa0fc00) == 0x2ea0d400) { JI r = emit_vfabd(j, i); if (r != JI_NO) return r; }                                     // FABD
     if ((i & 0xff7ffc00) == 0x6e30f800 || (i & 0xff7ffc00) == 0x6e30c800) return emit_fredv(j, i);   // FMAXV / FMINV / FMAXNMV / FMINNMV (4S)
     if ((i & 0xbfe0fc00) == 0x2ea04400) return emit_ushl_s(j, i);                 // USHL (32-bit lanes)
     if ((i & 0xfffffc00) == 0x4eb1b800) return emit_addv_4s(j, i);                // ADDV Sd, Vn.4S
