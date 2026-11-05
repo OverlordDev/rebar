@@ -6,7 +6,7 @@ SECS="$1"; shift
 for APP in "$@"; do
   N=$(basename "$APP" .app | tr ' ' '_')
   EXE="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
-  H=/tmp/rp/home_$N; rm -rf "$H" /tmp/rp/$N; mkdir -p "$H"
+  H=/tmp/rp/home_$N; if [ -n "$RP_KEEP_HOME" ]; then rm -rf /tmp/rp/$N; else rm -rf "$H" /tmp/rp/$N; fi; mkdir -p "$H"   # RP_KEEP_HOME=1: keep the private HOME (and the translation cache in it) of the earlier run
   ARGS=""
   if ls "$APP/Contents/Frameworks" 2>/dev/null | grep -q -E "Electron Framework|Framework.framework"; then
     if [ -d "$APP/Contents/Frameworks/Electron Framework.framework" ]; then ARGS="--no-sandbox --use-mock-keychain --disable-gpu-sandbox --use-angle=metal --ignore-gpu-blocklist --enable-gpu-rasterization --user-data-dir=/tmp/rp/$N"; fi

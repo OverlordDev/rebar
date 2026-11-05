@@ -330,7 +330,7 @@ static void *jc_thread(void *arg) {
 }
 static void *jc_saver(void *arg) {
     (void)arg; jc_block_signals();
-    for (int tick = 0;; tick++) { sleep(5); if (g_jc_n >= g_jc_saved_n + 256 || (g_jc_n && !g_jc_saved_n)) jc_save(); if (tick % 6 == 5) sn_save_if(30000); }
+    for (int tick = 0;; tick++) { sleep(5); if (g_jc_n >= g_jc_saved_n + 256 || (g_jc_n && !g_jc_saved_n)) jc_save(); if (tick % 6 == 5) sn_save_if(g_sn_saved_blocks / 5 > 2000 ? g_sn_saved_blocks / 5 : 2000); }
     return NULL;
 }
 
