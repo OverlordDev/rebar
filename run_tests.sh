@@ -214,6 +214,12 @@ hbcheck brew_sqlite 42 sqlite3 :memory: "select 6*7"
 hbcheck brew_lua 42 lua -e 'print(6*7)'
 [ -x "$HB/bin/rg" ] && { echo hello-rebar > $T/rg.txt; printf '1:hello-rebar\n' > $T/a; run_to 30 $T/b $R "$HB/bin/rg" -n hello $T/rg.txt; grep -v '^nvrm' $T/b > $T/b2; check brew_rg $T/a $T/b2; }
 hbcheck brew_tmux "tmux 3.8" tmux -V
+# GObject signals without a marshaller go through libffi (glib's generic closure marshal), GVariant, GMainLoop, GError, UTF-8
+if [ -f "$HB/lib/libgobject-2.0.dylib" ]; then
+    clang -arch arm64 -I$HB/include/glib-2.0 -I$HB/lib/glib-2.0/include -L$HB/lib -lgobject-2.0 -lglib-2.0 -Wl,-rpath,$HB/lib glib_gobject.c -o glib_gobject_arm 2>/dev/null
+    printf "changed 42 hello ud\ncompute 11.0\ntransform 7.500000\nvariant {'a': <[1, 2, 3]>, 'b': <('x', 2.5)>}\nhash 5\nloop done\ngerror 1\nutf8 5 STRASSE\n" > $T/a
+    REBAR_PATHMAP=/opt/homebrew=$HB run_to 60 $T/b $R glib_gobject_arm; grep -v '^nvrm' $T/b > $T/b2; check glib_gobject $T/a $T/b2
+fi
 # a script whose #! interpreter is an arm64 program is run through that interpreter
 if [ -x "$HB/bin/python3.13" ]; then
     printf '#!%s/bin/python3.13 -u\nimport sys\nprint("shebang", len(sys.argv), sys.argv[1:])\n' "$HB" > $T/she.py; chmod +x $T/she.py

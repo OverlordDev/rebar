@@ -117,6 +117,19 @@ def relocate_tree(root):
                     os.chmod(p, mode)
     return n
 
+def link_tree(src, dst):
+    """symlink everything under src into dst; a directory both have (lib/pkgconfig, share/man, ...) is merged entry by entry; on a file that exists, the first formula wins"""
+    os.makedirs(dst, exist_ok=True)
+    for e in os.listdir(src):
+        s, d = os.path.join(src, e), os.path.join(dst, e)
+        if not os.path.lexists(d):
+            os.symlink(os.path.relpath(s, dst), d)
+        elif os.path.isdir(s) and not os.path.islink(s) and os.path.isdir(d):
+            if os.path.islink(d):   # a link to one formula's directory: make it a real one holding links into that formula's directory first
+                old = os.path.realpath(d); os.remove(d); os.makedirs(d)
+                for x in os.listdir(old): os.symlink(os.path.relpath(os.path.join(old, x), d), os.path.join(d, x))
+            link_tree(s, d)
+
 def installed(name):
     return os.path.isdir(os.path.join(PREFIX, "Cellar", name))
 
@@ -150,12 +163,8 @@ def install(name, seen):
                 dst = os.path.join(PREFIX, sub, e)
                 if os.path.lexists(dst): os.remove(dst)
                 os.symlink(os.path.relpath(os.path.join(src, e), os.path.join(PREFIX, sub)), dst)
-        elif sub in ("lib", "include", "share", "etc"):   # (programs built for /opt/homebrew look for their files in <prefix>/lib/<name>, <prefix>/share/<name>: OCaml's stdlib, git's templates, ...); first formula wins
-            os.makedirs(os.path.join(PREFIX, sub), exist_ok=True)
-            for e in os.listdir(src):
-                dst = os.path.join(PREFIX, sub, e)
-                if os.path.lexists(dst): continue
-                os.symlink(os.path.relpath(os.path.join(src, e), os.path.join(PREFIX, sub)), dst)
+        elif sub in ("lib", "include", "share", "etc"):   # (programs built for /opt/homebrew look for their files in <prefix>/lib/<name>, <prefix>/share/<name>: OCaml's stdlib, git's templates, pkg-config files ...)
+            link_tree(src, os.path.join(PREFIX, sub))
     print("rebrew: installed %s (%d Mach-O files relocated)" % (f["name"], nm))
 
 def rebar_env():
