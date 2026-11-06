@@ -5,7 +5,7 @@
 
 static __thread uint64_t g_excl_addr = ~0ull, g_excl_val;
 
-static uint64_t a_load(uint64_t a, int size) {
+static uint64_t a_load(uint64_t a, int size) { a = TBI(a);
     switch (size) {
     case 0: return __atomic_load_n((uint8_t *)a, __ATOMIC_SEQ_CST);
     case 1: return __atomic_load_n((uint16_t *)a, __ATOMIC_SEQ_CST);
@@ -13,7 +13,7 @@ static uint64_t a_load(uint64_t a, int size) {
     default: return __atomic_load_n((uint64_t *)a, __ATOMIC_SEQ_CST);
     }
 }
-static void a_store(uint64_t a, int size, uint64_t v) {
+static void a_store(uint64_t a, int size, uint64_t v) { a = TBI(a);
     switch (size) {
     case 0: __atomic_store_n((uint8_t *)a, (uint8_t)v, __ATOMIC_SEQ_CST); break;
     case 1: __atomic_store_n((uint16_t *)a, (uint16_t)v, __ATOMIC_SEQ_CST); break;
@@ -22,7 +22,7 @@ static void a_store(uint64_t a, int size, uint64_t v) {
     }
 }
 // Compare-and-swap; on failure *expected receives the current value.
-static bool a_cas(uint64_t a, int size, uint64_t *expected, uint64_t desired) {
+static bool a_cas(uint64_t a, int size, uint64_t *expected, uint64_t desired) { a = TBI(a);
 #define CAS(T) { T e = (T)*expected; bool ok = __atomic_compare_exchange_n((T *)a, &e, (T)desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; return ok; }
     switch (size) {
     case 0: CAS(uint8_t)
@@ -33,7 +33,7 @@ static bool a_cas(uint64_t a, int size, uint64_t *expected, uint64_t desired) {
 #undef CAS
 }
 // opc as in LDADD..LDUMIN (0 add, 1 clr, 2 eor, 3 set, 4 smax, 5 smin, 6 umax, 7 umin), 8 = swap.
-static uint64_t a_rmw(uint64_t a, int size, int opc, uint64_t v) {
+static uint64_t a_rmw(uint64_t a, int size, int opc, uint64_t v) { a = TBI(a);
     int es = 1 << size;
     v = zx(v, es);
     uint64_t old = a_load(a, size), nv;
@@ -54,13 +54,13 @@ static uint64_t a_rmw(uint64_t a, int size, int opc, uint64_t v) {
 }
 
 // 128-bit compare-and-swap on a 16-byte aligned address (lock cmpxchg16b); *lo/*hi receive the value that was there
-static bool a_cas128(uint64_t a, uint64_t *lo, uint64_t *hi, uint64_t nlo, uint64_t nhi) {
+static bool a_cas128(uint64_t a, uint64_t *lo, uint64_t *hi, uint64_t nlo, uint64_t nhi) { a = TBI(a);
     uint64_t rlo = *lo, rhi = *hi; unsigned char ok;
     __asm__ volatile("lock cmpxchg16b %1; setz %0" : "=q"(ok), "+m"(*(volatile __int128 *)a), "+a"(rlo), "+d"(rhi) : "b"(nlo), "c"(nhi) : "memory", "cc");
     *lo = rlo; *hi = rhi; return ok;
 }
 // the 128-bit read-modify-write of SWPP / LDCLRP / LDSETP and their RCW forms: op 0 swap, 1 clear bits, 3 set bits; returns the old value
-static void a_rmw128(uint64_t a, int op, uint64_t vlo, uint64_t vhi, uint64_t *olo, uint64_t *ohi) {
+static void a_rmw128(uint64_t a, int op, uint64_t vlo, uint64_t vhi, uint64_t *olo, uint64_t *ohi) { a = TBI(a);
     uint64_t lo = *(volatile uint64_t *)a, hi = *(volatile uint64_t *)(a + 8), nlo, nhi;
     do {
         nlo = op == 0 ? vlo : op == 1 ? lo & ~vlo : lo | vlo;

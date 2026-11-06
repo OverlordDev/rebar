@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"><title>rebar</title><defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#181B20"/><stop offset="1" stop-color="#0B0D10"/></linearGradient></defs>
+<rect x="32" y="32" width="448" height="448" rx="104" fill="url(#bg)"/>
+<rect x="33" y="33" width="446" height="446" rx="103" fill="none" stroke="#fff" stroke-opacity=".08" stroke-width="2"/>
+<circle cx="162.0" cy="162.0" r="82.0" fill="#E9ECEF"/><rect x="268.0" y="80.0" width="164" height="164" rx="14" fill="#586070"/><rect x="80.0" y="268.0" width="164" height="164" rx="14" fill="#586070"/><circle cx="350.0" cy="350.0" r="82.0" fill="#E9ECEF"/>
+</svg>

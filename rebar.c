@@ -477,10 +477,10 @@ x_ldst:
             int bytes = 1 << scale;
             if (L) {
                 VReg a, b; memset(&a, 0, 16); memset(&b, 0, 16);
-                memcpy(&a, (void *)addr, bytes); memcpy(&b, (void *)(addr + bytes), bytes);
+                memcpy(&a, (void *)TBI(addr), bytes); memcpy(&b, (void *)TBI(addr + bytes), bytes);
                 c->vr[rt] = a; c->vr[rt2] = b;
             } else {
-                memcpy((void *)addr, &c->vr[rt], bytes); memcpy((void *)(addr + bytes), &c->vr[rt2], bytes);
+                memcpy((void *)TBI(addr), &c->vr[rt], bytes); memcpy((void *)TBI(addr + bytes), &c->vr[rt2], bytes);
             }
         } else if (L) {
             uint64_t a = mem_ld(addr, esz), b = mem_ld(addr + (1 << esz), esz);

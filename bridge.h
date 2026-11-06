@@ -78,12 +78,14 @@ static void dump_recent_imports(void) {
     static const char *noise[] = {"__tlv_bootstrap", "_pthread_getspecific", "_os_unfair_lock_trylock", "_os_unfair_lock_unlock", "_bzero", "_memcpy",
                                   "_memmove", "___error", "_malloc", "_calloc", "_free", "_malloc_size", "_realloc", "_malloc_zone_malloc", "_malloc_zone_free",
                                   "_pthread_mutex_lock", "_pthread_mutex_unlock", "_pthread_setspecific", "_memset_pattern16", "_strlen", "_memcmp", NULL};
+    static int lim = -1; if (lim < 0) lim = getenv("REBAR_RECENT") ? atoi(getenv("REBAR_RECENT")) : 16;   // REBAR_RECENT=n: show n entries, without the retain / release noise
     int shown = 0;
-    for (unsigned k = 1; k <= 128 && shown < 16; k++) {
+    for (unsigned k = 1; k <= 128 && shown < lim; k++) {
         const RingEnt *e = &t_ring[(t_ring_n - k) & 127];
         if (t_ring_n < k || !e->name) break;
         bool skip = false;
         for (const char **nz = noise; *nz; nz++) if (!strcmp(e->name, *nz)) skip = true;
+        if (lim > 16 && (!strncmp(e->name, "_objc_retain", 12) || !strncmp(e->name, "_objc_release", 13) || !strncmp(e->name, "_objc_autorelease", 17) || !strcmp(e->name, "_swift_retain") || !strcmp(e->name, "_swift_release") || !strcmp(e->name, "_swift_bridgeObjectRetain") || !strcmp(e->name, "_swift_bridgeObjectRelease"))) skip = true;
         if (skip) continue;
         if (!shown++) fprintf(stderr, "  recent imports on this thread, newest first:\n");
         char selb[96] = "";
@@ -91,14 +93,17 @@ static void dump_recent_imports(void) {
         fprintf(stderr, "    %s(0x%llx, 0x%llx, 0x%llx) = 0x%llx from 0x%llx%s\n", e->name, (unsigned long long)e->x0, (unsigned long long)e->x1, (unsigned long long)e->x2, (unsigned long long)e->ret, (unsigned long long)e->lr, selb);
     }
 }
-static void dump_backtrace(CPU *c) {
-    uint64_t pcs[24], n = 0, fp = c->x[29];
-    pcs[n++] = c->pc;
-    pcs[n++] = c->x[30];
+typedef struct { uint64_t pc, sp, fp, lr; uint64_t x[10]; uint64_t d[8]; } UFrame;  // callee-saved view of a guest frame
+typedef struct HostCallRec { struct HostCallRec *prev; CPU *cpu; UFrame f; } HostCallRec;  // one per guest->host call
+typedef struct Act { struct Act *prev; CPU *cpu, *saved; HostCallRec *hc_at_entry; bool own_gil; } Act;   // one per host->guest entry
+static void dump_frames(uint64_t pc, uint64_t lr, uint64_t fp) {
+    uint64_t pcs[24], n = 0;
+    pcs[n++] = pc;
+    pcs[n++] = lr;
     while (n < 24 && fp && !(fp & 7) && own_check(fp, 16)) {
-        uint64_t lr = ((uint64_t *)fp)[1], next = ((uint64_t *)fp)[0];
-        if (!lr) break;
-        pcs[n++] = lr;
+        uint64_t l = ((uint64_t *)fp)[1], next = ((uint64_t *)fp)[0];
+        if (!l) break;
+        pcs[n++] = l;
         if (next <= fp) break;
         fp = next;
     }
@@ -108,15 +113,19 @@ static void dump_backtrace(CPU *c) {
         fprintf(stderr, "  #%llu 0x%llx  %s+0x%llx\n", (unsigned long long)k, (unsigned long long)pcs[k],
                 im ? (name ? name + 1 : im->path) : "?", im ? (unsigned long long)(pcs[k] - im->base) : 0ull);
     }
+}
+static __thread Act *t_act;
+static void dump_backtrace(CPU *c) {
+    dump_frames(c->pc, c->x[30], c->x[29]);
+    for (Act *a = t_act; a && a->saved; a = a->prev) {   // (the guest code this one was entered from, when the host called back into the guest)
+        fprintf(stderr, "  -- entered from the host; the guest code below made that host call --\n");
+        dump_frames(a->saved->pc, a->saved->x[30], a->saved->x[29]);
+    }
     dump_recent_imports();
 }
 
 // ---- exception-handling state (see unwind.h)
-typedef struct { uint64_t pc, sp, fp, lr; uint64_t x[10]; uint64_t d[8]; } UFrame;  // callee-saved view of a guest frame
-typedef struct HostCallRec { struct HostCallRec *prev; CPU *cpu; UFrame f; } HostCallRec;  // one per guest->host call
-typedef struct Act { struct Act *prev; CPU *cpu, *saved; HostCallRec *hc_at_entry; bool own_gil; } Act;   // one per host->guest entry
 static __thread HostCallRec *t_hc;
-static __thread Act *t_act;
 static __thread bool t_landed;                  // an exception was delivered to a guest handler during this host call
 static __thread uint64_t t_pend_x0, t_pend_x1;  // exception pointer / selector for the handler, applied by stub_call
 
@@ -132,7 +141,7 @@ typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; c
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
-#define MAX_STUBS 8192
+#define MAX_STUBS 65536
 #define STUB_RET 0   // pc here means "return to the host" (see call_guest)
 #define STUB_EXIT 1  // main() returned here
 static Stub g_stubs[MAX_STUBS];
@@ -399,6 +408,7 @@ static uint64_t call_guest(CPU *c, uint64_t fn, uint64_t a0, uint64_t a1, uint64
 
 typedef struct { uint64_t sret; bool mem; int hfa; uint64_t tmp[64]; } EntryState;
 static const char *imp_encoding(uint64_t imp);
+static void hot_entry(uint64_t imp);
 static void entry_marshal(CPU *c, uint64_t *f, const char *enc, EntryState *st);
 static void entry_finish(CPU *c, uint64_t *f, EntryState *st);
 static void forward_enc(CPU *c, void *fn, void *stret_fn, const char *enc, const char *name);
@@ -499,6 +509,7 @@ void rebar_bridge_enter(uint64_t *f) {
     int sigent = t_sig_entry; t_sig_entry = 0;
     const uint64_t *stk = (const uint64_t *)f[15];
     const char *enc = imp_encoding(f[14]);
+    hot_entry(f[14]);   // (a guest method the host calls through the fault, again and again, gets a thunk: see objc.h)
     static int trace_entry = -1; if (trace_entry < 0) trace_entry = getenv("REBAR_TRACE_ENTRY") != NULL;   // REBAR_TRACE_ENTRY=1: every host call into a guest function (methods: self, selector)
     if (trace_entry) fprintf(stderr, "[entry] %llx%s%s self=%llx sel=%s a2=%llx a3=%llx\n", (unsigned long long)f[14], enc ? " enc=" : "", enc ? enc : "", (unsigned long long)f[0], (f[1] >> 36) == 0x7ff && ((int (*)(void *))dlsym(RTLD_DEFAULT, "sel_isMapped"))((void *)f[1]) ? ((const char *(*)(void *))dlsym(RTLD_DEFAULT, "sel_getName"))((void *)f[1]) : "-", (unsigned long long)f[2], (unsigned long long)f[3]);
     if (trace_entry) { void *ra = ((void **)f[15])[-1]; Dl_info di; fprintf(stderr, "        called from host %p %s+0x%llx (%s)\n", ra, dladdr(ra, &di) && di.dli_sname ? di.dli_sname : "?", dladdr(ra, &di) ? (unsigned long long)((char *)ra - (char *)di.dli_saddr) : 0ull, di.dli_fname ? strrchr(di.dli_fname, '/') + 1 : "?"); }
@@ -1185,6 +1196,37 @@ H(h_shm_open) { RET(shm_open(S(0), (int)c->x[1], (mode_t)*(uint64_t *)c->sp)); }
 H(h_sem_open) { RET((uint64_t)sem_open(S(0), (int)c->x[1], (mode_t)((uint64_t *)c->sp)[0], (unsigned)((uint64_t *)c->sp)[1])); }
 H(h_syslog)  { VA_INIT(ap, c->sp); vsyslog((int)c->x[0], S(1), ap); c->x[0] = 0; }
 H(h_vsyslog) { VA_INIT(ap, c->x[2]); vsyslog((int)c->x[0], S(1), ap); c->x[0] = 0; }
+// Swift's withVaList / CVarArg: the guest inlines the constructor and append of __VaListBuilder, which build the object in the arm64 layout (count at +0x18, capacity at +0x20, the
+// words at +0x28 behind a pointer: every variadic argument is one 8-byte word, in order, as on the arm64 stack), but the class (its metadata, va_list(), deinit) is the host's own, laid
+// out for x86_64 (a register save area header at +0x10, the storage reference at +0x28): the host's va_list() read the wrong fields and its deinit released the guest's malloc'd buffer as a Swift
+// object (SwiftPM's sqlite3_vmprintf calls: Xcode died when a new project was created). This replaces va_list(): it makes an x86_64 va_list that has every word in the overflow area (gp and fp
+// registers marked used), in the order of the arm64 stack, and empties the builder's fields so that the host's deinit finds nothing to release. The blocks are kept in a ring of 32 per thread.
+H(h_VaListBuilder_va_list) {
+    uint64_t obj = c->x[20];
+    if (!obj || obj < 0x10000 || in_guest(obj)) { c->x[0] = 0; return; }
+    uint64_t *o = (uint64_t *)obj, n = o[3], base = o[5];
+    if (n > (1u << 20)) n = 0;
+    uint8_t *blk = calloc(1, 24 + 176 + (n + 1) * 8);
+    struct { uint32_t gp, fp; void *over, *regs; } *t = (void *)blk;
+    uint8_t *words = blk + 24 + 176;
+    if (n && base) memcpy(words, (void *)base, n * 8);
+    t->gp = 48; t->fp = 176; t->over = words; t->regs = blk + 24;
+    o[3] = o[4] = o[5] = 0;
+    static __thread struct { uint8_t *blk; uint64_t base; } ring[32]; static __thread unsigned rn;
+    unsigned k = rn++ & 31; free(ring[k].blk); if (ring[k].base) free((void *)ring[k].base);
+    ring[k].blk = blk; ring[k].base = base;
+    c->x[0] = (uint64_t)t;
+}
+// ... and the guest allocates the builder with the size its own arm64 class has (0x30), the host's x86_64 class is 0x40 bytes: its deinit reads the storage field behind the block. swift_allocObject
+// gives that class the host's size (checked against the metadata, so every other Swift allocation goes through unchanged).
+H(h_swift_allocObject) {
+    static uint64_t vmeta; static bool tried;
+    if (__builtin_expect(!tried, 0)) { vmeta = (uint64_t)dlsym(RTLD_DEFAULT, "$ss15__VaListBuilderCN"); tried = true; }
+    if (__builtin_expect(c->x[0] == vmeta && vmeta && c->x[1] < 0x40, 0)) c->x[1] = 0x40;
+    host_call(c, HOSTFN("swift_allocObject"), false);
+}
+// asl_log(client, msg, level, format, ...): the variadic arguments are on the guest stack (GPUToolsCore passed a pointer through the registers it left behind)
+H(h_asl_log)  { VA_INIT(ap, c->sp); int (*f)(void *, void *, int, const char *, va_list) = dlsym(RTLD_DEFAULT, "asl_vlog"); c->x[0] = f ? (uint64_t)(int64_t)f((void *)c->x[0], (void *)c->x[1], (int)c->x[2], S(3), ap) : 0; }
 static void exec_list(CPU *c, bool search, bool with_env) {   // execl / execlp / execle: arg0 in x1, the rest of the list on the stack, up to a NULL (and then the environment for execle)
     char *argv[64]; int n = 0; argv[n++] = (char *)c->x[1];
     const uint64_t *st = (const uint64_t *)c->sp;
@@ -1460,12 +1502,18 @@ H(h_Unwind_Resume);
 H(h_Unwind_GetCFA); H(h_Unwind_SetGR); H(h_Unwind_SetIP); H(h_Unwind_GetIP); H(h_Unwind_GetGR); H(h_Unwind_GetIPInfo); H(h_Unwind_GetLanguageSpecificData); H(h_Unwind_GetRegionStart); H(h_Unwind_GetDataRelBase); H(h_Unwind_GetTextRelBase);
 H(h_objc_getProtocol); H(h_NSProtocolFromString); H(h_objc_alloc_init); H(h_objc_alloc); H(h_objc_opt_new); H(h_objc_allocWithZone);
 H(h_vfork); H(h_objc_claimAutoreleasedReturnValue); H(h_objc_autoreleaseReturnValue); H(h_objc_retainAutoreleasedReturnValue); H(h_objc_unsafeClaimAutoreleasedReturnValue); H(h_uname); H(h_thread_get_state); H(h_thread_set_state); H(h_thread_resume); H(h_posix_spawnattr_setbinpref_np); H(h_SSLSetIOFuncs); H(h_SecItemAdd); H(h_SecItemCopyMatching); H(h_SecItemUpdate); H(h_SecItemDelete); H(h_CGGetActiveDisplayList); H(h_CVDisplayLinkCreateWithActiveCGDisplays); H(h_CGDisplayIsActive); H(h_unw_getcontext); H(h_unw_init_local); H(h_unw_step); H(h_unw_get_reg); H(h_unw_set_reg); H(h_unw_get_fpreg); H(h_unw_set_fpreg); H(h_unw_is_signal_frame);
+H(h_abort_report);
 H(h_dlopen); H(h_dlsym); H(h_dlclose); H(h_dladdr); H(h_dlerror);
 H(h_dyld_image_count); H(h_dyld_get_image_name); H(h_dyld_get_image_header);
 H(h_dyld_get_image_vmaddr_slide); H(h_dyld_register_func_for_add_image);
 typedef struct { const char *name; StubHandler h; } Special;
 H(h_path_begin_end); H(h_path_iter_step);
 H(h_ffi_call); H(h_ffi_prep_cif_var); H(h_ffi_prep_cif);
+H(h_abort_report) {   // (the guest calls abort(): say where from, then let the host do it)
+    fprintf(stderr, "rebar: guest called abort() (pid %d) from lr 0x%llx\n", (int)getpid(), (unsigned long long)c->x[30]);
+    dump_recent_imports();
+    host_call(c, HOSTFN("abort"), false);
+}
 static const Special k_special[] = {
     {"_ffi_call", h_ffi_call}, {"_ffi_prep_cif_var", h_ffi_prep_cif_var}, {"_ffi_prep_cif", h_ffi_prep_cif}, {"__ZNKSt3__14__fs10filesystem4path5beginEv", h_path_begin_end}, {"__ZNKSt3__14__fs10filesystem4path3endEv", h_path_begin_end}, {"__ZNSt3__14__fs10filesystem4path8iterator11__incrementEv", h_path_iter_step}, {"__ZNSt3__14__fs10filesystem4path8iterator11__decrementEv", h_path_iter_step},
     {"_printf", h_printf}, {"_fprintf", h_fprintf}, {"_sprintf", h_sprintf}, {"_snprintf", h_snprintf},
@@ -1496,7 +1544,7 @@ static const Special k_special[] = {
     {"_SSLGetEnabledCiphers", h_SSLGetEnabledCiphers}, {"_SSLGetSupportedCiphers", h_SSLGetSupportedCiphers}, {"_SSLSetEnabledCiphers", h_SSLSetEnabledCiphers}, {"_SSLGetNegotiatedCipher", h_SSLGetNegotiatedCipher}, {"_munmap", h_munmap}, {"_mprotect", h_mprotect}, {"_madvise", h_madvise},
     {"_vm_protect", h_vm_protect}, {"_mach_vm_protect", h_vm_protect}, {"_vm_allocate", h_vm_allocate},
     {"_mach_vm_allocate", h_vm_allocate}, {"_vm_deallocate", h_vm_deallocate}, {"_mach_vm_deallocate", h_vm_deallocate},
-    {"_vfork", h_vfork}, {"_objc_claimAutoreleasedReturnValue", h_objc_claimAutoreleasedReturnValue}, {"_objc_autoreleaseReturnValue", h_objc_autoreleaseReturnValue}, {"_objc_retainAutoreleasedReturnValue", h_objc_retainAutoreleasedReturnValue}, {"_objc_unsafeClaimAutoreleasedReturnValue", h_objc_unsafeClaimAutoreleasedReturnValue}, {"_uname", h_uname}, {"_thread_get_state", h_thread_get_state}, {"_thread_set_state", h_thread_set_state}, {"_thread_resume", h_thread_resume}, {"_posix_spawnattr_setbinpref_np", h_posix_spawnattr_setbinpref_np}, {"_SSLSetIOFuncs", h_SSLSetIOFuncs}, {"_SecItemAdd", h_SecItemAdd}, {"_SecItemCopyMatching", h_SecItemCopyMatching}, {"_SecItemUpdate", h_SecItemUpdate}, {"_SecItemDelete", h_SecItemDelete}, {"_CGGetActiveDisplayList", h_CGGetActiveDisplayList}, {"_CVDisplayLinkCreateWithActiveCGDisplays", h_CVDisplayLinkCreateWithActiveCGDisplays}, {"_CGDisplayIsActive", h_CGDisplayIsActive}, {"_unw_getcontext", h_unw_getcontext}, {"_unw_init_local", h_unw_init_local}, {"_unw_step", h_unw_step}, {"_unw_get_reg", h_unw_get_reg}, {"_unw_set_reg", h_unw_set_reg}, {"_unw_get_fpreg", h_unw_get_fpreg}, {"_unw_set_fpreg", h_unw_set_fpreg}, {"_unw_is_signal_frame", h_unw_is_signal_frame}, {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_UIApplicationMain", h_UIApplicationMain}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_vsyslog", h_vsyslog}, {"_syslog$DARWIN_EXTSN", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
+    {"_vfork", h_vfork}, {"_objc_claimAutoreleasedReturnValue", h_objc_claimAutoreleasedReturnValue}, {"_objc_autoreleaseReturnValue", h_objc_autoreleaseReturnValue}, {"_objc_retainAutoreleasedReturnValue", h_objc_retainAutoreleasedReturnValue}, {"_objc_unsafeClaimAutoreleasedReturnValue", h_objc_unsafeClaimAutoreleasedReturnValue}, {"_uname", h_uname}, {"_thread_get_state", h_thread_get_state}, {"_thread_set_state", h_thread_set_state}, {"_thread_resume", h_thread_resume}, {"_posix_spawnattr_setbinpref_np", h_posix_spawnattr_setbinpref_np}, {"_SSLSetIOFuncs", h_SSLSetIOFuncs}, {"_SecItemAdd", h_SecItemAdd}, {"_SecItemCopyMatching", h_SecItemCopyMatching}, {"_SecItemUpdate", h_SecItemUpdate}, {"_SecItemDelete", h_SecItemDelete}, {"_CGGetActiveDisplayList", h_CGGetActiveDisplayList}, {"_CVDisplayLinkCreateWithActiveCGDisplays", h_CVDisplayLinkCreateWithActiveCGDisplays}, {"_CGDisplayIsActive", h_CGDisplayIsActive}, {"_unw_getcontext", h_unw_getcontext}, {"_unw_init_local", h_unw_init_local}, {"_unw_step", h_unw_step}, {"_unw_get_reg", h_unw_get_reg}, {"_unw_set_reg", h_unw_set_reg}, {"_unw_get_fpreg", h_unw_get_fpreg}, {"_unw_set_fpreg", h_unw_set_fpreg}, {"_unw_is_signal_frame", h_unw_is_signal_frame}, {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_UIApplicationMain", h_UIApplicationMain}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_vsyslog", h_vsyslog}, {"_asl_log", h_asl_log}, {"_swift_allocObject", h_swift_allocObject}, {"_$ss15__VaListBuilderC7va_lists03CVaB7PointerVyF", h_VaListBuilder_va_list}, {"_syslog$DARWIN_EXTSN", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
     {"_open$NOCANCEL", h_open}, {"_openat$NOCANCEL", h_openat}, {"_fcntl$NOCANCEL", h_fcntl},   // (the mode / argument of these variadic functions is on the stack on arm64, not in x2 / x3: Bun, Zig and Rust call the $NOCANCEL forms directly)
     {"_exit", h_exit}, {"_atexit", h_atexit}, {"___cxa_atexit", h_cxa_atexit}, {"___cxa_finalize", h_nop},
     {"_qsort", h_qsort}, {"_qsort_r", h_qsort_r}, {"_bsearch", h_bsearch}, {"__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv", h_dir_deref}, {"__ZNKSt3__14__fs10filesystem28recursive_directory_iterator13__dereferenceEv", h_rdir_deref}, {"_tsearch", h_tsearch}, {"_tfind", h_tfind}, {"_tdelete", h_tdelete}, {"_twalk", h_twalk}, {"_lfind", h_lfind}, {"_lsearch", h_lsearch},
@@ -1504,14 +1552,15 @@ static const Special k_special[] = {
     {"_longjmp", h_longjmp}, {"__longjmp", h_longjmp}, {"_siglongjmp", h_longjmp},
     {"__NSGetArgv", h_nsgetargv}, {"__NSGetArgc", h_nsgetargc}, {"__NSGetProgname", h_nsgetprogname},
     {"_getprogname", h_getprogname}, {"__NSGetExecutablePath", h_nsgetexepath},
-    {"__tlv_bootstrap", h_tlv_bootstrap}, {"_pthread_setspecific", h_pthread_setspecific}, {"_swift_updateClassMetadata2", h_swift_updateClassMetadata2}, {"_swift_getInitializedObjCClass", h_swift_getInitializedObjCClass}, {"_DNSServiceProcessResult", h_DNSServiceProcessResult},
+    {"__tlv_bootstrap", h_tlv_bootstrap}, {"_pthread_setspecific", h_pthread_setspecific}, {"_swift_updateClassMetadata2", h_swift_updateClassMetadata2}, {"_swift_initClassMetadata2", h_swift_initClassMetadata2}, {"_swift_getInitializedObjCClass", h_swift_getInitializedObjCClass}, {"_DNSServiceProcessResult", h_DNSServiceProcessResult},
+    {"_abort", h_abort_report},
     {"_dlopen", h_dlopen}, {"_dlerror", h_dlerror}, {"_dlsym", h_dlsym}, {"_dlclose", h_dlclose}, {"_dladdr", h_dladdr},
     {"__dyld_image_count", h_dyld_image_count}, {"__dyld_get_image_name", h_dyld_get_image_name},
     {"__dyld_get_image_header", h_dyld_get_image_header}, {"__dyld_get_image_vmaddr_slide", h_dyld_get_image_vmaddr_slide},
     {"__dyld_register_func_for_add_image", h_dyld_register_func_for_add_image}, {"__Unwind_Resume", h_Unwind_Resume}, {"__Unwind_GetIPInfo", h_Unwind_GetIPInfo}, {"__Unwind_GetLanguageSpecificData", h_Unwind_GetLanguageSpecificData}, {"__Unwind_GetRegionStart", h_Unwind_GetRegionStart}, {"__Unwind_GetDataRelBase", h_Unwind_GetDataRelBase}, {"__Unwind_GetTextRelBase", h_Unwind_GetTextRelBase}, {"__Unwind_GetCFA", h_Unwind_GetCFA}, {"__Unwind_SetGR", h_Unwind_SetGR}, {"__Unwind_SetIP", h_Unwind_SetIP}, {"__Unwind_GetIP", h_Unwind_GetIP}, {"__Unwind_GetGR", h_Unwind_GetGR},
     {"_objc_msgSend", h_objc_msgSend}, {"_objc_msgSendSuper2", h_objc_msgSendSuper2},
     {"_CFRunLoopObserverCreate", h_CFRunLoopObserverCreate}, {"_CFRunLoopTimerCreate", h_CFRunLoopTimerCreate}, {"_CFRunLoopSourceCreate", h_CFRunLoopSourceCreate}, {"_CVDisplayLinkSetOutputCallback", h_CVDisplayLinkSetOutputCallback},
-    {"_method_setImplementation", h_method_setImplementation}, {"_class_replaceMethod", h_class_replaceMethod}, {"_class_addMethod", h_class_addMethod},
+    {"_method_setImplementation", h_method_setImplementation}, {"_method_getTypeEncoding", h_method_getTypeEncoding}, {"_method_copyReturnType", h_method_copyReturnType}, {"_method_getReturnType", h_method_getReturnType}, {"_method_copyArgumentType", h_method_copyArgumentType}, {"_method_getArgumentType", h_method_getArgumentType}, {"_class_replaceMethod", h_class_replaceMethod}, {"_class_addMethod", h_class_addMethod},
     {"_method_getImplementation", h_method_getImplementation}, {"_class_getMethodImplementation", h_class_getMethodImplementation},
     {"_NSLog", h_NSLog}, {"_NSLogv", h_NSLogv},
     {"_CFStringCreateWithFormat", h_CFStringCreateWithFormat},
@@ -1817,8 +1866,18 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
           fprintf(stderr, "  host code at the fault:"); for (int k = -16; k < 16; k++) fprintf(stderr, " %02x", ((uint8_t *)rip)[k]); fprintf(stderr, "\n  block code:"); for (uint32_t k = 0; k < jb->len && k < 400; k++) fprintf(stderr, "%s%02x", k % 32 ? " " : "\n   ", jb->code[k]); fprintf(stderr, "\n");
           fprintf(stderr, "  host registers: rax=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx r15=%llx rsp=%llx\n", (unsigned long long)uc->uc_mcontext->__ss.__rax, (unsigned long long)uc->uc_mcontext->__ss.__rcx, (unsigned long long)uc->uc_mcontext->__ss.__rdx, (unsigned long long)uc->uc_mcontext->__ss.__rsi, (unsigned long long)uc->uc_mcontext->__ss.__rdi, (unsigned long long)uc->uc_mcontext->__ss.__r8, (unsigned long long)uc->uc_mcontext->__ss.__r9, (unsigned long long)uc->uc_mcontext->__ss.__r15, (unsigned long long)uc->uc_mcontext->__ss.__rsp);
       } }
-    fprintf(stderr, "rebar: fault (signal %d) addr %p, host pc %p, last guest pc 0x%llx, last import %s called from 0x%llx\n",
-            sig, si->si_addr, (void *)rip, (unsigned long long)(t_cpu ? t_cpu->pc : 0), t_last_stub ? t_last_stub->name : "-", (unsigned long long)t_last_lr);
+    if (getenv("REBAR_FAULT_FRAMES")) {   // the host frames above the fault by rbp chain (a fault inside a host library: who called it)
+        uint64_t bp = uc->uc_mcontext->__ss.__rbp; fprintf(stderr, "rebar: host frames at the fault (rbp chain):\n");
+        for (int k = 0; k < 24 && bp > 0x1000 && !(bp & 7); k++) {
+            uint64_t fr[2]; mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite(mach_task_self(), bp, 16, (mach_vm_address_t)fr, &got) != 0 || got != 16) break;
+            Dl_info di; bool ok = dladdr((void *)fr[1], &di) && di.dli_sname;
+            fprintf(stderr, "    ret 0x%llx %s+%ld (%s)\n", (unsigned long long)fr[1], ok ? di.dli_sname : "?", ok ? (long)(fr[1] - (uint64_t)di.dli_saddr) : 0L, di.dli_fname ? strrchr(di.dli_fname, '/') + 1 : "?");
+            if (fr[0] <= bp) break; bp = fr[0];
+        }
+    }
+    fprintf(stderr, "rebar: fault (pid %d, signal %d) addr %p, host pc %p, last guest pc 0x%llx, last import %s called from 0x%llx\n",
+            (int)getpid(), sig, si->si_addr, (void *)rip, (unsigned long long)(t_cpu ? t_cpu->pc : 0), t_last_stub ? t_last_stub->name : "-", (unsigned long long)t_last_lr);
     if (getenv("REBAR_DUMP_CODE_AT")) { uint64_t a = strtoull(getenv("REBAR_DUMP_CODE_AT"), NULL, 16); const uint8_t *q = (const uint8_t *)(a - 0x100); fprintf(stderr, "  [code from %p:", (void *)q); for (int k = 0; k < 0x180; k++) fprintf(stderr, " %02x", q[k]); fprintf(stderr, "]\n"); }
     if (getenv("REBAR_DUMP_CODE")) { const uint8_t *pc = (const uint8_t *)uc->uc_mcontext->__ss.__rip; fprintf(stderr, "  [code at host pc %p, 48 bytes before and 16 after:", (void *)pc); for (int k = -48; k < 16; k++) fprintf(stderr, " %02x", pc[k]); fprintf(stderr, "]\n"); }
     if (getenv("REBAR_DUMP_ADDR")) { for (char *spec = strdup(getenv("REBAR_DUMP_ADDR")), *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) { uint64_t a = strtoull(tok, NULL, 16); uint64_t w[16] = {0}; mach_vm_size_t got = 0; bool ok = mach_vm_read_overwrite(mach_task_self(), a, 128, (mach_vm_address_t)w, &got) == KERN_SUCCESS; fprintf(stderr, "  [memory at %llx%s]", (unsigned long long)a, ok ? "" : " (not readable)"); if (ok) for (int k = 0; k < 16; k++) fprintf(stderr, " %llx", (unsigned long long)w[k]); fprintf(stderr, "\n"); } }
@@ -1879,6 +1938,10 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
     if (t_cpu && getenv("REBAR_DUMP_REGS_MEM")) for (int k = 0; k < 3; k++) { uint64_t base = (k == 0 ? t_cpu->x[1] : k == 1 ? t_cpu->x[20] : t_cpu->x[0]); if (base > 0x10000 && base < 0x7fffffffffffull) { fprintf(stderr, "  mem at x%d=%llx:", k == 0 ? 1 : k == 1 ? 20 : 0, (unsigned long long)base); mach_vm_size_t got = 0; uint64_t w[24]; if (mach_vm_read_overwrite(mach_task_self(), base, sizeof w, (mach_vm_address_t)w, &got) == KERN_SUCCESS) for (int j = 0; j < 24; j++) fprintf(stderr, " %llx", (unsigned long long)w[j]); fprintf(stderr, "\n"); } }
     if (t_cpu) { fprintf(stderr, "  guest registers (pc %llx):", (unsigned long long)t_cpu->pc); for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)t_cpu->x[k]); fprintf(stderr, " sp=%llx\n", (unsigned long long)t_cpu->sp); }
     if (t_ring_n) { const RingEnt *e = &t_ring[(t_ring_n - 1) & 127]; fprintf(stderr, "  last import: %s(0x%llx, 0x%llx, 0x%llx)\n", e->name, (unsigned long long)e->x0, (unsigned long long)e->x1, (unsigned long long)e->x2); }
+    if (t_cpu) {   // where the guest was: image and offset of the pc and the return address, and the frame-pointer chain
+        fprintf(stderr, "  guest frames at the fault:\n"); dump_frames(t_cpu->pc, t_cpu->x[30], t_cpu->x[29]);
+        for (Act *a = t_act; a && a->saved; a = a->prev) { fprintf(stderr, "  -- entered from the host --\n"); dump_frames(a->saved->pc, a->saved->x[30], a->saved->x[29]); }
+    }
     dump_recent_imports();
     {   // what the kernel says about the page that was touched
         mach_vm_address_t ra = (mach_vm_address_t)si->si_addr;
@@ -2755,6 +2818,9 @@ static void stub_call_inner(CPU *c) {
     }
     apply_landing(c);
     ring_ent->ret = c->x[0];
+    { static const char *r0 = (const char *)1; if (r0 == (const char *)1) r0 = getenv("REBAR_TRACE_RET0");   // REBAR_TRACE_RET0=<name prefix>: imports of that kind that returned 0 (a metadata lookup that found nothing)
+      if (r0 && c->x[0] == 0 && !strncmp(s->name, r0, strlen(r0))) { fprintf(stderr, "[ret0] %s(0x%llx, 0x%llx, 0x%llx) from 0x%llx\n", s->name, (unsigned long long)ring_ent->x0, (unsigned long long)ring_ent->x1, (unsigned long long)ring_ent->x2, (unsigned long long)ring_ent->lr);
+        if (ring_ent->x0 > 0x10000 && ring_ent->x0 < 0x7fffffffffffull && !strncmp(s->name, "_swift_getTypeByMangledName", 27)) { char nm[80]; mach_vm_size_t got = 0; if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)ring_ent->x0, 79, (mach_vm_address_t)nm, &got) == 0) { nm[got < 79 ? got : 79] = 0; fprintf(stderr, "        name bytes: "); for (int k = 0; k < 40 && nm[k]; k++) fputc(nm[k] >= 32 && nm[k] < 127 ? nm[k] : '.', stderr); fputc('\n', stderr); } } } }
     if (g_trace_stubs && getenv("REBAR_TRACE_STUBS") && strcmp(getenv("REBAR_TRACE_STUBS"), "1") && trace_stub_wanted(s->name)) { char b[64]; int n = snprintf(b, sizeof b, "   -> %llx\n", (unsigned long long)c->x[0]); write(2, b, n); }
     if (g_trace_stubs && (!strcmp(s->name, "_mmap") || !strcmp(s->name, "_munmap") || !strcmp(s->name, "_mprotect"))) { char b[64]; int n = snprintf(b, sizeof b, "   -> %llx\n", (unsigned long long)c->x[0]); write(2, b, n); }
 }
@@ -3044,7 +3110,30 @@ static uint64_t image_export_lookup(const GImage *img, const char *name);
 
 // Returns the value to store in the guest's pointer slot for this import.
 // The address of a variable the host defines (kCFRunLoopCommonModes, stdout, ...), or 0 if `name` is not one.
+static uint64_t host_data_addr_uncached(const char *name);
+// The same names are asked for by every image (objc_msgSend, __stack_chk_guard, ... in each of Xcode's thousand images), and each answer costs a scan of the special tables, a dlsym over
+// every loaded image and a dladdr: the answers (also "not a variable") are kept.
 static uint64_t host_data_addr(const char *name) {
+    static struct { const char *name; uint64_t addr; } *tab; static const unsigned N = 1u << 17; static unsigned used; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t h = 1469598103934665603ull; for (const char *q = name; *q; q++) h = (h ^ (uint8_t)*q) * 1099511628211ull;
+    pthread_mutex_lock(&mu);
+    if (!tab) tab = calloc(N, sizeof *tab);
+    if (tab) for (unsigned k = 0; k < N; k++) {
+        unsigned j = (unsigned)((h >> 20) + k) & (N - 1);
+        if (!tab[j].name) {
+            pthread_mutex_unlock(&mu);
+            uint64_t a = host_data_addr_uncached(name);
+            pthread_mutex_lock(&mu);
+            if (used < N / 2 && !tab[j].name) { tab[j].name = strdup(name); tab[j].addr = a; used++; }
+            pthread_mutex_unlock(&mu);
+            return a;
+        }
+        if (!strcmp(tab[j].name, name)) { uint64_t a = tab[j].addr; pthread_mutex_unlock(&mu); return a; }
+    }
+    pthread_mutex_unlock(&mu);
+    return host_data_addr_uncached(name);
+}
+static uint64_t host_data_addr_uncached(const char *name) {
     for (const char **d = k_data_syms; *d; d++)
         if (!strcmp(*d, name)) { void *p = data_addr(name); if (p) return (uint64_t)p; }
     for (const Special *s = k_special; s->name; s++) if (!strcmp(s->name, name)) return 0;

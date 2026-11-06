@@ -378,10 +378,12 @@ static void run_image_initializers(CPU *c, GImage *img, char **apple) {
 
 // Brings images [first, g_nimages) to the running state: fixups, unwind info, ObjC, +load, initializers.
 static char **g_apple;
+static void install_host_bundle_hook(void);
 static void start_images(CPU *c, int first) {
     for (int k = first; k < g_nimages; k++) fixup_image(g_images[k]);
     for (int k = first; k < g_nimages; k++) { unwind_setup_image(g_images[k]); objc_prepare_image(g_images[k]); }
     for (int k = first; k < g_nimages; k++) objc_map_image(g_images[k]);
+    install_host_bundle_hook();
     for (int k = first; k < g_nimages; k++) objc_attach_categories(g_images[k]);
     for (int k = first; k < g_nimages; k++) swift_register_image(g_images[k]);
     jitcache_kick(g_nimages);   // the code of these images is final: the translator may start on the blocks it remembers
@@ -472,6 +474,80 @@ H(h_dlopen) {
     void *h = dlopen(path, (int)c->x[1]);  // a system library
     if (!h) { const char *e = dlerror(); snprintf(g_dlerr, sizeof g_dlerr, "%s", e ? e : "image not found"); g_dlerr_pending = true; }   // (kept for the guest's dlerror: the message is delivered once, and a second failed dlopen of the same name used to leave the host with none: JNA then took strlen of NULL)
     c->x[0] = (uint64_t)h;
+}
+
+// +[NSBundle bundleForClass:] answered by the host's own code (-[NSWindowController windowNibPath], NSBundle's localization, an NSImage lookup by name) knows nothing of the guest's images: a class of
+// Xcode's IDEKit gave the main bundle, and "IDEWorkspaceWindow" was searched there ("failed to load window nib file"). The method is replaced by one that answers for a class inside a guest image.
+static id (*g_orig_bundleForClass)(id, SEL, Class);
+static id rebar_bundleForClass(id self, SEL cmd, Class cls) {
+    if (cls && in_guest((uint64_t)cls)) {
+        GImage *im = image_by_addr((uint64_t)cls); char root[PATH_MAX];
+        if (im && im->path && im != g_main_image && guest_bundle_root(im->path, root, sizeof root)) {
+            id str = send_h((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), root);
+            id b = str ? send_h(self, sel_registerName("bundleWithPath:"), str) : NULL;
+            if (b) return b;
+        }
+    }
+    return g_orig_bundleForClass(self, cmd, cls);
+}
+static void install_host_bundle_hook(void) {
+    static bool done; if (done || getenv("REBAR_NO_BUNDLE_HOOK")) return; done = true;
+    Class meta = object_getClass((id)objc_getClass("NSBundle")); if (!meta) return;
+    Method m = class_getInstanceMethod(meta, sel_registerName("bundleForClass:")); if (!m) return;
+    g_orig_bundleForClass = (id (*)(id, SEL, Class))method_getImplementation(m);
+    method_setImplementation(m, (IMP)rebar_bundleForClass);
+}
+
+// A plug-in bundle (Xcode's .dvtplugin / .ideplugin, a framework a program loads with NSBundle) holds arm64 code that the host's NSBundle cannot dlopen. Its load, loadAndReturnError:,
+// preflightAndReturnError: and isLoaded are answered here: the executable goes through the guest loader, as dlopen does. A bundle with an executable of the host's kind is left to the host.
+static GImage *g_bundle_img[256]; static char *g_bundle_path[256]; static int g_nbundle;
+static bool bundle_load_hook(CPU *c, id self, SEL sel) {
+    static SEL s_load, s_lre, s_pre, s_il, s_ep; static Class cB;
+    if (!s_load) { s_load = sel_registerName("load"); s_lre = sel_registerName("loadAndReturnError:"); s_pre = sel_registerName("preflightAndReturnError:"); s_il = sel_registerName("isLoaded"); s_ep = sel_registerName("executablePath"); cB = objc_getClass("NSBundle"); }
+    static SEL s_bwi, s_bi, s_bwp, s_ies;
+    if (!s_bwi) { s_bwi = sel_registerName("bundleWithIdentifier:"); s_bi = sel_registerName("bundleIdentifier"); s_bwp = sel_registerName("bundleWithPath:"); s_ies = sel_registerName("isEqualToString:"); }
+    if (sel == s_bwi && cB && self == (id)cB && c->x[2] > 0x10000) {   // +bundleWithIdentifier: knows the bundles of the images the host loaded; the guest's frameworks are looked up here
+        id r = send_h(self, sel, (id)c->x[2]);
+        if (!r) {
+            id want = (id)c->x[2]; char done[PATH_MAX * 0 + 1]; (void)done;
+            for (int k = 0; k < g_nimages && !r; k++) {
+                char root[PATH_MAX]; if (!g_images[k]->path || !guest_bundle_root(g_images[k]->path, root, sizeof root)) continue;
+                id str = send_h((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), root);
+                id b = str ? send_h(self, s_bwp, str) : NULL; if (!b) continue;
+                id ident = send_h(b, s_bi);
+                if (ident && ((uint64_t)send_h(ident, s_ies, want) & 0xff)) r = b;
+            }
+        }
+        c->x[0] = (uint64_t)r; c->x[1] = 0;
+        return true;
+    }
+    if (sel != s_load && sel != s_lre && sel != s_pre && sel != s_il) return false;
+    if (!cB) return false;
+    Class k = object_getClass(self); while (k && k != cB) k = class_getSuperclass(k);
+    if (!k) return false;
+    id ep = send_h(self, s_ep);
+    const char *path = ep ? (const char *)send_h(ep, sel_registerName("UTF8String")) : NULL;
+    if (!path || !*path) return false;
+    char real[PATH_MAX]; if (!realpath(path, real)) return false;
+    int idx = -1; for (int i = 0; i < g_nbundle; i++) if (!strcmp(g_bundle_path[i], real)) idx = i;
+    if (idx < 0) {
+        bool arm = false; int fd = open(real, O_RDONLY);
+        if (fd >= 0) { size_t l = (size_t)lseek(fd, 0, SEEK_END); const uint8_t *f = mmap(NULL, l, PROT_READ, MAP_PRIVATE, fd, 0); if (f != MAP_FAILED) { arm = arm64_slice_or_null(f, l) != NULL; munmap((void *)f, l); } close(fd); }
+        if (!arm) return false;
+    }
+    if (sel == s_il) { c->x[0] = idx >= 0 && g_bundle_img[idx] ? 1 : 0; c->x[1] = 0; return true; }
+    if (sel == s_pre) { c->x[0] = 1; c->x[1] = 0; return true; }
+    if (idx < 0 && g_nbundle < 256) {
+        int first = g_nimages;
+        GImage *img = load_image(real, NULL, false);
+        if (getenv("REBAR_TRACE_BUNDLES")) fprintf(stderr, "[bundle] load %s -> %s\n", real, img ? "ok" : "FAILED");
+        if (img) start_images(c, first);
+        g_bundle_img[g_nbundle] = img; g_bundle_path[g_nbundle] = strdup(real); idx = g_nbundle++;
+    }
+    bool ok = idx >= 0 && g_bundle_img[idx];
+    c->x[0] = ok ? 1 : 0; c->x[1] = 0;
+    if (sel == s_lre && !ok && c->x[2] > 0x10000) *(uint64_t *)c->x[2] = 0;   // (no NSError is built here: the caller sees NO)
+    return true;
 }
 
 static bool host_libsystem_symbol(const char *sym) {

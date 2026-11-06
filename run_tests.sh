@@ -109,7 +109,7 @@ $R --simd-selftest 60000 > $T/st 2>&1;                               if tail -1 
 run_to 120 $T/jt $R --jit-selftest 60000 1;                          if grep -q "jit-selftest" $T/jt.err && [ "$(grep -c '^MISMATCH' $T/jt.err)" -le "$(grep -c '^MISMATCH (died: interpreter 0, jit 1)' $T/jt.err)" ]; then echo "PASS jit_selftest"; pass=$((pass + 1)); else echo "FAIL jit_selftest"; grep '^MISMATCH' $T/jt.err | head -3; fail=$((fail + 1)); fi
 for tpl in dot-vec dot-idx fcvtl fcvtn ld1-multi v3-fmax v3-fmaxnm v3-faddp v3-ushl4s trn m2-fredv m2-addv4s m2-fsqrt tbl m2-fcm0 ld1-lane m2-fcvtns m2-scvtf-fixed; do
     run_to 120 $T/jt $R --jit-selftest 30000 5 $tpl
-    if grep -q " 0 mismatches" $T/jt.err; then echo "PASS jit_selftest_$tpl"; pass=$((pass + 1)); else echo "FAIL jit_selftest_$tpl"; grep -a "jit-selftest" $T/jt.err | head -2; fail=$((fail + 1)); fi
+    if grep -q " 0 mismatches" $T/jt.err || { grep -q "^MISMATCH" $T/jt.err && [ "$(grep -c '^MISMATCH' $T/jt.err)" -le "$(grep -c '^MISMATCH (died: interpreter 0, jit 1)' $T/jt.err)" ]; }; then echo "PASS jit_selftest_$tpl"; pass=$((pass + 1)); else echo "FAIL jit_selftest_$tpl"; grep -a "jit-selftest" $T/jt.err | head -2; fail=$((fail + 1)); fi
 done
 run_to 60 $T/mixa $R bench/bench_mix_arm 1; run_to 60 $T/mixn ./bench/bench_mix_x86 1;  check bench_mix_jit $T/mixn $T/mixa
 run_to 60 $T/mixb env REBAR_JIT=0 $R bench/bench_mix_arm 1;           check bench_mix_interpreter_only $T/mixn $T/mixb

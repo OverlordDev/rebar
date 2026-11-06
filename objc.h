@@ -351,6 +351,29 @@ static void trace_string_arg(uint64_t v, char *out, size_t n) {
     if (t) snprintf(out, n, "%s", t);
 }
 static const char *g_trace_msg;  // REBAR_TRACE_MSG=sub1,sub2: log the Objective-C messages whose selector contains one of them
+static void dump_class_args(CPU *c) {   // REBAR_TRACE_CLASSINFO=1: what the runtime knows of a class given as an argument of -handleFailureInMethod:object:... (a class method that asserts)
+    {   // what the runtime knows of a class given as an argument (a guest address)
+        for (int a = 3; a < 4; a++) {
+            uint64_t v = c->x[a]; if (!in_guest(v)) continue;
+            { const uint64_t *w = (const uint64_t *)v; fprintf(stderr, "    arg%d raw class words @%p:", a, (void *)v); for (int q = 0; q < 12; q++) fprintf(stderr, " %llx", (unsigned long long)w[q]); fprintf(stderr, "\n");
+              uint64_t isa = w[0]; if (in_guest(isa)) { const uint64_t *mw = (const uint64_t *)isa; fprintf(stderr, "      meta words @%p:", (void *)isa); for (int q = 0; q < 8; q++) fprintf(stderr, " %llx", (unsigned long long)mw[q]); fprintf(stderr, "\n"); } }
+            Class k = (Class)v, m = object_getClass((id)k);
+            fprintf(stderr, "    arg%d class %p name=%s meta=%p (%s) super=%p (%s) isMeta(k)=%d\n", a, (void *)k, class_getName(k), (void *)m, m ? class_getName(m) : "-", (void *)class_getSuperclass(k), class_getSuperclass(k) ? class_getName(class_getSuperclass(k)) : "-", (int)class_isMetaClass(k));
+            if (m) { unsigned n = 0; Method *ml = class_copyMethodList(m, &n); fprintf(stderr, "      metaclass has %u methods:", n); for (unsigned i = 0; i < n && i < 20; i++) fprintf(stderr, " %s", sel_getName(method_getName(ml[i]))); fprintf(stderr, "\n"); free(ml);
+                for (int pass = 0; pass < 2; pass++) {   // the realized class_rw_t of the metaclass (pass 0) and of the class (pass 1): where its methods are
+                    uint64_t kk = pass ? (uint64_t)k : (uint64_t)m, bits = ((const uint64_t *)kk)[4] & 0x00007ffffffffff8ull;
+                    const uint64_t *rw = (const uint64_t *)bits; uint64_t roe = rw[1]; const uint64_t *ro = (const uint64_t *)(roe & ~1ull);
+                    if (roe & 1) ro = (const uint64_t *)ro[0];   // class_rw_ext_t: ro first
+                    fprintf(stderr, "      %s rw=%p flags=%x ro_or_ext=%llx ro words:", pass ? "class" : "meta", (void *)rw, *(const uint32_t *)rw, (unsigned long long)roe);
+                    for (int q = 0; q < 10; q++) fprintf(stderr, " %llx", (unsigned long long)ro[q]);
+                    uint64_t bm = ro[4 + 1 + 1 - 1]; (void)bm;
+                    fprintf(stderr, "\n");
+                    for (int q = 0; q < 10; q++) { uint64_t w = ro[q]; if (in_guest(w) && w > 0x100000000ull) { const uint32_t *h = (const uint32_t *)w; fprintf(stderr, "        ro[%d]=%llx -> %08x %08x %08x %08x\n", q, (unsigned long long)w, h[0], h[1], h[2], h[3]); } }
+                } }
+            { unsigned n = 0; Method *ml = class_copyMethodList(k, &n); fprintf(stderr, "      class has %u instance methods\n", n); free(ml); }
+        }
+    }
+}
 static void trace_msg(CPU *c, const char *kind, id self, SEL sel) {
     const char *name = sel_getName(sel);
     bool hit = false;
@@ -363,9 +386,23 @@ static void trace_msg(CPU *c, const char *kind, id self, SEL sel) {
     }
     if (!hit) return;
     if (getenv("REBAR_TRACE_MSG_BT")) dump_backtrace(c);   // the guest backtrace of every traced send
+    if (getenv("REBAR_TRACE_DESC")) {   // the description of each argument that looks like an object
+        static const void * (*cfdesc)(const void *); static bool (*cfget)(const void *, char *, long, uint32_t);
+        if (!cfdesc) { cfdesc = dlsym(RTLD_DEFAULT, "CFCopyDescription"); cfget = dlsym(RTLD_DEFAULT, "CFStringGetCString"); }
+        for (int a = 2; a < 6; a++) {
+            uint64_t v = c->x[a]; char probe[8]; mach_vm_size_t got = 0;
+            if (v < 0x100000 || (v & 7) || v >= 0x00007fffffffffffull) continue;
+            if (mach_vm_read_overwrite(mach_task_self(), v, 8, (mach_vm_address_t)probe, &got) != 0 || got != 8) continue;
+            uint64_t isa; memcpy(&isa, probe, 8);
+            if (in_guest(v)) continue;
+            (void)isa; const void * d = cfdesc ? cfdesc((const void *)v) : NULL; static char buf[200000];
+            if (d && cfget(d, buf, sizeof buf, 0x08000100)) fprintf(stderr, "    arg%d: %s\n", a, buf);
+        }
+    }
     char s2[96] = "", s3[96] = "";
-    trace_string_arg(c->x[2], s2, sizeof s2); trace_string_arg(c->x[3], s3, sizeof s3);
-    fprintf(stderr, "[objc] %s [%s %s] self=%p x2=%llx x3=%llx d0..3=%g %g %g %g%s%s%s%s%s%s\n", kind, self ? class_getName(object_getClass(self)) : "nil", name, (void *)self,
+    static int nostr = -1; if (nostr < 0) nostr = getenv("REBAR_TRACE_NOSTR") != NULL;   // (the guess at "is this a string" can fault on an array of pointers)
+    if (!nostr) { trace_string_arg(c->x[2], s2, sizeof s2); trace_string_arg(c->x[3], s3, sizeof s3); }
+    fprintf(stderr, "[objc] %s [%s %s] lr=%llx self=%p x2=%llx x3=%llx d0..3=%g %g %g %g%s%s%s%s%s%s\n", kind, self ? class_getName(object_getClass(self)) : "nil", name, (unsigned long long)c->x[30], (void *)self,
             (unsigned long long)c->x[2], (unsigned long long)c->x[3], c->vr[0].df[0], c->vr[1].df[0], c->vr[2].df[0], c->vr[3].df[0],
             s2[0] ? " x2=\"" : "", s2, s2[0] ? "\"" : "", s3[0] ? " x3=\"" : "", s3, s3[0] ? "\"" : "");
 }
@@ -566,7 +603,8 @@ static bool guest_bundle_for_class(CPU *c, uint64_t cls) {
 // is an instruction-fetch fault per call (a signal, several microseconds: +[NSObject allocWithZone:] alone is called 10000 times a second in the GPU
 // process).  Every IMP the guest installs gets a small x86 thunk instead (mov r11, imp; jmp [rebar_guest_entry]) that does what the fault handler does,
 // and every IMP the guest reads back from the runtime is turned back into the guest address.
-static struct { uint64_t guest; uint8_t *thunk; } g_imp_tab[8192];
+#define IMP_TAB_BITS 21
+static struct { uint64_t guest; uint8_t *thunk; } g_imp_tab[1 << IMP_TAB_BITS];   // (Xcode installs tens of thousands of methods; 8192 slots were full soon after it started and every later IMP stayed a raw guest address)
 static uint8_t *g_thunk_page, *g_thunk_top, *g_thunk_end;
 static pthread_mutex_t g_thunk_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool is_thunk(uint64_t a) { return g_thunk_page && a >= (uint64_t)g_thunk_page && a < (uint64_t)g_thunk_end && ((a - (uint64_t)g_thunk_page) & 31) == 0; }
@@ -577,16 +615,17 @@ static uint64_t imp_wrap(uint64_t imp) { return imp_wrap_any(imp, false); }
 static uint64_t imp_wrap_any(uint64_t imp, bool any) {
     if (!imp || (!in_guest(imp) && !(any && imp >= 0x10000 && imp < 0x100000000ull))) return imp;
     pthread_mutex_lock(&g_thunk_mu);
-    unsigned h = (unsigned)((imp >> 2) * 0x9e3779b97f4a7c15ull >> 51);
-    for (int k = 0; k < 8192; k++) {
-        unsigned j = (h + k) & 8191;
+    unsigned h = (unsigned)((imp >> 2) * 0x9e3779b97f4a7c15ull >> (64 - IMP_TAB_BITS));
+    for (int k = 0; k < (1 << IMP_TAB_BITS); k++) {
+        unsigned j = (h + k) & ((1 << IMP_TAB_BITS) - 1);
         if (g_imp_tab[j].guest == imp) { uint64_t t = (uint64_t)g_imp_tab[j].thunk; pthread_mutex_unlock(&g_thunk_mu); return t; }
         if (!g_imp_tab[j].guest) {
-            if (g_thunk_top == g_thunk_end) {
-                g_thunk_page = g_thunk_top = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (!g_thunk_page) {   // one region for all of them (reserved address space, pages are taken when a thunk is written): is_thunk() is a range check
+                g_thunk_page = g_thunk_top = mmap(NULL, 64u << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
                 if (g_thunk_page == MAP_FAILED) { g_thunk_page = g_thunk_top = g_thunk_end = NULL; pthread_mutex_unlock(&g_thunk_mu); return imp; }
-                g_thunk_end = g_thunk_page + (1 << 20);
+                g_thunk_end = g_thunk_page + (64u << 20);
             }
+            if (g_thunk_top == g_thunk_end) { pthread_mutex_unlock(&g_thunk_mu); return imp; }   // (2 million thunks: the raw address works, through the fault)
             uint8_t *t = g_thunk_top; g_thunk_top += 32;
             t[0] = 0x49; t[1] = 0xBB; memcpy(t + 2, &imp, 8);                         // mov r11, imp
             t[10] = 0xFF; t[11] = 0x25; memset(t + 12, 0, 4);                         // jmp [rip+0]: the qword that follows
@@ -597,7 +636,7 @@ static uint64_t imp_wrap_any(uint64_t imp, bool any) {
         }
     }
     pthread_mutex_unlock(&g_thunk_mu);
-    return imp;   // (the table is full: the raw address works, through the fault)
+    return imp;
 }
 // Callbacks the guest hands to CoreFoundation / CoreVideo: function pointers in the argument, or in a context structure that is copied on the way in
 // (retain, release, copyDescription, ... of an observer, timer or source context: every qword from offset 16 on is a function pointer).
@@ -710,10 +749,43 @@ static const char *imp_encoding(uint64_t imp);
 // only in those calls; a method that takes or returns a struct by value (a CGRect result is in memory on x86_64, in d0-d3 on arm64) is called with the wrong registers without it.
 // (The string may be a temporary of the caller: it is copied.)
 static void imp_register_runtime(uint64_t imp, const char *types) { if (imp && types && strchr(types, '{') && !imp_encoding(imp)) imp_register(imp, strdup(types)); }
+// The host's Objective-C runtime is x86_64, where BOOL is a signed char ('c'); the arm64 code the guest was built as has it as _Bool ('B'). A guest that compares a method's encoding with the one
+// of its own block or declaration (Xcode's IBReplaceMethodPrimitive: "Type encoding mismatch ... B@: vs c16@0:8 for NSButtonCell on _isAnimatingDefaultCell") is shown the arm64 spelling:
+// every type 'c' of a host method's encoding is reported as 'B' (a char is rare in Apple's interfaces; struct names and quoted class names are left alone). REBAR_NO_BOOL_ENC=1 turns it off.
+static const char *bool_encoding(const char *e) {
+    static struct { const char *src; char *out; } tab[4096]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static int off = -1;
+    if (off < 0) off = getenv("REBAR_NO_BOOL_ENC") != NULL;
+    if (off || !e || !strchr(e, 'c')) return e;
+    unsigned h = (unsigned)(((uint64_t)e >> 3) * 2654435761u) & 4095;
+    pthread_mutex_lock(&mu);
+    for (unsigned k = 0; k < 4096; k++, h = (h + 1) & 4095) {
+        if (tab[h].src == e) { const char *r = tab[h].out; pthread_mutex_unlock(&mu); return r; }
+        if (!tab[h].src) {
+            char *o = strdup(e); int depth_name = 0; bool quote = false;
+            for (char *q = o; *q; q++) {
+                if (quote) { if (*q == '"') quote = false; continue; }
+                if (*q == '"') { quote = true; continue; }
+                if (*q == '{' || *q == '(') { depth_name = 1; continue; }
+                if (depth_name) { if (*q == '=' || *q == '}' || *q == ')') depth_name = 0; continue; }
+                if (*q == 'c') *q = 'B';
+            }
+            tab[h].src = e; tab[h].out = o; pthread_mutex_unlock(&mu); return o;
+        }
+    }
+    pthread_mutex_unlock(&mu); return e;
+}
+static bool host_method(Method m) { return m && !in_guest(imp_unwrap((uint64_t)method_getImplementation(m))); }
+H(h_method_getTypeEncoding) { Method m = (Method)c->x[0]; const char *e = m ? method_getTypeEncoding(m) : NULL; c->x[0] = (uint64_t)(host_method(m) ? bool_encoding(e) : e); }
+H(h_method_copyReturnType) { Method m = (Method)c->x[0]; char *r = m ? method_copyReturnType(m) : NULL; if (r && host_method(m) && r[0] == 'c' && !r[1] && !getenv("REBAR_NO_BOOL_ENC")) r[0] = 'B'; c->x[0] = (uint64_t)r; }
+H(h_method_getReturnType) { Method m = (Method)c->x[0]; char *dst = (char *)c->x[1]; size_t n = c->x[2]; if (m) method_getReturnType(m, dst, n); if (m && host_method(m) && n > 1 && dst[0] == 'c' && !dst[1] && !getenv("REBAR_NO_BOOL_ENC")) dst[0] = 'B'; c->x[0] = 0; }
+H(h_method_copyArgumentType) { Method m = (Method)c->x[0]; char *r = m ? method_copyArgumentType(m, (unsigned)c->x[1]) : NULL; if (r && host_method(m) && r[0] == 'c' && !r[1] && !getenv("REBAR_NO_BOOL_ENC")) r[0] = 'B'; c->x[0] = (uint64_t)r; }
+H(h_method_getArgumentType) { Method m = (Method)c->x[0]; char *dst = (char *)c->x[2]; size_t n = c->x[3]; if (m) method_getArgumentType(m, (unsigned)c->x[1], dst, n); if (m && host_method(m) && n > 1 && dst[0] == 'c' && !dst[1] && !getenv("REBAR_NO_BOOL_ENC")) dst[0] = 'B'; c->x[0] = 0; }
 H(h_method_setImplementation) { imp_register_runtime(c->x[1], method_getTypeEncoding((Method)c->x[0])); c->x[1] = imp_wrap(c->x[1]); host_call(c, HOSTFN("method_setImplementation"), false); c->x[0] = imp_unwrap(c->x[0]); }
 // swift_updateClassMetadata2 (completes a class's metadata: instance size, field offsets) and swift_getInitializedObjCClass (what a metadata accessor of a plain class ends with):
 // the classes that were held back at load (swift_class_needs_runtime_init) are given to the Objective-C runtime when the Swift runtime is through with them.
 static void swift_class_ready(uint64_t cls);
+static void attach_pending_categories(uint64_t cls);
+static bool swift_deferred(uint64_t c);
 // A Swift class that ObjC-style code (an alloc / init through a class reference, a message to the class) reaches before any Swift code asked for its metadata: the Objective-C
 // runtime would call the class's metadata initializer at realization; here the class was deferred, so do it before the use.
 static int g_nswift_deferred;
@@ -723,8 +795,9 @@ H(h_objc_alloc_init) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("o
 H(h_objc_alloc) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_alloc"), false); }
 H(h_objc_opt_new) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_opt_new"), false); }
 H(h_objc_allocWithZone) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_allocWithZone"), false); }
-H(h_swift_updateClassMetadata2) { uint64_t cls = c->x[0]; host_call(c, HOSTFN("swift_updateClassMetadata2"), false); swift_class_ready(cls); }
-H(h_swift_getInitializedObjCClass) { swift_class_ready(c->x[0]); host_call(c, HOSTFN("swift_getInitializedObjCClass"), false); }
+H(h_swift_initClassMetadata2) { uint64_t cls = c->x[0]; host_call(c, HOSTFN("swift_initClassMetadata2"), false); if (cls && in_guest(cls) && !swift_deferred(cls)) attach_pending_categories(cls); }   // (a class outside its image's class list is set up here; its class methods wait in a category)
+H(h_swift_updateClassMetadata2) { uint64_t cls = c->x[0]; host_call(c, HOSTFN("swift_updateClassMetadata2"), false); swift_class_ready(cls); if (cls && !swift_deferred(cls)) attach_pending_categories(cls); }   // (a class that is not in its image's class list carries its class methods in a category: Xcode's SSHHelperXPCClient has no +serviceIdentifier without it)
+H(h_swift_getInitializedObjCClass) { uint64_t cls = c->x[0]; swift_class_ready(cls); host_call(c, HOSTFN("swift_getInitializedObjCClass"), false); if (cls && !swift_deferred(cls)) attach_pending_categories(cls); }
 H(h_class_replaceMethod) { imp_register_runtime(c->x[2], (const char *)c->x[3]); c->x[2] = imp_wrap(c->x[2]); host_call(c, HOSTFN("class_replaceMethod"), false); c->x[0] = imp_unwrap(c->x[0]); }
 H(h_class_addMethod) {
     static int trace = -1; if (trace < 0) trace = getenv("REBAR_TRACE_ENTRY") != NULL;
@@ -771,13 +844,14 @@ static int g_msgfast = -1;
 typedef struct { uint32_t seq; uint32_t rsize; uint64_t cls, sel, imp; char rkind; } MsgFast;
 #define MSGFAST_SLOTS 8192
 static MsgFast g_msgfast_tab[MSGFAST_SLOTS];
+static bool bundle_load_hook(CPU *c, id self, SEL sel);   // (loader.h)
 static bool msg_special_sel(SEL sel) {
     static SEL sp[40]; static int n;
     if (!n) {
         static const char *names[] = {"stringWithFormat:", "predicateWithFormat:", "raise:format:", "initWithFormat:", "appendFormat:", "stringByAppendingFormat:", "initWithFormat:arguments:", "predicateWithFormat:arguments:",
             "initWithFormat:locale:arguments:", "arrayWithObjects:", "dictionaryWithObjectsAndKeys:", "handleFailureInFunction:file:lineNumber:description:", "handleFailureInMethod:object:file:lineNumber:description:",
             "initWithColorsAndLocations:", "initWithObjects:", "initWithObjectsAndKeys:", "orderedSetWithObjects:", "setWithObjects:", "commit", "set", "setLayer:", "bundleForClass:", "mainBundle", "launch",
-            "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", "defaultContainer", "containerWithIdentifier:", NULL};
+            "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", "defaultContainer", "containerWithIdentifier:", "loadAndReturnError:", "preflightAndReturnError:", "isLoaded", "bundleWithIdentifier:", NULL};
         int k = 0; for (; names[k] && k < 40; k++) sp[k] = sel_registerName(names[k]);
         __atomic_store_n(&n, k, __ATOMIC_RELEASE);
     }
@@ -803,7 +877,7 @@ static void msgfast_insert(Class cls, SEL sel, IMP imp, const Enc *r) {   // (ca
 static bool msgsend_fast(CPU *c) {
     if (__builtin_expect(g_msgfast <= 0, 0)) { if (g_msgfast < 0) g_msgfast = getenv("REBAR_NO_MSGFAST") ? 0 : 1; if (!g_msgfast) return false; }
     id self = (id)c->x[0]; SEL sel = (SEL)c->x[1];
-    if (__builtin_expect(!self || (uint64_t)sel < 0x10000 || g_gpu_sync || g_dump_layers || g_trace_msg || g_trace || g_nswift_deferred, 0)) return false;
+    if (__builtin_expect(!self || (uint64_t)sel < 0x10000 || g_gpu_sync || g_dump_layers || g_trace_msg || g_trace || (g_nswift_deferred && in_guest((uint64_t)self)), 0)) return false;   // (a Swift class that is still waiting for its runtime is a receiver in guest memory: only that send needs swift_ensure_receiver; any other receiver is a host object)
     Class cls = object_getClass(self);
     MsgFast snap; bool hit = false;
     for (int k = 0; k < 2 && !hit; k++) {
@@ -831,6 +905,7 @@ H(h_objc_msgSend) {
     swift_ensure_receiver(c, (uint64_t)self);
     if (__builtin_expect(g_gpu_sync != 0, 0)) gpu_hook(c, self, sel);
     if (__builtin_expect(g_dump_layers != 0, 0)) layer_dump_hook(c, self, sel);
+    { static int ci = -1; static SEL s_hf; if (ci < 0) { ci = getenv("REBAR_TRACE_CLASSINFO") != NULL; s_hf = sel_registerName("handleFailureInMethod:object:file:lineNumber:description:"); } if (__builtin_expect(ci, 0) && sel == s_hf) dump_class_args(c); }
     if (__builtin_expect(g_trace_msg != NULL, 0)) trace_msg(c, "send", self, sel);
     if (g_trace && self && (!strcmp(sel_getName(sel), "objectForKey:") || !strcmp(sel_getName(sel), "objectForInfoDictionaryKey:") || !strcmp(sel_getName(sel), "stringByAppendingString:") || !strcmp(sel_getName(sel), "stringByAppendingPathComponent:") || !strcmp(sel_getName(sel), "bundlePath"))) {
         static bool (*get_cstr)(uint64_t, char *, long, uint32_t);
@@ -863,6 +938,7 @@ H(h_objc_msgSend) {
             if (mb_cache) { c->x[0] = (uint64_t)mb_cache; c->x[1] = 0; return; }
         }
     }
+    if (bundle_load_hook(c, self, sel)) return;
     Class cls = object_getClass(self);
     // (a method lookup can run a class's +initialize and wait on libobjc's class initialization lock, which another thread may hold while it waits for the interpreter lock)
     bool gil_held_l = gil_release(); IMP imp_raw = class_getMethodImplementation(cls, sel); if (gil_held_l) gil_acquire();
@@ -948,17 +1024,54 @@ H(h_objc_msgSendSuper2) {
 // (-drawRect:, -setFrame:, ...), the arguments arrive in the SysV layout. The guest's
 // own method lists give us each IMP's type encoding, so we can rebuild the arm64 layout.
 
-static uint64_t g_imp_key[8192];
-static const char *g_imp_enc[8192];
+static uint64_t g_imp_key[262144];
+static const char *g_imp_enc[262144];
 static void imp_register(uint64_t imp, const char *types) {
-    uint32_t h = (uint32_t)((imp >> 2) * 2654435761u) & 8191;
-    while (g_imp_key[h] && g_imp_key[h] != imp) h = (h + 1) & 8191;
+    uint32_t h = (uint32_t)((imp >> 2) * 2654435761u) & 262143;
+    while (g_imp_key[h] && g_imp_key[h] != imp) h = (h + 1) & 262143;
     g_imp_key[h] = imp; g_imp_enc[h] = types;
 }
 static const char *imp_encoding(uint64_t imp) {
-    uint32_t h = (uint32_t)((imp >> 2) * 2654435761u) & 8191;
-    while (g_imp_key[h]) { if (g_imp_key[h] == imp) return g_imp_enc[h]; h = (h + 1) & 8191; }
+    uint32_t h = (uint32_t)((imp >> 2) * 2654435761u) & 262143;
+    while (g_imp_key[h]) { if (g_imp_key[h] == imp) return g_imp_enc[h]; h = (h + 1) & 262143; }
     return NULL;
+}
+// The methods of the classes in the images' class lists reach the host's runtime as they are in the guest's memory: raw guest IMPs, and every call the host makes to one of them (a
+// CFSet hashing its elements, -[NSArray indexOfObject:], Swift's foreign String reading characterAtIndex:) is an instruction-fetch fault, a signal that costs several microseconds
+// (Xcode opening a project: 1.5 million of them, 900000 into one -[PackedPath characterAtIndex:]). The methods are remembered here by IMP; one that the host has entered through the fault
+// HOT_AFTER times gets a thunk, put into the runtime with class_replaceMethod (only that class and its subclasses lose their caches). REBAR_NO_HOTIMP=1 turns it off.
+#define HOT_AFTER 32
+#define HOT_BITS 20
+static struct HotImp { uint64_t imp; Class cls; const char *name, *types; uint32_t n; } *g_hot; static uint32_t g_hot_used; static int g_hot_off = -1;
+static bool swift_class_is_done(uint64_t cls);
+static void hot_register_cb(const char *name, const char *types, uint64_t imp, void *ctx) {
+    if (g_hot_off < 0) g_hot_off = getenv("REBAR_NO_HOTIMP") != NULL;
+    if (g_hot_off || !imp || !ctx) return;
+    if (!g_hot) g_hot = calloc((size_t)1 << HOT_BITS, sizeof *g_hot);
+    if (!g_hot || g_hot_used > (3u << HOT_BITS) / 4) return;
+    unsigned h = (unsigned)((imp >> 2) * 0x9e3779b97f4a7c15ull >> (64 - HOT_BITS));
+    for (unsigned k = 0; k < (1u << HOT_BITS); k++) {
+        struct HotImp *e = &g_hot[(h + k) & ((1u << HOT_BITS) - 1)];
+        if (e->imp == imp) return;   // (one class is enough: the same function shared by several is wrapped through the first)
+        if (!e->imp) { e->imp = imp; e->cls = (Class)ctx; e->name = name; e->types = types; g_hot_used++; return; }
+    }
+}
+// Called when the host enters the guest function `imp` (rebar_bridge_enter): a raw guest address that was called through the fault is counted.
+static void hot_entry(uint64_t imp) {
+    if (!g_hot) return;
+    unsigned h = (unsigned)((imp >> 2) * 0x9e3779b97f4a7c15ull >> (64 - HOT_BITS));
+    for (unsigned k = 0; k < (1u << HOT_BITS); k++) {
+        struct HotImp *e = &g_hot[(h + k) & ((1u << HOT_BITS) - 1)];
+        if (e->imp == imp) {
+            if (__atomic_add_fetch(&e->n, 1, __ATOMIC_RELAXED) == HOT_AFTER && e->cls && e->name && (!swift_deferred((uint64_t)e->cls) || swift_class_is_done((uint64_t)e->cls))) {   // (a Swift class still waiting for its runtime is not known to the host yet)
+                static int trace = -1; if (trace < 0) trace = getenv("REBAR_TRACE_HOTIMP") != NULL;
+                if (trace) fprintf(stderr, "[hotimp] %s %s -> thunk\n", class_getName(e->cls), e->name);
+                class_replaceMethod(e->cls, sel_registerName(e->name), (IMP)imp_wrap(imp), e->types);
+            }
+            return;
+        }
+        if (!e->imp) return;
+    }
 }
 static void imp_register_cb(const char *name, const char *types, uint64_t imp, void *ctx) {
     if (strchr(types, '{')) imp_register(imp, types);
@@ -978,30 +1091,37 @@ static void entry_marshal(CPU *c, uint64_t *f, const char *enc, EntryState *st) 
     }
 #define X86_INT() (xi < 6 ? f[xi++] : xs[xsn++])
 #define X86_DBL() (xv < 8 ? f[6 + xv++] : xs[xsn++])
+    // (arguments that do not fit in x0-x7 / v0-v7 go on the arm64 callee's stack, one 8-byte slot each; a structure that does not fit in the registers left goes there whole)
+    uint64_t ov[32]; int nov = 0;
+#define OVF(v) do { if (nov < 32) ov[nov++] = (v); else { fprintf(stderr, "rebar: too many arguments in callback into guest (%s)\n", enc); exit(127); } } while (0)
     while (*e) {
         e = enc_parse(e, &t);
         while (*e >= '0' && *e <= '9') e++;
-        if (nx >= 8 || nv >= 8) { fprintf(stderr, "rebar: too many arguments in callback into guest\n"); exit(127); }
-        if (t.kind == 'f' || t.kind == 'd') c->vr[nv++].d[0] = X86_DBL();
-        else if (t.kind != 's') c->x[nx++] = X86_INT();
+        if (t.kind == 'f' || t.kind == 'd') { uint64_t v = X86_DBL(); if (nv < 8) c->vr[nv++].d[0] = v; else OVF(v); }
+        else if (t.kind != 's') { uint64_t v = X86_INT(); if (nx < 8) c->x[nx++] = v; else OVF(v); }
         else if (t.hfa && t.hfa_t == 'd') {
-            if (t.size <= 16) for (int k = 0; k < t.hfa && nv < 8; k++) c->vr[nv++].d[0] = X86_DBL();
-            else for (int k = 0; k < t.hfa && nv < 8; k++) c->vr[nv++].d[0] = xs[xsn++];
+            bool regs = nv + t.hfa <= 8;
+            if (t.size <= 16) for (int k = 0; k < t.hfa; k++) { uint64_t v = X86_DBL(); if (regs) c->vr[nv++].d[0] = v; else OVF(v); }
+            else for (int k = 0; k < t.hfa; k++) { uint64_t v = xs[xsn++]; if (regs) c->vr[nv++].d[0] = v; else OVF(v); }
+            if (!regs) nv = 8;
         } else if (t.hfa && t.hfa_t == 'f') {
             fprintf(stderr, "rebar: callback into guest takes a float aggregate by value (not forwardable yet)\n"); exit(127);
         } else if (t.size <= 16) {
             int words = (t.size + 7) / 8;
-            bool regs = xi + words <= 6;
-            for (int k = 0; k < words && nx < 8; k++) c->x[nx++] = regs ? f[xi++] : xs[xsn++];
+            bool xregs = xi + words <= 6, aregs = nx + words <= 8;
+            for (int k = 0; k < words; k++) { uint64_t v = xregs ? f[xi++] : xs[xsn++]; if (aregs) c->x[nx++] = v; else OVF(v); }
+            if (!aregs) nx = 8;
         } else {  // arm64 wants a pointer to a copy of the bytes the x86 caller put on the stack
             int words = (t.size + 7) / 8;
             uint64_t *buf = &st->tmp[tmpn];
             tmpn += words;
             if (tmpn > 60) { fprintf(stderr, "rebar: callback struct arguments too large\n"); exit(127); }
             for (int k = 0; k < words; k++) buf[k] = xs[xsn++];
-            c->x[nx++] = (uint64_t)buf;
+            if (nx < 8) c->x[nx++] = (uint64_t)buf; else OVF((uint64_t)buf);
         }
     }
+    if (nov) { c->sp = (c->sp - (uint64_t)nov * 8) & ~0xfull; memcpy((void *)c->sp, ov, (size_t)nov * 8); }
+#undef OVF
 #undef X86_INT
 #undef X86_DBL
 }
@@ -1086,23 +1206,29 @@ static void find_load_cb(const char *name, const char *types, uint64_t imp, void
     if (!strcmp(name, "load")) ((struct find_load *)ctx)->imp = imp;
 }
 
-static uint64_t g_seen[16384];
+static uint64_t g_seen[524288];
 static bool seen_test_and_set(uint64_t p) {
-    uint32_t h = (uint32_t)((p >> 4) * 2654435761u) & 16383;
-    while (g_seen[h]) { if (g_seen[h] == p) return true; h = (h + 1) & 16383; }
+    uint32_t h = (uint32_t)((p >> 4) * 2654435761u) & 524287;
+    while (g_seen[h]) { if (g_seen[h] == p) return true; h = (h + 1) & 524287; }
     g_seen[h] = p;
     return false;
 }
 
+static bool seen_has(uint64_t p) {
+    uint32_t h = (uint32_t)((p >> 4) * 2654435761u) & 524287;
+    while (g_seen[h]) { if (g_seen[h] == p) return true; h = (h + 1) & 524287; }
+    return false;
+}
+
 static const void *g_imageinfo;
-static uint64_t g_dropped[512];
+static uint64_t g_dropped[4096];
 static int g_ndropped;
 static bool class_dropped(uint64_t c) { for (int k = 0; k < g_ndropped; k++) if (g_dropped[k] == c) return true; return false; }
 // A Swift class whose descriptor asks for "singleton metadata initialization" (a resilient superclass, say: Rectangle's windows derive from NSWindow) is set up by the Swift
 // runtime when the class is first used: swift_updateClassMetadata2 patches the class_ro_t that the class's data field points to. objc_readClassPair would have realized the
 // class by then (data -> a class_rw_t on the heap), and the runtime writes the instance size into that. Such classes are not handed to the Objective-C runtime here; it learns
 // of them from the Swift runtime and finds them unrealized, as it does on a real Mac.
-static uint64_t g_swift_deferred[1024];
+static uint64_t g_swift_deferred[16384];
 static bool swift_deferred(uint64_t c) { for (int k = 0; k < g_nswift_deferred; k++) if (g_swift_deferred[k] == c) return true; return false; }
 static bool swift_class_needs_runtime_init(const GClass *c) {
     if (!(c->data & 3)) return false;   // not a Swift class
@@ -1113,10 +1239,10 @@ static bool swift_class_needs_runtime_init(const GClass *c) {
 }
 static void register_class_now(GClass *c);   // (below)
 // The Swift runtime has set the class up: now the Objective-C runtime may know it (and realize it, from the updated class_ro_t)
-static uint64_t g_swift_done[1024]; static int g_nswift_done;
+static uint64_t g_swift_done[16384]; static int g_nswift_done;
 static bool swift_class_is_done(uint64_t cls) { for (int k = 0; k < g_nswift_done; k++) if (g_swift_done[k] == cls) return true; return false; }
 // A category of a Swift class that is still waiting for the Swift runtime (its class is not known to the Objective-C runtime yet) is attached when the class is set up.
-static uint64_t g_pending_cats[512]; static int g_npending_cats;
+static uint64_t g_pending_cats[16384]; static int g_npending_cats;
 static void attach_category_now(GCat *cat, Class cls);
 static void attach_pending_categories(uint64_t cls) {
     for (int k = 0; k < g_npending_cats; k++) {
@@ -1128,7 +1254,7 @@ static void swift_class_ready(uint64_t cls) {
     if (!cls || !swift_deferred(cls)) return;
     GClass *c = (GClass *)cls;
     if (swift_class_is_done(cls)) return;
-    if (g_nswift_done < 1024) g_swift_done[g_nswift_done++] = cls;
+    if (g_nswift_done < 16384) g_swift_done[g_nswift_done++] = cls;
     if (in_guest(c->superclass) && swift_deferred(c->superclass)) swift_class_ready(c->superclass);
     register_class_now(c);   // (the Swift runtime has realized the class in place by now; the runtime still has to learn its name and put it in its class table)
     attach_pending_categories(cls);
@@ -1150,7 +1276,7 @@ static void register_class(GClass *c) {
     if (seen_test_and_set((uint64_t)c)) return;
     if (in_guest(c->superclass)) register_class((GClass *)c->superclass);
     if (!getenv("REBAR_NO_SWIFT_DEFER") && ((in_guest(c->superclass) && swift_deferred(c->superclass)) || swift_class_needs_runtime_init(c))) {
-        if (g_nswift_deferred < 1024) g_swift_deferred[g_nswift_deferred++] = (uint64_t)c;
+        if (g_nswift_deferred < 16384) g_swift_deferred[g_nswift_deferred++] = (uint64_t)c;
         if (getenv("REBAR_OBJC_TRACE")) fprintf(stderr, "  [objc] deferred Swift class %p %s to the Swift runtime\n", (void *)c, (const char *)class_ro(c)->name);
         return;
     }
@@ -1162,7 +1288,7 @@ static void register_class_now(GClass *c) {
     if (r != (Class)c) {
         // A class whose superclass is a weak import that this macOS lacks (a view class of a newer system, say) is dropped by the runtime: it does not exist
         // here, and neither does anything that derives from it. The class references to it become nil (see objc_map_image), as dyld does.
-        if (!r && g_ndropped < 512) {
+        if (!r && g_ndropped < 4096) {
             g_dropped[g_ndropped++] = (uint64_t)c;
             if (getenv("REBAR_OBJC_TRACE")) fprintf(stderr, "  [objc] dropped class %s: its superclass is missing on this system\n", (const char *)class_ro(c)->name);
             return;
@@ -1178,13 +1304,13 @@ static uint64_t class_load_imp(const GClass *c) {
     return fl.imp;
 }
 
-static uint64_t g_load_cls[2048], g_load_imp[2048];
+static uint64_t g_load_cls[32768], g_load_imp[32768];
 static int g_nload;
 static void call_load(CPU *c, GClass *cls) {
-    static uint64_t loaded[4096]; static int nloaded;
+    static uint64_t loaded[65536]; static int nloaded;
     for (int k = 0; k < nloaded; k++) if (loaded[k] == (uint64_t)cls) return;
     if (in_guest(cls->superclass)) call_load(c, (GClass *)cls->superclass);
-    if (nloaded < 4096) loaded[nloaded++] = (uint64_t)cls;
+    if (nloaded < 65536) loaded[nloaded++] = (uint64_t)cls;
     for (int k = 0; k < g_nload; k++)
         if (g_load_cls[k] == (uint64_t)cls && g_load_imp[k]) call_guest(c, g_load_imp[k], (uint64_t)cls, (uint64_t)s_load, 0, 0);
 }
@@ -1194,7 +1320,7 @@ static uint64_t g_cur_slide;
 
 // The protocols compiled into the guest's images: the host runtime has not read them (it does not know the images), so NSProtocolFromString / objc_getProtocol look here first
 // (Google's Gemini asserted "Either instanceClass or instanceProtocol must be provided" when the protocol of one of its own classes came back nil).
-static uint64_t g_guest_protos[8192]; static int g_nguest_protos;
+static uint64_t g_guest_protos[65536]; static int g_nguest_protos;
 static uint64_t guest_protocol_named(const char *name) {
     for (int k = 0; k < g_nguest_protos; k++) { const char *n = *(const char **)(g_guest_protos[k] + 8); if (n && !strcmp(n, name)) return g_guest_protos[k]; }
     return 0;
@@ -1238,7 +1364,42 @@ static void objc_prepare_image(GImage *img) {
         for (uint64_t o = 0; o < s->size; o += 8) {
             uint64_t *proto = *(uint64_t **)(SA(s) + o);
             if (in_guest((uint64_t)proto) && !proto[0]) proto[0] = (uint64_t)protocol;
-            if (in_guest((uint64_t)proto) && g_nguest_protos < 8192 && proto[1] > 0x10000) g_guest_protos[g_nguest_protos++] = (uint64_t)proto;
+            if (in_guest((uint64_t)proto) && g_nguest_protos < 65536 && proto[1] > 0x10000) g_guest_protos[g_nguest_protos++] = (uint64_t)proto;
+        }
+    }
+    if ((s = find_section(mh, "__objc_protolist")) && !getenv("REBAR_NO_PROTO_MIRROR")) {
+        // The Swift runtime of the host finds an @objc protocol by name through objc_getProtocol ("any IDEMenuItemActionImageProvider" came out as null), so a protocol of the guest
+        // the host does not know is mirrored by one of the same name that inherits the same protocols (conformsToProtocol: goes through the inherited ones).
+        enum { MAXM = 4096 }; static uint64_t gp[MAXM]; static Protocol *mp[MAXM]; int nm = 0;
+        for (uint64_t o = 0; o < s->size && nm < MAXM; o += 8) {
+            uint64_t *proto = *(uint64_t **)(SA(s) + o);
+            const char *pn = in_guest((uint64_t)proto) && proto[1] > 0x10000 ? *(const char **)(proto + 1) : NULL;
+            if (!pn || objc_getProtocol(pn)) continue;
+            Protocol *m = objc_allocateProtocol(pn); if (m) { gp[nm] = (uint64_t)proto; mp[nm++] = m; }
+        }
+        // (an inherited protocol must be registered before it is added: the inherited ones first)
+        static bool done[MAXM]; memset(done, 0, sizeof done);
+        for (int k = 0; k < nm; k++) {
+            int stack[64], sp = 0; stack[sp++] = k;
+            while (sp) {
+                int cur = stack[sp - 1];
+                if (done[cur]) { sp--; continue; }
+                const uint64_t *pl = (const uint64_t *)((uint64_t *)gp[cur])[2];
+                bool ready = true;
+                for (uint64_t j = 0; pl && j < pl[0] && j < 64 && ready; j++) {
+                    const char *in = in_guest(pl[1 + j]) ? *(const char **)(pl[1 + j] + 8) : NULL;
+                    for (int q = 0; q < nm && in; q++) if (!done[q] && q != cur && !strcmp(*(const char **)(gp[q] + 8), in)) { if (sp < 63) stack[sp++] = q; ready = false; break; }
+                }
+                if (!ready) continue;
+                for (uint64_t j = 0; pl && j < pl[0] && j < 64; j++) {
+                    const char *in = in_guest(pl[1 + j]) ? *(const char **)(pl[1 + j] + 8) : NULL;
+                    Protocol *t = NULL;
+                    for (int q = 0; q < nm && in; q++) if (done[q] && !strcmp(*(const char **)(gp[q] + 8), in)) t = mp[q];
+                    if (!t && in) t = objc_getProtocol(in);
+                    if (t && t != mp[cur]) protocol_addProtocol(mp[cur], t);
+                }
+                objc_registerProtocol(mp[cur]); done[cur] = true; sp--;
+            }
         }
     }
     if ((s = find_section(mh, "__objc_classlist")))
@@ -1246,9 +1407,11 @@ static void objc_prepare_image(GImage *img) {
             GClass *gc = *(GClass **)(SA(s) + o);
             each_method(class_ro(gc)->baseMethods, imp_register_cb, NULL);
             each_method(class_ro((GClass *)gc->isa)->baseMethods, imp_register_cb, NULL);
+            each_method(class_ro(gc)->baseMethods, hot_register_cb, gc);
+            each_method(class_ro((GClass *)gc->isa)->baseMethods, hot_register_cb, (void *)gc->isa);
         }
     if ((s = find_section(mh, "__objc_nlclslist")))
-        for (uint64_t o = 0; o < s->size && g_nload < 2048; o += 8) {
+        for (uint64_t o = 0; o < s->size && g_nload < 32768; o += 8) {
             GClass *gc = *(GClass **)(SA(s) + o);
             g_load_cls[g_nload] = (uint64_t)gc; g_load_imp[g_nload++] = class_load_imp(gc);
         }
@@ -1287,6 +1450,8 @@ static void swift_register_image(GImage *img) {
     void (*reg_types)(const void *, const void *) = dlsym(RTLD_DEFAULT, "swift_registerTypeMetadataRecords");
     if (!reg_conf && !reg_types) return;   // no Swift runtime in this process (yet)
     const struct section_64 *s;
+    void (*reg_protos)(const void *, const void *) = dlsym(RTLD_DEFAULT, "swift_registerProtocols");   // the protocol descriptors (a protocol is found by its mangled name through them: "any IDEMenuItemActionImageProvider")
+    if (reg_protos && (s = find_text_section(img->mh, "__swift5_protos")) && s->size) reg_protos((void *)(s->addr + img->slide), (void *)(s->addr + img->slide + s->size));
     if (reg_conf && (s = find_text_section(img->mh, "__swift5_proto")) && s->size) reg_conf((void *)(s->addr + img->slide), (void *)(s->addr + img->slide + s->size));
     if (reg_types && (s = find_text_section(img->mh, "__swift5_types")) && s->size) reg_types((void *)(s->addr + img->slide), (void *)(s->addr + img->slide + s->size));
 }
@@ -1316,6 +1481,10 @@ static void add_category_properties(Class cls, uint64_t list) {
 }
 
 // Step 2b, after the classes of every image exist (a category may extend a class of another image).
+// A Swift class that is not in its image's class list (Xcode's IDEKit: IDEWorkspaceNavigator) is not known to the Objective-C runtime until the Swift runtime sets it up;
+// a category of it waits for that (adding methods to a class the runtime does not know is fatal: "Attempt to use unknown class").
+static bool seen_has(uint64_t p);
+static bool swift_class_unknown(uint64_t cls) { return !seen_has(cls); }   // (a class of an image's class list has been through register_class by now)
 static void objc_attach_categories(GImage *img) {
     if (!img->objc_mapped) return;
     const struct mach_header_64 *mh = img->mh;
@@ -1326,8 +1495,8 @@ static void objc_attach_categories(GImage *img) {
             GCat *cat = *(GCat **)(SA(s) + o);
             Class cls = (Class)cat->cls;
             if (class_dropped((uint64_t)cls)) continue;
-            if (in_guest((uint64_t)cls) && swift_deferred((uint64_t)cls) && !swift_class_is_done((uint64_t)cls)) {   // (not in the runtime yet)
-                if (g_npending_cats < 512) g_pending_cats[g_npending_cats++] = (uint64_t)cat;
+            if (in_guest((uint64_t)cls) && ((swift_deferred((uint64_t)cls) && !swift_class_is_done((uint64_t)cls)) || swift_class_unknown((uint64_t)cls))) {   // (not in the runtime yet)
+                if (g_npending_cats < 16384) g_pending_cats[g_npending_cats++] = (uint64_t)cat;
                 continue;
             }
             attach_category_now(cat, cls);

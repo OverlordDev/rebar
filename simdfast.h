@@ -635,17 +635,17 @@ static bool vsingle_fast(CPU *c, uint32_t i) {
     uint8_t *p = (uint8_t *)&c->vr[rt] + idx * es;
     if (L) {
         switch (es) {
-        case 1: *p = *(volatile uint8_t *)base; break;
-        case 2: memcpy(p, (void *)base, 2); break;
-        case 4: memcpy(p, (void *)base, 4); break;
-        default: memcpy(p, (void *)base, 8); break;
+        case 1: *p = *(volatile uint8_t *)TBI(base); break;
+        case 2: memcpy(p, (void *)TBI(base), 2); break;
+        case 4: memcpy(p, (void *)TBI(base), 4); break;
+        default: memcpy(p, (void *)TBI(base), 8); break;
         }
     } else {
         switch (es) {
-        case 1: *(volatile uint8_t *)base = *p; break;
-        case 2: memcpy((void *)base, p, 2); break;
-        case 4: memcpy((void *)base, p, 4); break;
-        default: memcpy((void *)base, p, 8); break;
+        case 1: *(volatile uint8_t *)TBI(base) = *p; break;
+        case 2: memcpy((void *)TBI(base), p, 2); break;
+        case 4: memcpy((void *)TBI(base), p, 4); break;
+        default: memcpy((void *)TBI(base), p, 8); break;
         }
     }
     if (post) wr_sp(c, rn, base + (rm == 31 ? (uint64_t)es : rd(c, rm)));
@@ -658,10 +658,10 @@ static bool vld1r_fast(CPU *c, uint32_t i) {
     uint64_t base = rd_sp(c, rn);
     U8x16 r;
     switch (size) {
-    case 0: { uint8_t v = *(volatile uint8_t *)base; U8x16 z = {0}; r = z + v; break; }
-    case 1: { uint16_t v; memcpy(&v, (void *)base, 2); U16x8 z = {0}; z = z + v; memcpy(&r, &z, 16); break; }
-    case 2: { uint32_t v; memcpy(&v, (void *)base, 4); U32x4 z = {0}; z = z + v; memcpy(&r, &z, 16); break; }
-    default: { uint64_t v; memcpy(&v, (void *)base, 8); U64x2 z = {0}; z = z + v; memcpy(&r, &z, 16); break; }
+    case 0: { uint8_t v = *(volatile uint8_t *)TBI(base); U8x16 z = {0}; r = z + v; break; }
+    case 1: { uint16_t v; memcpy(&v, (void *)TBI(base), 2); U16x8 z = {0}; z = z + v; memcpy(&r, &z, 16); break; }
+    case 2: { uint32_t v; memcpy(&v, (void *)TBI(base), 4); U32x4 z = {0}; z = z + v; memcpy(&r, &z, 16); break; }
+    default: { uint64_t v; memcpy(&v, (void *)TBI(base), 8); U64x2 z = {0}; z = z + v; memcpy(&r, &z, 16); break; }
     }
     vwrite(&c->vr[rt], r, Q);
     if (post) wr_sp(c, rn, base + (rm == 31 ? (uint64_t)(1 << size) : rd(c, rm)));
@@ -699,21 +699,21 @@ static bool simd_fast(CPU *c, uint32_t i) {
 static inline void vreg_load(VReg *r, uint64_t addr, int bytes) {
     VReg t = {0};
     switch (bytes) {
-    case 1: t.b[0] = *(volatile uint8_t *)addr; break;
-    case 2: memcpy(&t, (void *)addr, 2); break;
-    case 4: memcpy(&t, (void *)addr, 4); break;
-    case 8: memcpy(&t, (void *)addr, 8); break;
-    default: memcpy(&t, (void *)addr, 16); break;
+    case 1: t.b[0] = *(volatile uint8_t *)TBI(addr); break;
+    case 2: memcpy(&t, (void *)TBI(addr), 2); break;
+    case 4: memcpy(&t, (void *)TBI(addr), 4); break;
+    case 8: memcpy(&t, (void *)TBI(addr), 8); break;
+    default: memcpy(&t, (void *)TBI(addr), 16); break;
     }
     *r = t;
 }
 static inline void vreg_store(const VReg *r, uint64_t addr, int bytes) {
     switch (bytes) {
-    case 1: *(volatile uint8_t *)addr = r->b[0]; break;
-    case 2: memcpy((void *)addr, r, 2); break;
-    case 4: memcpy((void *)addr, r, 4); break;
-    case 8: memcpy((void *)addr, r, 8); break;
-    default: memcpy((void *)addr, r, 16); break;
+    case 1: *(volatile uint8_t *)TBI(addr) = r->b[0]; break;
+    case 2: memcpy((void *)TBI(addr), r, 2); break;
+    case 4: memcpy((void *)TBI(addr), r, 4); break;
+    case 8: memcpy((void *)TBI(addr), r, 8); break;
+    default: memcpy((void *)TBI(addr), r, 16); break;
     }
 }
 
@@ -785,7 +785,7 @@ static bool vmulti_fast(CPU *c, uint32_t i) {
 #define INTERLEAVE(T)                                                                                           \
         {                                                                                                       \
             typedef T __attribute__((may_alias, aligned(1))) ta;                                                \
-            ta *p = (ta *)base;                                                                                 \
+            ta *p = (ta *)TBI(base);                                                                                 \
             T *r0 = (T *)o[0], *r1 = (T *)o[1], *r2 = (T *)o[2], *r3 = (T *)o[3];                               \
             if (L) {                                                                                            \
                 if (selem == 2) for (int e = 0; e < lanes; e++, p += 2) { r0[e] = p[0]; r1[e] = p[1]; }         \

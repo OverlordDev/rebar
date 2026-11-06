@@ -15,6 +15,7 @@ struct AppEntry: Identifiable, Hashable {
 /// What is known about an iOS app from its executable.
 struct IOSInfo: Hashable {
     let usesUI: Bool         // links UIKit or SwiftUI: needs rebar-ios (the Mac Catalyst UIKit) in a host .app bundle
+    let simulator: Bool      // built for the iOS Simulator: the Rust standard library of such a build reads IPHONE_SIMULATOR_ROOT and aborts without it
     let encrypted: Bool      // FairPlay (LC_ENCRYPTION_INFO cryptid 1): the code cannot be read, nothing here decrypts it
 }
 
@@ -185,7 +186,7 @@ final class Launcher: NSObject, ObservableObject {
         let exe = p + "/" + exeName
         guard let m = machoInfo(atPath: exe), m.archs.contains("arm64") else { return nil }
         let name = (info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String) ?? exeName
-        return AppEntry(path: p, name: name, version: (info["CFBundleShortVersionString"] as? String) ?? "", exe: exe, engine: nil, ios: IOSInfo(usesUI: m.usesUI, encrypted: m.encrypted))
+        return AppEntry(path: p, name: name, version: (info["CFBundleShortVersionString"] as? String) ?? "", exe: exe, engine: nil, ios: IOSInfo(usesUI: m.usesUI, simulator: m.simulator, encrypted: m.encrypted))
     }
 
     /// UIKit (Mac Catalyst) only runs in a process that lives in an .app: its scene server looks the client up by bundle. So an iOS app that uses UIKit runs from a small host bundle:
@@ -301,6 +302,7 @@ final class Launcher: NSObject, ObservableObject {
         var program = rebar, programArgs = [app.exe] + args
         if let ios = app.ios {
             if ios.encrypted { message = "“\(app.name)” is encrypted (FairPlay, from the App Store): its code cannot be read, so it cannot run. Only apps you built yourself or have the decrypted binary of work."; return }
+            if ios.simulator, env["IPHONE_SIMULATOR_ROOT"] == nil { env["IPHONE_SIMULATOR_ROOT"] = "/" }
             env["REBAR_IOS"] = "1"; env["REBAR_LIB_DIR"] = (rebar as NSString).deletingLastPathComponent
             if ios.usesUI {
                 env["REBAR_IOS_UI"] = "1"

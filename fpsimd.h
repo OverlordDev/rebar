@@ -158,8 +158,8 @@ static void fpw(CPU *c, int r, int type, double v) {
 
 static void vmem(CPU *c, int rt, int size, int opc, uint64_t addr) {
     int bytes = (opc & 2) ? 16 : 1 << size;
-    if (opc & 1) { VReg t; memset(&t, 0, 16); memcpy(&t, (void *)addr, bytes); c->vr[rt] = t; }
-    else memcpy((void *)addr, &c->vr[rt], bytes);
+    if (opc & 1) { VReg t; memset(&t, 0, 16); memcpy(&t, (void *)TBI(addr), bytes); c->vr[rt] = t; }
+    else memcpy((void *)TBI(addr), &c->vr[rt], bytes);
 }
 
 // LD1..LD4 / ST1..ST4, multiple structures.
@@ -184,8 +184,8 @@ static void simd_ldst_multi(CPU *c, uint32_t i) {
         for (int e = 0; e < lanes; e++)
             for (int s = 0; s < selem; s++) {
                 VReg *v = &c->vr[(rt + r + s) & 31];
-                if (L) memcpy((uint8_t *)v + e * es, (void *)addr, es);
-                else memcpy((void *)addr, (uint8_t *)v + e * es, es);
+                if (L) memcpy((uint8_t *)v + e * es, (void *)TBI(addr), es);
+                else memcpy((void *)TBI(addr), (uint8_t *)v + e * es, es);
                 addr += es;
             }
     if (post) wr_sp(c, rn, base + (rm == 31 ? (uint64_t)(rpt * selem * ds) : rd(c, rm)));
@@ -212,11 +212,11 @@ static void simd_ldst_single(CPU *c, uint32_t i) {
             if (!L) die(c, "bad ldst single", i);
             int lanes = (Q ? 16 : 8) / es;
             VReg t; memset(&t, 0, 16);
-            uint64_t val = 0; memcpy(&val, (void *)addr, es);
+            uint64_t val = 0; memcpy(&val, (void *)TBI(addr), es);
             for (int e = 0; e < lanes; e++) vset(&t, es, e, val);
             *v = t;
-        } else if (L) memcpy((uint8_t *)v + idx * es, (void *)addr, es);
-        else memcpy((void *)addr, (uint8_t *)v + idx * es, es);
+        } else if (L) memcpy((uint8_t *)v + idx * es, (void *)TBI(addr), es);
+        else memcpy((void *)TBI(addr), (uint8_t *)v + idx * es, es);
         addr += es;
     }
     if (post) wr_sp(c, rn, base + (rm == 31 ? (uint64_t)(selem * es) : rd(c, rm)));

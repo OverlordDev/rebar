@@ -16,6 +16,7 @@ clang -arch x86_64 -mmacosx-version-min=11.0 -dynamiclib -O2 -Wno-everything ../
 clang -arch x86_64 -mmacosx-version-min=11.0 -dynamiclib -fobjc-arc -O2 -w -framework Foundation -framework Security ../ios_sec.m -o "$APP/Contents/Resources/bin/librebar_sec.dylib"   # (the keychain of iOS apps)
 swiftc -O -swift-version 5 -parse-as-library -target x86_64-apple-macos11.0 Sources/App.swift Sources/Model.swift Sources/Support.swift Sources/FastEditor.swift -o "$APP/Contents/MacOS/$NAME"
 cp Info.plist "$APP/Contents/Info.plist"
+cp icon/AppIcon.icns icon/icon-light.png icon/icon-dark.png "$APP/Contents/Resources/"   # (made from the SVGs by icon/make_icon.sh)
 codesign --force --deep --sign - "$APP"
 mkdir -p "$OUT/stage/Rebar"
 cp -R "$APP" "$OUT/stage/Rebar/"

@@ -2,7 +2,17 @@ import SwiftUI
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var appearanceWatch: NSKeyValueObservation?
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }   // (the apps that were started keep running)
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        applyIcon()
+        appearanceWatch = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in DispatchQueue.main.async { self?.applyIcon() } }
+    }
+    /// The Dock shows the dark icon while the system is dark and the light one otherwise (the file in Finder is the light one: macOS before 26 has no icon that follows the appearance).
+    private func applyIcon() {
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if let url = Bundle.main.url(forResource: dark ? "icon-dark" : "icon-light", withExtension: "png"), let img = NSImage(contentsOf: url) { NSApp.applicationIconImage = img }
+    }
 }
 
 @main

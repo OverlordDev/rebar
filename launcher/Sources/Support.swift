@@ -165,7 +165,7 @@ final class PidCache {
 
 
 /// What matters about an executable for iOS apps: the CPU types, whether its code is FairPlay-encrypted (LC_ENCRYPTION_INFO cryptid 1) and whether it links UIKit or SwiftUI (of the arm64 slice).
-func machoInfo(atPath path: String) -> (archs: [String], encrypted: Bool, usesUI: Bool)? {
+func machoInfo(atPath path: String) -> (archs: [String], encrypted: Bool, usesUI: Bool, simulator: Bool)? {
     let archs = machoArchs(atPath: path)
     guard !archs.isEmpty, let h = FileHandle(forReadingAtPath: path) else { return nil }
     defer { try? h.close() }
@@ -181,11 +181,12 @@ func machoInfo(atPath path: String) -> (archs: [String], encrypted: Bool, usesUI
     try? h.seek(toOffset: base)
     let d = [UInt8](h.readData(ofLength: 1 << 17))
     func le(_ o: Int) -> UInt32 { UInt32(d[o + 3]) << 24 | UInt32(d[o + 2]) << 16 | UInt32(d[o + 1]) << 8 | UInt32(d[o]) }
-    guard d.count > 32, le(0) == 0xFEEDFACF, le(4) == 0x0100000C else { return (archs, false, false) }
-    var off = 32, enc = false, ui = false
+    guard d.count > 32, le(0) == 0xFEEDFACF, le(4) == 0x0100000C else { return (archs, false, false, false) }
+    var off = 32, enc = false, ui = false, sim = false
     for _ in 0..<Int(le(16)) where off + 8 <= d.count {
         let cmd = le(off), size = Int(le(off + 4))
         if size < 8 || off + size > d.count { break }
+        if cmd == 0x32, size >= 12, le(off + 8) == 7 { sim = true }   // LC_BUILD_VERSION, platform 7: built for the iOS Simulator
         if cmd == 0x2C, size >= 20, le(off + 16) != 0 { enc = true }   // LC_ENCRYPTION_INFO_64
         if cmd == 0xC || cmd == 0x80000018 || cmd == 0x8000001F || cmd == 0x1F {   // LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LOAD_UPWARD_DYLIB
             let no = off + Int(le(off + 8))
@@ -196,5 +197,5 @@ func machoInfo(atPath path: String) -> (archs: [String], encrypted: Bool, usesUI
         }
         off += size
     }
-    return (archs, enc, ui)
+    return (archs, enc, ui, sim)
 }
