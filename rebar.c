@@ -102,6 +102,15 @@ static const char *g_die_why;   // (what --probe-insns reports)
     if (t_fault_jb && g_guest_fault_handler[2] && !strncmp(why, "unimplemented", 13)) deliver_guest_signal(c, SIGILL, 1, c->pc);   // an instruction the guest wants to trap on (HotSpot's deoptimization instruction)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }
     fprintf(stderr, "rebar: %s (insn 0x%08x at pc 0x%llx)\n", why, insn, (unsigned long long)c->pc);
+    fprintf(stderr, "  guest registers:"); for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)c->x[k]); fprintf(stderr, " sp=%llx\n", (unsigned long long)c->sp);
+    if (getenv("REBAR_DUMP_SWIFT_STRINGS")) {   // x20/x24 and x23/x22 read as Swift Strings (a native large one: the characters at +32 of the object; a bridged one: the NSString)
+        uint64_t ow[2][2] = {{c->x[20], c->x[24]}, {c->x[23], c->x[22]}};
+        for (int k = 0; k < 2; k++) {
+            uint64_t obj = ow[k][1] & 0x00ffffffffffffffull; fprintf(stderr, "  string %d: countAndFlags %llx object %llx", k, (unsigned long long)ow[k][0], (unsigned long long)ow[k][1]);
+            if (!(ow[k][1] >> 60 & 0x2)) { if ((ow[k][1] >> 56) == 0 && obj > 0x10000) fprintf(stderr, " native: \"%.*s\"", (int)(ow[k][0] & 0xffff), (const char *)(obj + 32)); }
+            fprintf(stderr, "\n");
+        }
+    }
     dump_backtrace(c);
     exit(127);
 }

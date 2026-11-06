@@ -137,7 +137,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; bool ffi_abi, ffi_closure, cb9; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; bool ffi_abi, ffi_closure, cb9; bool strret; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -2680,6 +2680,32 @@ static uint8_t pathmask_for(const char *name) {   // bit k: argument k is a path
     for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) if (!strcmp(base, t[k].n)) return t[k].m;
     return 0;
 }
+// A Swift String that a host Swift function returns (Foundation's URL.path ...). The host here is macOS 15, whose Foundation hands out a lazily bridged NSString (a "foreign" String: the count in
+// its word is the UTF-16 length, the object word 0x5...); the code of an Xcode built for macOS 26 was compiled against a Foundation that returns native Strings, and counts its bytes inline
+// (SymbolCacheIndexing compared a 122-byte path with a 119-unit one and trapped: Xcode died while indexing a project). Such a result is turned into a native String
+// (String(cString:)); the NSString it held is released. REBAR_NO_NATIVE_STRINGS=1 turns it off.
+static void swift_string_to_native(CPU *c) {
+    static int off = -1; if (off < 0) off = getenv("REBAR_NO_NATIVE_STRINGS") != NULL;
+    if (off || (c->x[1] >> 60) != 0x5 || (c->x[0] >> 48) > 0x7fff) return;
+    static uint64_t (*cfstr_len)(const void *); static bool (*cfstr_get)(const void *, char *, long, uint32_t); typedef struct { uint64_t a, b; } SwStr2; static SwStr2 (*mk)(const char *); static void (*rel)(uint64_t);
+    if (!mk) {
+        cfstr_len = dlsym(RTLD_DEFAULT, "CFStringGetLength"); cfstr_get = dlsym(RTLD_DEFAULT, "CFStringGetCString");
+        mk = dlsym(RTLD_DEFAULT, "$sSS7cStringSSSPys4Int8VG_tcfC"); rel = dlsym(RTLD_DEFAULT, "swift_bridgeObjectRelease");
+        if (!mk) mk = (void *)1;
+    }
+    if (mk == (void *)1 || !cfstr_len || !cfstr_get || !rel) return;
+    const void *ns = (const void *)(c->x[1] & 0x00ffffffffffffffull);
+    long n = (long)cfstr_len(ns) * 3 + 4;
+    char *buf = malloc((size_t)n);
+    if (!buf) return;
+    if (cfstr_get(ns, buf, n, 0x08000100)) {
+        uint64_t old = c->x[1];
+        SwStr2 r = mk(buf);
+        c->x[0] = r.a; c->x[1] = r.b;
+        rel(old);
+    }
+    free(buf);
+}
 static void stub_call_inner(CPU *c) {
     { static int chk = -1; if (chk < 0) chk = getenv("REBAR_CHECK_ALIGN") != NULL; if (chk && ((uintptr_t)__builtin_frame_address(0) & 15) != 0) { static int n; if (n++ < 6) fprintf(stderr, "[align] stub_call_inner frame %p misaligned (pc %llx, lr %llx)\n", __builtin_frame_address(0), (unsigned long long)c->pc, (unsigned long long)c->x[30]); } }
     if (c->pc - g_stub_base >= g_stub_size) {  // an x86 host function reached through a pointer
@@ -2818,6 +2844,7 @@ static void stub_call_inner(CPU *c) {
     case 's': c->x[0] = (uint64_t)(int64_t)(int16_t)c->x[0]; break;
     }
     apply_landing(c);
+    if (__builtin_expect(s->strret, 0) && !t_landed) swift_string_to_native(c);
     ring_ent->ret = c->x[0];
     { static const char *r0 = (const char *)1; if (r0 == (const char *)1) r0 = getenv("REBAR_TRACE_RET0");   // REBAR_TRACE_RET0=<name prefix>: imports of that kind that returned 0 (a metadata lookup that found nothing)
       if (r0 && c->x[0] == 0 && !strncmp(s->name, r0, strlen(r0))) { fprintf(stderr, "[ret0] %s(0x%llx, 0x%llx, 0x%llx) from 0x%llx\n", s->name, (unsigned long long)ring_ent->x0, (unsigned long long)ring_ent->x1, (unsigned long long)ring_ent->x2, (unsigned long long)ring_ent->lr);
@@ -3025,6 +3052,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     if (host && !h && stl_layout_dependent(name))
         fprintf(stderr, "rebar: warning: %s takes libc++ objects whose arm64 layout rebar does not convert; expect it to misbehave\n", name);
     if (host && !h) g_stubs[idx].thisret = returns_this(name);
+    if (host && !h && name[0] == '_' && name[1] == '$') { size_t nl = strlen(name); g_stubs[idx].strret = (nl > 4 && (!strcmp(name + nl - 4, "SSvg") || !strcmp(name + nl - 4, "SSyF"))); }   // (a getter or a method that returns a String)
     if (host && !h) g_stubs[idx].throwing = !strcmp(name, "___cxa_throw");
     g_stubs[idx].pathmask = pathmask_for(name);
     g_stubs[idx].async_host = host && name && (!strcmp(name, "_swift_task_switch") || !strcmp(name, "_swift_continuation_await") || !strcmp(name, "_swift_task_future_wait") || !strcmp(name, "_swift_task_future_wait_throwing") || !strcmp(name, "_swift_task_group_wait_next_throwing") || !strcmp(name, "_swift_asyncLet_get") || !strcmp(name, "_swift_asyncLet_get_throwing") || !strcmp(name, "_swift_asyncLet_finish") || !strcmp(name, "_swift_task_run_inline") || (name[0] == '_' && name[1] == '$' && strstr(name, "Ya") && (strstr(name, "YaF") || strstr(name, "YaKF") || strstr(name, "Yacig") || strstr(name, "YaKcfC"))));
