@@ -389,7 +389,7 @@ static void trace_msg(CPU *c, const char *kind, id self, SEL sel) {
     if (getenv("REBAR_TRACE_DESC")) {   // the description of each argument that looks like an object
         static const void * (*cfdesc)(const void *); static bool (*cfget)(const void *, char *, long, uint32_t);
         if (!cfdesc) { cfdesc = dlsym(RTLD_DEFAULT, "CFCopyDescription"); cfget = dlsym(RTLD_DEFAULT, "CFStringGetCString"); }
-        for (int a = 2; a < 6; a++) {
+        for (int a = (getenv("REBAR_TRACE_SELF") ? 0 : 2); a < (getenv("REBAR_TRACE_SELF") ? 3 : 6); a++) {   // REBAR_TRACE_SELF=1: the receiver and the first argument only (the others of some selectors are not objects)
             uint64_t v = c->x[a]; char probe[8]; mach_vm_size_t got = 0;
             if (v < 0x100000 || (v & 7) || v >= 0x00007fffffffffffull) continue;
             if (mach_vm_read_overwrite(mach_task_self(), v, 8, (mach_vm_address_t)probe, &got) != 0 || got != 8) continue;
@@ -701,7 +701,11 @@ H(h_CVDisplayLinkCreateWithActiveCGDisplays) {   // (see above) the link of the 
     c->x[0] = (uint64_t)(int64_t)r;
 }
 H(h_CGDisplayIsActive) { uint32_t (*mainid)(void) = HOSTFN("CGMainDisplayID"); int (*real)(uint32_t) = HOSTFN("CGDisplayIsActive"); c->x[0] = real((uint32_t)c->x[0]) || (uint32_t)c->x[0] == mainid(); }
-H(h_CFRunLoopSourceCreate) { uint8_t t[80]; wrap_ctx(c, 2, 80, t); host_call(c, HOSTFN("CFRunLoopSourceCreate"), false); }
+H(h_CFRunLoopSourceCreate) {
+    uint8_t t[80];
+    if (getenv("REBAR_TRACE_CTX") && c->x[2] > 0x10000) { const uint64_t *w = (const uint64_t *)c->x[2]; fprintf(stderr, "[CFRunLoopSourceCreate] from %llx ctx:", (unsigned long long)c->x[30]); for (int k = 0; k < 10; k++) fprintf(stderr, " %llx", (unsigned long long)w[k]); fprintf(stderr, "\n"); }
+    wrap_ctx(c, 2, 80, t); host_call(c, HOSTFN("CFRunLoopSourceCreate"), false);
+}
 // REBAR_DISPLAY_HZ=<n>: the display link of the guest ticks at n Hz instead of the display's own rate.  A translated browser needs ~15-17 ms for the frame of
 // a scroll; on a 144 Hz display (ticks 6.9 ms apart) a frame that takes 14 ms waits for the third tick (20.8 ms, 48 fps), at a steady 60 Hz it fits in one tick.
 // The host's display link keeps running (it is what tells us the link is started and the window is shown); its callback only notes the time and the latest
@@ -842,7 +846,7 @@ static bool try_open_arm64_app(CPU *c, id self, SEL sel) {
 // in a table that is read without the lock; a repeat is checked against the current implementation and made without taking the lock. REBAR_NO_MSGFAST=1 turns it off.
 static int g_msgfast = -1;
 typedef struct { uint32_t seq; uint32_t rsize; uint64_t cls, sel, imp; char rkind; } MsgFast;
-#define MSGFAST_SLOTS 8192
+#define MSGFAST_SLOTS 262144   // (Xcode sends tens of thousands of different (class, selector) pairs: with 8192 slots the table thrashed and every miss paid class_getInstanceMethod)
 static MsgFast g_msgfast_tab[MSGFAST_SLOTS];
 static bool bundle_load_hook(CPU *c, id self, SEL sel);   // (loader.h)
 static bool msg_special_sel(SEL sel) {

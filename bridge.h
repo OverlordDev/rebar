@@ -2585,6 +2585,7 @@ static void h_objc_msgSend(CPU *c);
 static bool msgsend_fast(CPU *c);
 static void stub_call(CPU *c) {
     uint64_t off = c->pc - g_stub_base;
+    if (__builtin_expect(off < g_stub_size && off / 16 >= 2 && off / 16 < (uint64_t)g_nstubs && g_stubs[off / 16].handler == h_chkstk_darwin && !g_stubprof && g_slow_ms <= 0, 1)) { c->pc = c->x[30]; return; }   // (the stack probe does nothing: embree's traversal calls it for a 9.7 KB frame millions of times a second)
     if (__builtin_expect(g_slow_ms > 0, 0) && !g_stubprof) {
         struct timespec a, b; uint64_t lr0 = c->x[30], x0 = c->x[0], x1 = c->x[1], x2 = c->x[2];
         bool lock0 = off < g_stub_size && off / 16 >= 2 && off / 16 < (uint64_t)g_nstubs && g_stubs[off / 16].handler && g_stubs[off / 16].handler != h_chkstk_darwin, had0 = t_have_gil;
@@ -2841,10 +2842,19 @@ static bool trace_stub_wanted(const char *name) {
     return false;
 }
 
+// Stubs by name: stub_for was a linear scan over every stub made so far (tens of thousands for Xcode: seconds of strcmp while its images are bound).
+static int32_t g_stub_hash[MAX_STUBS * 2];   // stub index + 1, 0 = free
+static inline uint32_t stub_name_hash(const char *s) { uint32_t h = 2166136261u; while (*s) h = (h ^ (uint8_t)*s++) * 16777619u; return h; }
+static int stub_find(const char *name) {
+    uint32_t m = MAX_STUBS * 2 - 1, h = stub_name_hash(name) & m;
+    while (g_stub_hash[h]) { int k = g_stub_hash[h] - 1; if (!strcmp(g_stubs[k].name, name)) return k; h = (h + 1) & m; }
+    return -1;
+}
 static int stub_new(const char *name, const char *lib, void *host, StubHandler h) {
     if (g_nstubs >= MAX_STUBS) { fprintf(stderr, "rebar: too many imports\n"); exit(1); }
     g_stubs[g_nstubs] = (Stub){strdup(name), lib ? strdup(lib) : NULL, host, h,
                                strstr(name, "9to_stringE") || strstr(name, "6substrE") || strstr(name, "6getlocE") || strstr(name, "17current_exceptionv"), NULL, 0, NULL, NULL, false, false};
+    { uint32_t m = MAX_STUBS * 2 - 1, h = stub_name_hash(g_stubs[g_nstubs].name) & m; while (g_stub_hash[h]) h = (h + 1) & m; g_stub_hash[h] = g_nstubs + 1; }
     return g_nstubs++;
 }
 
@@ -2965,8 +2975,7 @@ static void patch_swift_extra_inhabitants(void) {
 }
 static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     if (name && (!strncmp(name, "_swift_", 7) || !strncmp(name, "_$s", 3))) patch_swift_extra_inhabitants();
-    for (int k = 2; k < g_nstubs; k++)
-        if (!strcmp(g_stubs[k].name, name)) return stub_addr(k);
+    { int k = stub_find(name); if (k >= 2) return stub_addr(k); }
     {   // debugging aid: REBAR_NOP=_vm_protect,_madvise makes those imports do nothing and return 0
         const char *nop = getenv("REBAR_NOP");
         if (nop) {
@@ -2987,8 +2996,11 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
         if (!h) {
             const char *sym = name + (name[0] == '_');
             char buf[512];
+            static const char *const inode64[] = {"alphasort", "fdopendir", "fstat", "fstatat", "fstatfs", "fstatx_np", "fts_children", "fts_close", "fts_open", "fts_open_b", "fts_read", "fts_set", "ftw",
+                "getfsstat", "getmntinfo", "glob", "glob_b", "lstat", "lstatx_np", "nftw", "opendir", "readdir", "readdir_r", "rewinddir", "scandir", "scandir_b", "seekdir", "stat", "statfs", "statx_np", "telldir", NULL};
+            bool i64 = false; for (const char *const *q = inode64; *q; q++) if (!strcmp(*q, sym)) { i64 = true; break; }   // (a lookup that finds nothing walks every loaded image: only the names that have the variant are asked for it)
             snprintf(buf, sizeof buf, "%s$INODE64", sym);  // x86_64 stat() & co. need the 64-bit inode variants
-            host = dlsym(RTLD_DEFAULT, buf);
+            if (i64) host = dlsym(RTLD_DEFAULT, buf);
             if (!host) host = dlsym(RTLD_DEFAULT, sym);
         }
     }

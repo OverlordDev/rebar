@@ -560,6 +560,17 @@ H(h_dlsym) {
     snprintf(name, sizeof name, "_%s", S(1));
     GImage *img = image_from_handle(handle);
     uint64_t a = img ? image_export_lookup(img, name) : 0;
+    if (!a && img && !getenv("REBAR_NO_DLSYM_DEPS")) {   // dlsym(handle, name) also looks into what the library depends on (JBR's libawt_lwawt and the natives of AWTThreading in libosxapp): its guest dependencies, breadth first
+        static __thread GImage *queue[512]; int qh = 0, qt = 0; queue[qt++] = img;
+        for (; qh < qt && !a; qh++)
+            for (int d = 0; d < queue[qh]->ndeps && !a; d++) {
+                GImage *dep = queue[qh]->dep_img[d]; if (!dep) continue;
+                bool seen = false; for (int q = 0; q < qt; q++) if (queue[q] == dep) { seen = true; break; }
+                if (seen) continue;
+                a = image_export_lookup(dep, name);
+                if (!a && qt < 512) queue[qt++] = dep;
+            }
+    }
     bool deps = false;   // dlsym(handle of a guest library, name) also finds what the library's dependencies export (Julia asks libjulia-internal for strlen): the libraries here are the host's
     if (!a && img && !img->is_main && name[1] && !strchr(name + 1, '$') && host_libsystem_symbol(name + 1)) deps = true;   // (only what libSystem really has: every guest library depends on it)
     if (!a && (!img || img->is_main || deps)) {       // RTLD_DEFAULT / RTLD_NEXT / the executable: every guest image, then the host
