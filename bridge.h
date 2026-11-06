@@ -970,10 +970,24 @@ static void trace_mem(const char *what, uint64_t a, uint64_t len, uint64_t x, ui
     fprintf(stderr, "[mem] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx) = 0x%llx from 0x%llx\n", what, (unsigned long long)a, (unsigned long long)len,
             (unsigned long long)x, (unsigned long long)y, (unsigned long long)ret, (unsigned long long)lr);
 }
+// Guest code is interpreted: memory the guest maps or protects needs no execute permission, and with it the host would run the arm64 bytes of a function pointer the guest handed to host
+// code (a JNA / libffi closure trampoline, a JIT's stub) as x86: SIGILL (IntelliJ died in a CFRunLoop callback). Without it the jump is an instruction-fetch fault, which on_segv bridges into the
+// interpreter (the memory is the guest's: own_add). REBAR_KEEP_EXEC=1 leaves the permissions as they are.
+static int guest_prot(int prot) { static int keep = -1; if (keep < 0) keep = getenv("REBAR_KEEP_EXEC") != NULL; return keep ? prot : (prot & ~4); }
+static void strip_exec_region(uint64_t addr, uint64_t size) {   // a region the kernel has just made (vm_remap, vm_map): its protection is whatever the source had
+    static int keep = -1; if (keep < 0) keep = getenv("REBAR_KEEP_EXEC") != NULL; if (keep || !addr || !size) return;
+    for (uint64_t a = addr; a < addr + size;) {
+        mach_vm_address_t ra = a; mach_vm_size_t rs = 0; vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t on;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &on) != KERN_SUCCESS || ra >= addr + size) break;
+        if (bi.protection & VM_PROT_EXECUTE) { uint64_t lo = ra < addr ? addr : ra, hi = ra + rs > addr + size ? addr + size : ra + rs; mach_vm_protect(mach_task_self(), lo, hi - lo, false, bi.protection & ~VM_PROT_EXECUTE); }
+        a = ra + rs;
+    }
+}
 H(h_mmap) {  // (addr, len, prot, flags, fd, off)
     int flags = (int)c->x[3], prot = (int)c->x[2], fd = (int)c->x[4];
     off_t off = (off_t)c->x[5];
     uint64_t len = (c->x[1] + GUEST_PAGE - 1) & ~(GUEST_PAGE - 1);
+    prot = guest_prot(prot);
     void *r = mmap(P(0), len, prot, flags, fd, off);
     if (r == MAP_FAILED && errno == EINVAL && fd >= 0 && !(flags & MAP_ANON)) {   // a POSIX shared memory object is rounded to the host's 4 KB pages, not to the 16 KB the arm64 guest assumes (multiprocessing.shared_memory maps 64 bytes): map what the object holds
         uint64_t len4 = (c->x[1] + 4095) & ~4095ull;
@@ -1163,12 +1177,12 @@ H(h_thread_suspend) {
     pthread_mutex_unlock(&g_jit_mu);
 }
 H(h_munmap) { bool ok = own_check(c->x[0], c->x[1]); trace_mem(ok ? "munmap" : "munmap (ignored)", c->x[0], c->x[1], 0, 0, 0, c->x[30]); if (!ok) { RET(0); return; } own_remove(c->x[0], c->x[1]); RET(munmap(P(0), c->x[1])); }
-H(h_mprotect) { bool ok = own_check(c->x[0], c->x[1]); trace_mem(ok ? "mprotect" : "mprotect (ignored)", c->x[0], c->x[1], c->x[2], 0, 0, c->x[30]); if (!ok) { RET(0); return; } RET(mprotect(P(0), c->x[1], (int)c->x[2])); }
+H(h_mprotect) { bool ok = own_check(c->x[0], c->x[1]); trace_mem(ok ? "mprotect" : "mprotect (ignored)", c->x[0], c->x[1], c->x[2], 0, 0, c->x[30]); if (!ok) { RET(0); return; } RET(mprotect(P(0), c->x[1], guest_prot((int)c->x[2]))); }
 H(h_madvise) { bool ok = own_check(c->x[0], c->x[1]); trace_mem(ok ? "madvise" : "madvise (ignored)", c->x[0], c->x[1], c->x[2], 0, 0, c->x[30]); if (!ok) { RET(0); return; } RET(madvise(P(0), c->x[1], (int)c->x[2])); }
 H(h_vm_protect) {  // (task, addr, size, set_maximum, prot) - also used for mach_vm_protect
     if (!own_check(c->x[1], c->x[2])) { RET(0); return; }
     kern_return_t (*f)(uint64_t, uint64_t, uint64_t, int, int) = HOSTFN("mach_vm_protect");
-    RET(f(c->x[0], c->x[1], c->x[2], (int)c->x[3], (int)c->x[4]));
+    RET(f(c->x[0], c->x[1], c->x[2], (int)c->x[3], guest_prot((int)c->x[4])));
 }
 H(h_vm_allocate) {  // (task, *addr, size, flags)
     kern_return_t (*f)(uint64_t, uint64_t *, uint64_t, int) = HOSTFN("mach_vm_allocate");
@@ -1502,13 +1516,30 @@ H(h_Unwind_Resume);
 H(h_Unwind_GetCFA); H(h_Unwind_SetGR); H(h_Unwind_SetIP); H(h_Unwind_GetIP); H(h_Unwind_GetGR); H(h_Unwind_GetIPInfo); H(h_Unwind_GetLanguageSpecificData); H(h_Unwind_GetRegionStart); H(h_Unwind_GetDataRelBase); H(h_Unwind_GetTextRelBase);
 H(h_objc_getProtocol); H(h_NSProtocolFromString); H(h_objc_alloc_init); H(h_objc_alloc); H(h_objc_opt_new); H(h_objc_allocWithZone);
 H(h_vfork); H(h_objc_claimAutoreleasedReturnValue); H(h_objc_autoreleaseReturnValue); H(h_objc_retainAutoreleasedReturnValue); H(h_objc_unsafeClaimAutoreleasedReturnValue); H(h_uname); H(h_thread_get_state); H(h_thread_set_state); H(h_thread_resume); H(h_posix_spawnattr_setbinpref_np); H(h_SSLSetIOFuncs); H(h_SecItemAdd); H(h_SecItemCopyMatching); H(h_SecItemUpdate); H(h_SecItemDelete); H(h_CGGetActiveDisplayList); H(h_CVDisplayLinkCreateWithActiveCGDisplays); H(h_CGDisplayIsActive); H(h_unw_getcontext); H(h_unw_init_local); H(h_unw_step); H(h_unw_get_reg); H(h_unw_set_reg); H(h_unw_get_fpreg); H(h_unw_set_fpreg); H(h_unw_is_signal_frame);
-H(h_abort_report);
+H(h_abort_report); H(h_JRSFontGetBoundingBoxesForGlyphsAndStyle);
 H(h_dlopen); H(h_dlsym); H(h_dlclose); H(h_dladdr); H(h_dlerror);
 H(h_dyld_image_count); H(h_dyld_get_image_name); H(h_dyld_get_image_header);
 H(h_dyld_get_image_vmaddr_slide); H(h_dyld_register_func_for_add_image);
 typedef struct { const char *name; StubHandler h; } Special;
 H(h_path_begin_end); H(h_path_iter_step);
 H(h_ffi_call); H(h_ffi_prep_cif_var); H(h_ffi_prep_cif);
+// JavaRuntimeSupport (JBR's AWT font code): JRSFontGetBoundingBoxesForGlyphsAndStyle(font, matrix, style, glyphs, count, rects) of this macOS dereferences its style argument (the rendering style
+// the arm64 JBR passes is the value 3: SIGSEGV at address 3 inside the host function). The boxes are asked of CoreText instead and moved by the matrix. REBAR_NO_JRS_BBOX=1 calls the host function.
+H(h_JRSFontGetBoundingBoxesForGlyphsAndStyle) {
+    static int off = -1; if (off < 0) off = getenv("REBAR_NO_JRS_BBOX") != NULL;
+    typedef struct { double a, b, c, d, tx, ty; } Aff; typedef struct { double x, y, w, h; } Rc;
+    uint64_t font = c->x[0]; const Aff *m = (const Aff *)c->x[1]; const uint16_t *glyphs = (const uint16_t *)c->x[3]; size_t n = c->x[4]; Rc *rects = (Rc *)c->x[5];
+    void (*bb)(uint64_t, int, const uint16_t *, Rc *, long) = dlsym(RTLD_DEFAULT, "CTFontGetBoundingRectsForGlyphs");
+    if (off || !bb || !rects || !glyphs) { host_call(c, HOSTFN("JRSFontGetBoundingBoxesForGlyphsAndStyle"), false); return; }
+    bb(font, 0, glyphs, rects, (long)n);
+    if (m) for (size_t i = 0; i < n; i++) {   // (the four corners of the box, moved by the matrix: their bounds)
+        double xs[4] = {rects[i].x, rects[i].x + rects[i].w, rects[i].x, rects[i].x + rects[i].w}, ys[4] = {rects[i].y, rects[i].y, rects[i].y + rects[i].h, rects[i].y + rects[i].h};
+        double lo_x = 1e300, hi_x = -1e300, lo_y = 1e300, hi_y = -1e300;
+        for (int k = 0; k < 4; k++) { double X = m->a * xs[k] + m->c * ys[k] + m->tx, Y = m->b * xs[k] + m->d * ys[k] + m->ty; if (X < lo_x) lo_x = X; if (X > hi_x) hi_x = X; if (Y < lo_y) lo_y = Y; if (Y > hi_y) hi_y = Y; }
+        rects[i] = (Rc){lo_x, lo_y, hi_x - lo_x, hi_y - lo_y};
+    }
+    c->x[0] = 1;
+}
 H(h_abort_report) {   // (the guest calls abort(): say where from, then let the host do it)
     fprintf(stderr, "rebar: guest called abort() (pid %d) from lr 0x%llx\n", (int)getpid(), (unsigned long long)c->x[30]);
     dump_recent_imports();
@@ -1553,7 +1584,7 @@ static const Special k_special[] = {
     {"__NSGetArgv", h_nsgetargv}, {"__NSGetArgc", h_nsgetargc}, {"__NSGetProgname", h_nsgetprogname},
     {"_getprogname", h_getprogname}, {"__NSGetExecutablePath", h_nsgetexepath},
     {"__tlv_bootstrap", h_tlv_bootstrap}, {"_pthread_setspecific", h_pthread_setspecific}, {"_swift_updateClassMetadata2", h_swift_updateClassMetadata2}, {"_swift_initClassMetadata2", h_swift_initClassMetadata2}, {"_swift_getInitializedObjCClass", h_swift_getInitializedObjCClass}, {"_DNSServiceProcessResult", h_DNSServiceProcessResult},
-    {"_abort", h_abort_report},
+    {"_abort", h_abort_report}, {"_JRSFontGetBoundingBoxesForGlyphsAndStyle", h_JRSFontGetBoundingBoxesForGlyphsAndStyle},
     {"_dlopen", h_dlopen}, {"_dlerror", h_dlerror}, {"_dlsym", h_dlsym}, {"_dlclose", h_dlclose}, {"_dladdr", h_dladdr},
     {"__dyld_image_count", h_dyld_image_count}, {"__dyld_get_image_name", h_dyld_get_image_name},
     {"__dyld_get_image_header", h_dyld_get_image_header}, {"__dyld_get_image_vmaddr_slide", h_dyld_get_image_vmaddr_slide},
@@ -2827,7 +2858,7 @@ static void stub_call_inner(CPU *c) {
         if (s->ffi_closure && c->x[0] < 128) c->x[0] = 128;
         if (s->txn_mask) for (int k = 0; k < 8; k++) if (((s->txn_mask >> k) & 1) && c->x[k] == 1) c->x[k] = 2;
         t_stk = s->stk; t_swift = s->swift; t_async_call = s->async_host && !g_no_async_tail; if (s->cb9) t_cb_stackargs++; host_call(c, s->host, s->sret); if (s->cb9) t_cb_stackargs--; t_stk = NULL;
-        if (s->maps && (uint32_t)c->x[0] == 0 && !t_landed) own_add(*(uint64_t *)addr_ptr, size);  // vm_map & co.: the guest owns what came back
+        if (s->maps && (uint32_t)c->x[0] == 0 && !t_landed) { own_add(*(uint64_t *)addr_ptr, size); strip_exec_region(*(uint64_t *)addr_ptr, size); }  // vm_map & co.: the guest owns what came back
     }
     else {
         fprintf(stderr, "rebar: unresolved import %s%s%s%s\n", s->name,

@@ -624,6 +624,7 @@ static uint64_t imp_wrap_any(uint64_t imp, bool any) {
                 g_thunk_page = g_thunk_top = mmap(NULL, 64u << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
                 if (g_thunk_page == MAP_FAILED) { g_thunk_page = g_thunk_top = g_thunk_end = NULL; pthread_mutex_unlock(&g_thunk_mu); return imp; }
                 g_thunk_end = g_thunk_page + (64u << 20);
+                if (getenv("REBAR_IMAGES")) fprintf(stderr, "rebar: imp thunks %p - %p\n", (void *)g_thunk_page, (void *)g_thunk_end);
             }
             if (g_thunk_top == g_thunk_end) { pthread_mutex_unlock(&g_thunk_mu); return imp; }   // (2 million thunks: the raw address works, through the fault)
             uint8_t *t = g_thunk_top; g_thunk_top += 32;
