@@ -801,6 +801,10 @@ H(h_objc_alloc) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_a
 H(h_objc_opt_new) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_opt_new"), false); }
 H(h_objc_allocWithZone) { swift_ensure_receiver(c, c->x[0]); host_call(c, HOSTFN("objc_allocWithZone"), false); }
 H(h_swift_initClassMetadata2) { uint64_t cls = c->x[0]; host_call(c, HOSTFN("swift_initClassMetadata2"), false); if (cls && in_guest(cls) && !swift_deferred(cls)) attach_pending_categories(cls); }   // (a class outside its image's class list is set up here; its class methods wait in a category)
+// objc_opt_self(cls) is what `SomeSwiftClass.self` compiles to in code that wants a Swift class's metadata: a class that is still waiting for the Swift runtime (deferred) is set up first, or the
+// metadata handed to swift_dynamicCast and friends is unfinished (Xcode: casting to IDESourceControlUI.SourceControlWorkspaceHolder faulted inside the host's swift_dynamicCast
+// when a source file was opened).
+H(h_objc_opt_self) { uint64_t cls = c->x[0]; if (cls && g_nswift_deferred && in_guest(cls)) swift_class_ensure_ready(c, cls); host_call(c, HOSTFN("objc_opt_self"), false); }
 H(h_swift_updateClassMetadata2) { uint64_t cls = c->x[0]; host_call(c, HOSTFN("swift_updateClassMetadata2"), false); swift_class_ready(cls); if (cls && !swift_deferred(cls)) attach_pending_categories(cls); }   // (a class that is not in its image's class list carries its class methods in a category: Xcode's SSHHelperXPCClient has no +serviceIdentifier without it)
 H(h_swift_getInitializedObjCClass) { uint64_t cls = c->x[0]; swift_class_ready(cls); host_call(c, HOSTFN("swift_getInitializedObjCClass"), false); if (cls && !swift_deferred(cls)) attach_pending_categories(cls); }
 H(h_class_replaceMethod) { imp_register_runtime(c->x[2], (const char *)c->x[3]); c->x[2] = imp_wrap(c->x[2]); host_call(c, HOSTFN("class_replaceMethod"), false); c->x[0] = imp_unwrap(c->x[0]); }

@@ -1240,6 +1240,21 @@ H(h_swift_allocObject) {
     host_call(c, HOSTFN("swift_allocObject"), false);
 }
 // asl_log(client, msg, level, format, ...): the variadic arguments are on the guest stack (GPUToolsCore passed a pointer through the registers it left behind)
+// swift_dynamicCast whose source is an Any container with no type metadata: the type word holds a small number, one of the "no payload" encodings of an Optional (the other words are leftovers of the stack).
+// Code that tests only for nil (word == 0) took it for a value (Xcode: Combine's CompactMap handed IDEDelta's `workspaceHolder` closure such an Any?, the runtime read a vtable at address type-8 and died when
+// a source file was opened). Casting nothing to a class can only fail, which is what the closure's `as?` is for; the source is left alone (a destroy of it would crash as well).
+// REBAR_TRACE_CAST=1 reports every cast of an Any, REBAR_NO_CAST_GUARD=1 turns the guard off.
+H(h_swift_dynamicCast) {
+    static uint64_t any_md; if (!any_md) { void *p = dlsym(RTLD_DEFAULT, "$sypN"); any_md = p ? (uint64_t)p + 8 : 1; }
+    static int tr = -1, off = 0; if (tr < 0) { tr = getenv("REBAR_TRACE_CAST") != NULL; off = getenv("REBAR_NO_CAST_GUARD") != NULL; }
+    if (c->x[2] == any_md && c->x[1]) {
+        uint64_t *w = (uint64_t *)c->x[1];
+        if (tr) fprintf(stderr, "[dynamicCast of Any: src=%llx type word=%llx target=%llx flags=%llx lr=%llx]\n", (unsigned long long)c->x[1], (unsigned long long)w[3], (unsigned long long)c->x[3], (unsigned long long)c->x[4], (unsigned long long)c->x[30]);
+        if (w[3] < 0x1000 && !off) { c->x[0] = 0; return; }
+    }
+    bool (*f)(void *, void *, const void *, const void *, uint64_t) = (bool (*)(void *, void *, const void *, const void *, uint64_t))dlsym(RTLD_DEFAULT, "swift_dynamicCast");
+    c->x[0] = f((void *)c->x[0], (void *)c->x[1], (const void *)c->x[2], (const void *)c->x[3], c->x[4]) ? 1 : 0;
+}
 H(h_asl_log)  { VA_INIT(ap, c->sp); int (*f)(void *, void *, int, const char *, va_list) = dlsym(RTLD_DEFAULT, "asl_vlog"); c->x[0] = f ? (uint64_t)(int64_t)f((void *)c->x[0], (void *)c->x[1], (int)c->x[2], S(3), ap) : 0; }
 static void exec_list(CPU *c, bool search, bool with_env) {   // execl / execlp / execle: arg0 in x1, the rest of the list on the stack, up to a NULL (and then the environment for execle)
     char *argv[64]; int n = 0; argv[n++] = (char *)c->x[1];
@@ -1584,7 +1599,7 @@ static const Special k_special[] = {
     {"__NSGetArgv", h_nsgetargv}, {"__NSGetArgc", h_nsgetargc}, {"__NSGetProgname", h_nsgetprogname},
     {"_getprogname", h_getprogname}, {"__NSGetExecutablePath", h_nsgetexepath},
     {"__tlv_bootstrap", h_tlv_bootstrap}, {"_pthread_setspecific", h_pthread_setspecific}, {"_swift_updateClassMetadata2", h_swift_updateClassMetadata2}, {"_swift_initClassMetadata2", h_swift_initClassMetadata2}, {"_swift_getInitializedObjCClass", h_swift_getInitializedObjCClass}, {"_DNSServiceProcessResult", h_DNSServiceProcessResult},
-    {"_abort", h_abort_report}, {"_JRSFontGetBoundingBoxesForGlyphsAndStyle", h_JRSFontGetBoundingBoxesForGlyphsAndStyle},
+    {"_abort", h_abort_report}, {"_swift_dynamicCast", h_swift_dynamicCast}, {"_objc_opt_self", h_objc_opt_self}, {"_JRSFontGetBoundingBoxesForGlyphsAndStyle", h_JRSFontGetBoundingBoxesForGlyphsAndStyle},
     {"_dlopen", h_dlopen}, {"_dlerror", h_dlerror}, {"_dlsym", h_dlsym}, {"_dlclose", h_dlclose}, {"_dladdr", h_dladdr},
     {"__dyld_image_count", h_dyld_image_count}, {"__dyld_get_image_name", h_dyld_get_image_name},
     {"__dyld_get_image_header", h_dyld_get_image_header}, {"__dyld_get_image_vmaddr_slide", h_dyld_get_image_vmaddr_slide},
