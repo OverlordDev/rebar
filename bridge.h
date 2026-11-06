@@ -1,4 +1,5 @@
 #include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <setjmp.h>
 // Bridge between the interpreted arm64 guest and the host's x86_64 libSystem.
 //
@@ -1829,7 +1830,7 @@ static bool jit_recover_state(ucontext_t *uc, const JReg *jb, uint64_t *ea) {
 }
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
-    if (sig == SIGSEGV && getenv("REBAR_POOL_GUARD") && (uint64_t)si->si_addr == 0 && unwind_out_of_pool_pop(uc)) return;
+    { static int pg = -1; if (pg < 0) pg = getenv("REBAR_POOL_GUARD") != NULL; if (pg && sig == SIGSEGV && (uint64_t)si->si_addr == 0 && unwind_out_of_pool_pop(uc)) return; }   // (getenv is a linear scan of the environment under a lock: not on every fault)
     if (sig == SIGILL || sig == SIGTRAP || sig == SIGFPE) {  // never an instruction-fetch bridge: report without touching any state
         { const JReg *jb = g_jit_on ? jit_block_of(uc->uc_mcontext->__ss.__rip) : NULL; if (jb) { char bb[160]; int nn = snprintf(bb, sizeof bb, "rebar: trap in translated code of the block at guest pc 0x%llx (%u instructions)\n", (unsigned long long)jb->pc, jb->n); write(2, bb, nn); } }
         char b[200];
@@ -1859,8 +1860,16 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
             { static int chk = -1; if (chk < 0) chk = getenv("REBAR_CHECK_ALIGN") != NULL;
               if (chk && (uc->uc_mcontext->__ss.__rsp & 15) != 8) { static int n; if (n++ < 8) { uint64_t ra = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; Dl_info di; const char *nm = dladdr((void *)ra, &di) && di.dli_sname ? di.dli_sname : "?";
                 char b[300]; int k = snprintf(b, sizeof b, "[align] host jumped to guest %llx with rsp %llx (mod 16 = %d); return address %llx in %s\n", (unsigned long long)rip, (unsigned long long)uc->uc_mcontext->__ss.__rsp, (int)(uc->uc_mcontext->__ss.__rsp & 15), (unsigned long long)ra, nm); write(2, b, k); } } }
-            { uint64_t ra0 = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; uint32_t after = 0; mach_vm_size_t got0 = 0; uc->uc_mcontext->__ss.__r10 = 0;
-              if (!getenv("REBAR_NO_ASYNC_RET") && mach_vm_read_overwrite(mach_task_self(), ra0, 4, (mach_vm_address_t)&after, &got0) == KERN_SUCCESS && got0 == 4 && after == 0x08ec8348u && ({ Dl_info dj; dladdr((void *)ra0, &dj) && dj.dli_fname && strstr(dj.dli_fname, "libswift_Concurrency"); })) { uc->uc_mcontext->__ss.__r10 = 0x5ca1ab1e5ca1ab1eull; if (getenv("REBAR_TRACE_ASYNC")) { Dl_info di; const char *nm = dladdr((void *)ra0, &di) && di.dli_sname ? di.dli_sname : "?"; char b[240]; int k = snprintf(b, sizeof b, "[async return] guest %llx called from %llx in %s\n", (unsigned long long)rip, (unsigned long long)ra0, nm); write(2, b, k); } } }   // 48 83 ec 08 = subq $8,%rsp
+            { uint64_t ra0 = *(uint64_t *)uc->uc_mcontext->__ss.__rsp; uc->uc_mcontext->__ss.__r10 = 0;
+              // only a host caller inside libswift_Concurrency matters here: its address range is found once (again when more images were loaded and it was not there yet), and the four bytes
+              // at the return address are then read directly (a mach_vm_read_overwrite per fault cost more than the rest of the handler: 500000 faults opening a project)
+              static int noasync = -1; if (noasync < 0) noasync = getenv("REBAR_NO_ASYNC_RET") != NULL;
+              static uint64_t conc_lo, conc_hi; static uint32_t conc_n;
+              if (!noasync) {
+                  uint32_t nimg = _dyld_image_count();
+                  if (!conc_hi && nimg != conc_n) { conc_n = nimg; for (uint32_t k = 0; k < nimg; k++) { const char *pn = _dyld_get_image_name(k); if (pn && strstr(pn, "libswift_Concurrency")) { const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(k); unsigned long sz = 0; if (mh && getsegmentdata(mh, "__TEXT", &sz)) { conc_lo = (uint64_t)mh; conc_hi = conc_lo + sz; } break; } } }
+                  if (ra0 - conc_lo < conc_hi - conc_lo && *(uint32_t *)ra0 == 0x08ec8348u) { uc->uc_mcontext->__ss.__r10 = 0x5ca1ab1e5ca1ab1eull; if (getenv("REBAR_TRACE_ASYNC")) { Dl_info di; const char *nm = dladdr((void *)ra0, &di) && di.dli_sname ? di.dli_sname : "?"; char b[240]; int k = snprintf(b, sizeof b, "[async return] guest %llx called from %llx in %s\n", (unsigned long long)rip, (unsigned long long)ra0, nm); write(2, b, k); } }   // 48 83 ec 08 = subq $8,%rsp
+              } }
             uc->uc_mcontext->__ss.__r11 = rip;
             uc->uc_mcontext->__ss.__rip = (uint64_t)rebar_guest_entry;
             if (g_entry_stats) {
