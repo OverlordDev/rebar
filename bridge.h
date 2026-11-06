@@ -1529,9 +1529,9 @@ H(h_JRSFontGetBoundingBoxesForGlyphsAndStyle) {
     static int off = -1; if (off < 0) off = getenv("REBAR_NO_JRS_BBOX") != NULL;
     typedef struct { double a, b, c, d, tx, ty; } Aff; typedef struct { double x, y, w, h; } Rc;
     uint64_t font = c->x[0]; const Aff *m = (const Aff *)c->x[1]; const uint16_t *glyphs = (const uint16_t *)c->x[3]; size_t n = c->x[4]; Rc *rects = (Rc *)c->x[5];
-    void (*bb)(uint64_t, int, const uint16_t *, Rc *, long) = dlsym(RTLD_DEFAULT, "CTFontGetBoundingRectsForGlyphs");
+    Rc (*bb)(uint64_t, int, const uint16_t *, Rc *, long) = dlsym(RTLD_DEFAULT, "CTFontGetBoundingRectsForGlyphs");   // (it returns the union rectangle: a CGRect is returned in memory, through a hidden first argument: declared as void it wrote that rectangle over the font object)
     if (off || !bb || !rects || !glyphs) { host_call(c, HOSTFN("JRSFontGetBoundingBoxesForGlyphsAndStyle"), false); return; }
-    bb(font, 0, glyphs, rects, (long)n);
+    (void)bb(font, 0, glyphs, rects, (long)n);
     if (m) for (size_t i = 0; i < n; i++) {   // (the four corners of the box, moved by the matrix: their bounds)
         double xs[4] = {rects[i].x, rects[i].x + rects[i].w, rects[i].x, rects[i].x + rects[i].w}, ys[4] = {rects[i].y, rects[i].y, rects[i].y + rects[i].h, rects[i].y + rects[i].h};
         double lo_x = 1e300, hi_x = -1e300, lo_y = 1e300, hi_y = -1e300;
