@@ -3031,6 +3031,25 @@ static void patch_swift_extra_inhabitants(void) {
     }
     if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[swift extra inhabitants: %d reader(s), %d writer(s) patched to the arm64 numbering]\n", nr, nw);
 }
+// A Swift function that returns Bool (or a Bool getter): the host's x86_64 code leaves the rest of rax undefined, and arm64 callers test the whole w0 (`bl swift_isUniquelyReferenced_nonNull; mov x8, x0; cbz w8, ...`).
+// With garbage above bit 0 a shared array buffer looked uniquely referenced and was mutated in place (Xcode: Array.replaceSubrange moved the tail of a shared buffer with a negative length when a
+// source file was opened). The runtime's own functions are listed; a mangled name is demangled once and its result type looked at. REBAR_NO_SWIFT_BOOL=1 turns it off.
+static bool swift_returns_bool(const char *name) {
+    static int off = -1; if (off < 0) off = getenv("REBAR_NO_SWIFT_BOOL") != NULL;
+    if (off) return false;
+    static const char *const rt[] = {"_swift_isUniquelyReferenced_nonNull", "_swift_isUniquelyReferenced_nonNull_native", "_swift_isUniquelyReferencedNonObjC", "_swift_isUniquelyReferencedNonObjC_nonNull",
+        "_swift_isUniquelyReferencedNonObjC_nonNull_bridgeObject", "_swift_isEscapingClosureAtFileLocation", "_swift_dynamicCast", "_swift_dynamicCastMetatype", "_swift_isClassType", "_swift_isOptionalType",
+        "_swift_isDeallocating", "_swift_unknownObjectUnownedIsDeallocating", "_swift_bridgeObjectUnownedIsDeallocating", "_swift_unownedRetainStrong", "_swift_stdlib_isStackAllocationSafe", "_swift_isOptionalType", "_swift_conformsToProtocolCommon", NULL};
+    for (const char *const *q = rt; *q; q++) if (!strcmp(*q, name)) return !!strcmp(name, "_swift_unownedRetainStrong") && !!strcmp(name, "_swift_conformsToProtocolCommon");
+    if (name[0] != '_' || name[1] != '$' || (name[2] != 's' && name[2] != 'S') || !strstr(name, "Sb")) return false;
+    static char *(*demangle)(const char *, size_t, char *, size_t *, uint32_t);
+    if (!demangle) demangle = (char *(*)(const char *, size_t, char *, size_t *, uint32_t))dlsym(RTLD_DEFAULT, "swift_demangle");
+    if (!demangle) return false;
+    const char *m = name + 1; char *d = demangle(m, strlen(m), NULL, NULL, 0);
+    if (!d) return false;
+    size_t n = strlen(d); bool r = (n > 13 && !strcmp(d + n - 13, "-> Swift.Bool")) || (n > 20 && strstr(d, ".getter : Swift.Bool") && !strchr(strstr(d, ".getter : Swift.Bool") + 20, ' '));
+    free(d); return r;
+}
 static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     if (name && (!strncmp(name, "_swift_", 7) || !strncmp(name, "_$s", 3))) patch_swift_extra_inhabitants();
     { int k = stub_find(name); if (k >= 2) return stub_addr(k); }
@@ -3080,6 +3099,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
             if (cmp < 0) hi = mid - 1; else lo = mid + 1;
         }
     }
+    if (host && !h && !g_stubs[idx].narrow && swift_returns_bool(name)) g_stubs[idx].narrow = 'B';
     if (host && !h && stl_layout_dependent(name))
         fprintf(stderr, "rebar: warning: %s takes libc++ objects whose arm64 layout rebar does not convert; expect it to misbehave\n", name);
     if (host && !h) g_stubs[idx].thisret = returns_this(name);
