@@ -1303,6 +1303,18 @@ static void ios_unity_prestart(CPU *c, id self, SEL sel) {
     if (getenv("REBAR_TRACE_UNITY")) fprintf(stderr, "[unity] first read of the display surface finds none: initRendering -> %llx stored at +%llx\n", (unsigned long long)surf, (unsigned long long)off_iv);
     busy = 0;
 }
+// Google Mobile Ads (GADMarketplaceKitSignals) asks MarketplaceKit for the app's distributor behind `#available(iOS 17.4, *)`; MarketplaceKit on the Mac has no AppDistributor, the Swift runtime
+// finds the type descriptor missing ("Failed to look up symbolic reference ... missing weak symbol") and aborts the process. The method is answered with "no distributor" (completion(nil)).
+// REBAR_NO_IOS_PATCHES=1 turns the patches off.
+static void ios_gad_app_distributor(id self, SEL _cmd, void *block) {
+    (void)self; (void)_cmd; if (!block) return;
+    void (*inv)(void *, id) = *(void (**)(void *, id))((char *)block + 16); inv(block, NULL);
+}
+static void ios_class_patches(void) {
+    if (getenv("REBAR_NO_IOS_PATCHES")) return;
+    Class k = objc_getClass("GADMarketplaceKitSignals"); SEL sel = sel_registerName("appDistributorWithCompletionHandler:");
+    if (k && class_getClassMethod(k, sel)) { class_replaceMethod(object_getClass((id)k), sel, (IMP)ios_gad_app_distributor, "v@:@?"); if (getenv("REBAR_TRACE_UNITY")) fprintf(stderr, "[ios] GADMarketplaceKitSignals appDistributor patched\n"); }
+}
 H(h_UIApplicationMain) {
     if (getenv("REBAR_PRINT_IMPS")) {   // debugging: REBAR_PRINT_IMPS=Class:selector,Class:selector prints where the guest implementations are (to put into REBAR_WATCH)
         char buf[1024]; snprintf(buf, sizeof buf, "%s", getenv("REBAR_PRINT_IMPS"));
@@ -1313,6 +1325,7 @@ H(h_UIApplicationMain) {
         }
     }
     for (int k = 0; k < g_nswift_deferred; k++) swift_class_ensure_ready(c, g_swift_deferred[k]);
+    if (getenv("REBAR_IOS_UI")) ios_class_patches();
     host_call(c, HOSTFN("UIApplicationMain"), false);
 }
 static void register_class(GClass *c) {

@@ -380,10 +380,18 @@ static const GStack *gstack_of(pthread_t th) {
     return r;
 }
 
+// The guest CPU of every thread that runs guest code, by the thread's mach port: Boehm's collector (il2cpp / Unity, Mono) suspends the other threads with thread_suspend and reads their registers with
+// thread_get_state(ARM_THREAD_STATE64) to scan their stacks (see h_thread_get_state).
+static struct { uint32_t port; CPU *cpu; } g_thr_cpu[1024]; static int g_nthr_cpu;
+static void thr_register(CPU *c) {
+    int k = __atomic_fetch_add(&g_nthr_cpu, 1, __ATOMIC_RELAXED);
+    if (k < 1024) { g_thr_cpu[k].cpu = c; __atomic_store_n(&g_thr_cpu[k].port, (uint32_t)mach_thread_self(), __ATOMIC_RELEASE); }
+}
 static CPU *cur_cpu(void) {
     if (!t_cpu) {
         t_cpu = calloc(1, sizeof(CPU));
         t_cpu->tpidrro = (uint64_t)t_tlv_tab;
+        thr_register(t_cpu);
         prof_register(t_cpu);
         size_t sz = 4u << 20;
         void *st = alloc_guarded(sz);
@@ -1686,7 +1694,21 @@ static CPU *mach_faulting_cpu(uint32_t port, uint64_t *far) {
 }
 enum { MFL_ARM_THREAD_STATE64 = 6, MFL_ARM_EXCEPTION_STATE64 = 7, MFL_ARM_NEON_STATE64 = 17 };
 H(h_thread_get_state) {   // (thread, flavor, state*, count*)
-    uint64_t far = 0; CPU *t = mach_faulting_cpu((uint32_t)c->x[0], &far);
+    uint64_t far = 0; uint32_t port = (uint32_t)c->x[0]; CPU *t = mach_faulting_cpu(port, &far);
+    if (!t && (c->x[1] == MFL_ARM_THREAD_STATE64 || c->x[1] == MFL_ARM_NEON_STATE64) && !getenv("REBAR_NO_THREAD_STATE")) {
+        // Another guest thread that the guest has suspended: its registers are in its CPU structure, but translated code keeps some of them (and the stack pointer) in host registers until the
+        // block ends, so a thread that was stopped inside translated code is let go on for a moment and stopped again until it is in the interpreter or in a call to the host.
+        for (int k = 0; k < g_nthr_cpu && k < 1024 && !t; k++) if (__atomic_load_n(&g_thr_cpu[k].port, __ATOMIC_ACQUIRE) == port) t = g_thr_cpu[k].cpu;
+        if (t) {
+            for (int tries = 0; tries < 20000; tries++) {
+                _STRUCT_X86_THREAD_STATE64 hs; mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
+                if (thread_get_state((thread_act_t)port, x86_THREAD_STATE64, (thread_state_t)&hs, &n) != KERN_SUCCESS) break;
+                if (!g_jit_on || !jit_block_of(hs.__rip)) break;
+                thread_resume((thread_act_t)port); usleep(20);
+                pthread_mutex_lock(&g_jit_mu); thread_suspend((thread_act_t)port); pthread_mutex_unlock(&g_jit_mu);
+            }
+        }
+    }
     if (!t) { host_call(c, HOSTFN("thread_get_state"), false); return; }
     int fl = (int)c->x[1]; uint64_t *st = (uint64_t *)c->x[2]; uint32_t *cnt = (uint32_t *)c->x[3];
     if (fl == MFL_ARM_THREAD_STATE64) {
@@ -2960,6 +2982,7 @@ static bool host_lib_ok(const char *path) {
     if (g_nhostlibs >= 512) return false;
     g_hostlibs[g_nhostlibs].path = strdup(path);
     bool ok = dlopen(path, RTLD_NOW | RTLD_GLOBAL) != NULL;
+    if (!ok && !strncmp(path, "/System/Library/", 16)) { char sp[400]; snprintf(sp, sizeof sp, "/System/iOSSupport%s", path); ok = dlopen(sp, RTLD_NOW | RTLD_GLOBAL) != NULL; }   // (an iOS framework that lives under /System/iOSSupport on the Mac: MarketplaceKit, ...)
     if (!ok && !strncmp(path, "@rpath/libswift", 15)) { char sp[300]; snprintf(sp, sizeof sp, "/usr/lib/swift/%s", path + 7); ok = dlopen(sp, RTLD_NOW | RTLD_GLOBAL) != NULL; }   // (an iOS app's back-deployed Swift runtime: the host's own)
     return g_hostlibs[g_nhostlibs++].ok = ok;
 }
@@ -3107,7 +3130,7 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
             if (!host) host = dlsym(RTLD_DEFAULT, sym);
         }
     }
-    if (!h && !host && weak) return 0;
+    if (!h && !host && weak) { if (getenv("REBAR_TRACE_WEAK")) fprintf(stderr, "[weak] %s (%s) not found: null\n", name, lib ? lib : "?"); return 0; }
     int idx = stub_new(name, lib, host, h);
     if (host && !h) {  // returns bool/char/short? (generated table): the result needs extending for the arm64 caller
         int lo = 0, hi = (int)(sizeof k_narrow / sizeof k_narrow[0]) - 2;

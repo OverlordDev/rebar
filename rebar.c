@@ -1831,6 +1831,7 @@ static void ios_avsession_shim(void) {
     Method m = class_getClassMethod(av, sel_registerName("sharedInstance"));
     if (m && g_avsess) method_setImplementation(m, (IMP)ios_avsess_shared);
 }
+static void abort_frames(int sig, siginfo_t *si, void *ctx) { (void)si; (void)ctx; fprintf(stderr, "rebar: abort (signal %d) in the host; guest frames:\n", sig); if (t_cpu) dump_backtrace(t_cpu); raise(sig); }
 static void ios_prepare(void) {
     ios_avsession_shim();
     dlopen("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", RTLD_NOW | RTLD_GLOBAL);
@@ -2029,6 +2030,7 @@ int main(int argc, char **argv) {
     own_add((uint64_t)stack, stack_size);
     gstack_register((uint64_t)stack, stack_size);
     cpu.sp = ((uint64_t)stack + stack_size - 256) & ~0xfull;
+    thr_register(&cpu);
     if (getenv("REBAR_IMAGES")) fprintf(stderr, "rebar: guest stack %p - %p\n", (void *)stack, (void *)(stack + stack_size));
 
     struct sigaction sa = {0};
@@ -2041,6 +2043,9 @@ int main(int argc, char **argv) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
+    if (getenv("REBAR_ABORT_FRAMES")) {   // debugging: the guest frames of an abort() that the host's code makes (a Swift runtime fatal error)
+        struct sigaction ab; memset(&ab, 0, sizeof ab); ab.sa_flags = SA_SIGINFO | SA_RESETHAND; ab.sa_sigaction = abort_frames; sigaction(SIGABRT, &ab, NULL);
+    }
     sigaction(SIGFPE, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
     if (getenv("REBAR_ABORT_REPORT")) sigaction(SIGABRT, &sa, NULL);   // an abort() of the guest (or of a host library it called): report the last imports like a fault
