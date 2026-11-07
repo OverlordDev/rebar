@@ -33,15 +33,24 @@ static void vc_set(JC *j, int n, int xr) {   // V[n] has just been stored from x
     sse_r(j, 0, 0x28, 8 + s, xr);   // movaps xmm(8+s), xr
     j->vc_keep |= 1u << n;
 }
+static void first_ld_note(JC *j, int xr, int n, int dbl) {
+    if (j->first_ld_n >= 4) return;
+    uint32_t insn = *(const uint32_t *)j->pc;
+    j->first_lds[j->first_ld_n++] = (typeof(j->first_lds[0])){n, xr, dbl, (uint32_t)(j->p - j->start),
+        (insn & 0xff000000) == 0x1f000000, j->open_fwd != 0};   // FMADD family: the rest of the instruction uses xmm0, not the address scratch
+}
 static void ld_s(JC *j, int xr, int n, int dbl) {   // movss / movsd xmm, [V[n]]: the upper bits of xmm are cleared
+    bool note = g_loopwarm && j->pc == j->blockpc && j->first_ld_n < 4 && j->start;
     int s = vc_find(j, n);
     if (s >= 0) {
         j->vc_age[s] = ++j->vc_tick;
         if (dbl) sse_r(j, 0xF3, 0x7E, xr, 8 + s);                                   // movq xr, xmm: the upper 64 bits cleared
         else { sse_r(j, 0, 0x57, xr, xr); sse_r(j, 0xF3, 0x10, xr, 8 + s); }       // xorps xr, xr ; movss xr, xmm: only the low lane
+        if (note) first_ld_note(j, xr, n, dbl);
         return;
     }
     sse_m(j, dbl ? 0xF2 : 0xF3, 0x10, xr, R15, GVR(n));
+    if (note) first_ld_note(j, xr, n, dbl);
 }
 // the operand of a scalar operation: op xr, V[n] (the low lane) from the cache when it is there
 static void sse_vm(JC *j, int prefix, int opc, int xr, int n) {
@@ -61,11 +70,11 @@ static void movq_xg(JC *j, int xr, int gr);
 static void st_v64z(JC *j, int rd, int src) { movq_xg(j, 15, src); sse_m(j, 0, 0x11, 15, R15, GVR(rd)); }   // V[rd] = src (64 bits), upper half cleared: one 16-byte store (xmm15 is the scratch)   // V[rd] = src (64 bits), upper half cleared
 static void movq_xg(JC *j, int xr, int gr) { e1(j, 0x66); rex(j, 1, xr, gr, 0); e1(j, 0x0F); e1(j, 0x6E); modrm_rr(j, xr, gr); }   // movq xmm, r64
 static void v_const(JC *j, int xr, uint64_t v) { mov_ri_nf(j, RCX, v); movq_xg(j, xr, RCX); }                                   // the low 64 bits of xmm xr = v, the rest cleared (rcx is scratch)
-static void setcc_r(JC *j, int cc, int reg) { e1(j, 0x0F); e1(j, 0x90 + cc); modrm_rr(j, 0, reg); }                      // al, cl, dl only (no REX)
 static void btc_m(JC *j, int base, int32_t disp, int bit, int w) { rex(j, w, 0, base, 0); e1(j, 0x0F); e1(j, 0xBA); modrm_mem(j, 7, base, disp); e1(j, (uint8_t)bit); }
 
 // ---- SIMD&FP LDP / STP (S, D and Q registers)
 static bool g_nofp;   // REBAR_JIT_NOFP=1: no scalar-FP / vector-pair templates (to bisect)
+static bool g_no_fpflags;   // REBAR_JIT_NOFPFLAGS=1: store the FCMP flags immediately (the old path, to bisect)
 static JI emit_ldst_pair_vec(JC *j, uint32_t i) {
     if (g_nofp) return JI_NO;
     int opc = B(i, 31, 30), L = B(i, 22, 22), idx = B(i, 24, 23), rt = B(i, 4, 0), rt2 = B(i, 14, 10), rn = B(i, 9, 5);
@@ -113,10 +122,12 @@ static JI emit_ld1_multi(JC *j, uint32_t i) {
 // An invalid operation (and any NaN operand) gives the positive default NaN, as the interpreter's f2raw does; x86 gives a negative one or passes the operand's payload on.
 static void canon_nan(JC *j, int dbl) {   // xmm0 holds a scalar result
     sse_r(j, dbl ? 0x66 : 0, 0x2E, 0, 0);                                    // ucomis[sd] xmm0, xmm0: unordered (PF) only for a NaN
-    Fix ok = jcc_fwd(j, CC_NP);
+    // A plain jump over the two instructions of the NaN way: they touch nothing but rax and xmm0, so both ways reach the join with the same register cache and the cache is neither
+    // flushed nor cleared (jcc_fwd / fix_here did both: every scalar FP operation threw the integer registers out of their host registers and stopped the vector cache from filling)
+    e1(j, 0x0F); e1(j, 0x80 + CC_NP); uint8_t *at = j->p; e4(j, 0);
     mov_ri_nf(j, RAX, dbl ? 0x7ff8000000000000ull : 0x7fc00000ull);
     e1(j, 0x66); rex(j, 1, 0, RAX, 0); e1(j, 0x0F); e1(j, 0x6E); modrm_rr(j, 0, RAX);   // movq xmm0, rax
-    fix_here(j, ok);
+    int32_t dj = (int32_t)(j->p - (at + 4)); memcpy(at, &dj, 4);
 }
 
 // FMAX / FMIN / FMAXNM / FMINNM (scalar): without a NaN the four agree with x86's max / min, made symmetric for the zeros (+0 beats -0 for max, -0 beats +0 for min) by
@@ -209,23 +220,23 @@ static JI emit_fp1(JC *j, uint32_t i) {   // one source: FMOV FABS FNEG FSQRT FC
     return JI_NO;
 }
 
-static void jfcmp_flags(JC *j, int type, int rn, int rm, bool zero) {   // N Z C V (in memory) from the comparison of Vn with Vm or with 0.0
+static void jfcmp_emit(JC *j, int type, int rn, int rm, bool zero) {   // ucomis[sd]: the x86 flags now mean the ARM N Z C V of a FP compare
     ld_s(j, 0, rn, type);
     if (zero) { sse_r(j, 0, 0x57, 1, 1); sse_r(j, type ? 0x66 : 0, 0x2E, 0, 1); }          // xorps xmm1, xmm1; ucomis[sd] xmm0, xmm1
     else sse_vm(j, type ? 0x66 : 0, 0x2E, 0, rm);                                              // ucomis[sd] xmm0, [m]
-    // x86: unordered ZF=PF=CF=1, less CF=1, equal ZF=1, greater none.  ARM: less N, equal ZC, greater C, unordered CV.
-    setcc_m(j, CC_P, R15, GV);                      // V = unordered
-    setcc_r(j, CC_NP, RCX); setcc_r(j, CC_B, RAX); setcc_r(j, CC_E, RDX);
-    alu_rr(j, 0x20, RAX, RCX, 0); alu_rr(j, 0x20, RDX, RCX, 0);   // N = less and ordered; Z = equal and ordered (and r/m8, r8)
-    st_sized(j, R15, GN, RAX, 1); st_sized(j, R15, GZ, RDX, 1);
-    e1(j, 0x34); e1(j, 1);                          // xor al, 1
-    st_sized(j, R15, GC, RAX, 1);                   // C = not N
+    j->flagkind = 4; j->kind_set = true;
+}
+static void jfcmp_flags(JC *j, int type, int rn, int rm, bool zero) {   // N Z C V (in memory): FCCMP's two paths set different flags, so store them at once
+    jfcmp_emit(j, type, rn, rm, zero);
+    flags_from_x86(j, 4);
+    j->flagkind = 0;   // (the x86 flags are not the ARM ones on FCCMP's other path)
 }
 static JI emit_fcmp(JC *j, uint32_t i) {   // FCMP / FCMPE with a register or with #0.0
     int type = B(i, 23, 22), rm = B(i, 20, 16), rn = B(i, 9, 5), opc = B(i, 4, 3);
     if (type > 1) return JI_NO;
-    jfcmp_flags(j, type, rn, rm, opc & 1);
-    j->flagkind = 0; j->kind_set = true;
+    if (g_no_fpflags) { jfcmp_flags(j, type, rn, rm, opc & 1); return JI_OK; }
+    jfcmp_emit(j, type, rn, rm, opc & 1);
+    flags_out(j, 4);   // store, defer or leave in the x86 flags (FCSEL / B.cond can read them directly)
     return JI_OK;
 }
 static JI emit_fccmp(JC *j, uint32_t i) {   // FCCMP / FCCMPE: the comparison when the condition holds, else the immediate flags

@@ -415,6 +415,26 @@ static uint64_t call_guest(CPU *c, uint64_t fn, uint64_t a0, uint64_t a1, uint64
     return r;
 }
 
+// call_guest for a short, non-blocking callback that the host calls many times from inside one handler (the comparison function of qsort / bsearch): the interpreter lock stays held (the callback
+// is not going to wait for anything another guest thread holds) and only the state a callee can change and the caller still needs is saved: x19..x30 and sp are the callee's to restore (saved anyway, a handler must not trust them), but the pc, the
+// counters and the translated code's return-address stack bounds are not; x0..x18 and the vector registers other than d8..d15 are caller-saved (the call is a call), the flags are not preserved
+// by one either. Copying the whole structure twice (850 bytes) was 40% of a comparison's cost. REBAR_SLOW_CALLBACK=1 gives the full copy back.
+static uint64_t call_guest_short(CPU *c, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    static int slow = -1; if (slow < 0) slow = getenv("REBAR_SLOW_CALLBACK") != NULL;
+    if (slow) return call_guest(c, fn, a0, a1, a2, a3);
+    uint64_t sx[12], ssp = c->sp, spc = c->pc, stick = c->tick, scl = c->code_lo, scn = c->code_len, shsp = c->jit_hsp, shlim = c->jit_hlim; uint32_t sepoch = c->code_epoch; int32_t sbud = c->jit_budget;
+    bool sn = c->n, sz = c->z, sc = c->c, sv = c->v; uint64_t sd[8]; for (int k = 0; k < 8; k++) sd[k] = c->vr[8 + k].d[0];
+    for (int k = 0; k < 12; k++) sx[k] = c->x[19 + k];
+    c->x[0] = a0; c->x[1] = a1; c->x[2] = a2; c->x[3] = a3;
+    c->x[30] = stub_addr(STUB_RET);
+    c->pc = fn;
+    run_until(c, stub_addr(STUB_RET));
+    uint64_t r = c->x[0];
+    for (int k = 0; k < 12; k++) c->x[19 + k] = sx[k]; c->sp = ssp; c->pc = spc; c->tick = stick; c->code_lo = scl; c->code_len = scn; c->code_epoch = sepoch; c->jit_hsp = shsp; c->jit_hlim = shlim; c->jit_budget = sbud;
+    c->n = sn; c->z = sz; c->c = sc; c->v = sv; for (int k = 0; k < 8; k++) c->vr[8 + k].d[0] = sd[k];
+    return r;
+}
+
 typedef struct { uint64_t sret; bool mem; int hfa; uint64_t tmp[64]; } EntryState;
 static const char *imp_encoding(uint64_t imp);
 static void hot_entry(uint64_t imp);
@@ -1318,7 +1338,7 @@ H(h_cxa_atexit) { if (g_natexit < 256) { g_atexit[g_natexit].fn = c->x[0]; g_ate
 typedef struct { CPU *c; uint64_t fn, thunk; bool has_thunk; } CbCtx;
 static int qsort_cb(void *t, const void *a, const void *b) {
     CbCtx *x = t;
-    return (int)call_guest(x->c, x->fn, x->has_thunk ? x->thunk : (uint64_t)a, x->has_thunk ? (uint64_t)a : (uint64_t)b,
+    return (int)call_guest_short(x->c, x->fn, x->has_thunk ? x->thunk : (uint64_t)a, x->has_thunk ? (uint64_t)a : (uint64_t)b,
                            x->has_thunk ? (uint64_t)b : 0, 0);
 }
 H(h_qsort)   { CbCtx x = {c, c->x[3], 0, false}; qsort_r(P(0), c->x[1], c->x[2], &x, qsort_cb); }
@@ -1328,7 +1348,7 @@ H(h_bsearch) {
     uint64_t lo = 0, hi = n;
     while (lo < hi) {
         uint64_t mid = lo + (hi - lo) / 2, el = base + mid * w;
-        int r = (int)call_guest(c, fn, key, el, 0, 0);
+        int r = (int)call_guest_short(c, fn, key, el, 0, 0);
         if (r == 0) { c->x[0] = el; return; }
         if (r < 0) hi = mid; else lo = mid + 1;
     }

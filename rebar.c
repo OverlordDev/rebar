@@ -1210,6 +1210,7 @@ static int jit_selftest(long count, uint64_t seed, const char *only, bool tails)
     { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = selftest_segv; sa.sa_flags = SA_NODEFER; sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL); if (getenv("REBAR_SELFTEST_TRACE")) signal(SIGABRT, selftest_abrt); }   // a sequence that clobbers its own base register just faults, in both runs (a wild address through rbp is a stack fault, which arrives as SIGILL)
     setenv("REBAR_JIT", "1", 1);
     jit_init();
+    g_fl_retdead = false;   // (the selftest compares the flags at the end of a random sequence: a return after a frame restore does not count as the end of their life there)
     if (!g_jit_on) { fprintf(stderr, "jit-selftest: the JIT did not start\n"); return 2; }
     g_rng = seed ? seed : 0x243f6a8885a308d3ull;
     const size_t MSZ = 1u << 20, WIN = MSZ, WBASE = 0, MID = 0x80000;   // all of the guest memory is restored and compared after each run
@@ -1218,7 +1219,11 @@ static int jit_selftest(long count, uint64_t seed, const char *only, bool tails)
     uint8_t *orig = malloc(WIN), *ma = malloc(WIN), *mb = malloc(WIN);
     CPU *a = calloc(1, sizeof(CPU)), *b = calloc(1, sizeof(CPU)), *init = calloc(1, sizeof(CPU));
     t_cpu = a;
-    static uint8_t lowsave[0x2000]; memcpy(lowsave, (void *)0x1000, sizeof lowsave);   // (the host maps a page or two at 0x1000: a pointer near zero lands in it, so it is restored like the rest)
+    // (a wild pointer near zero lands in the low page, so it is saved and restored like the rest; on the macOS 26 host the page at 0x1000 is rebar's own __TEXT, mapped RX: only a writable one is touched)
+    static uint8_t lowsave[0x2000]; bool lowrw;
+    { mach_vm_address_t la = 0x1000; mach_vm_size_t lsz = 0; vm_region_basic_info_data_64_t li; mach_msg_type_number_t lc = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t lo = 0;
+      lowrw = mach_vm_region(mach_task_self(), &la, &lsz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&li, &lc, &lo) == KERN_SUCCESS && la == 0x1000 && (li.protection & VM_PROT_WRITE); }
+    if (lowrw) memcpy(lowsave, (void *)0x1000, sizeof lowsave);
     typedef struct { const char *name; uint32_t base, mask; int kind; } T;
     static const T tmpl[] = {
         {"addsub-imm", 0x11000000, 0xE07FFFFF, 0}, {"logic-imm", 0x12000000, 0xE07FFFFF, 0}, {"movw", 0x12800000, 0xE07FFFFF, 0},
@@ -1354,7 +1359,7 @@ static int jit_selftest(long count, uint64_t seed, const char *only, bool tails)
         if (it == 0) for (size_t o = 0; o < WIN; o += 8) *(uint64_t *)(orig + o) = rnd64();
         // interpreter
         *a = *init; a->pc = cpc; a->code_lo = (uint64_t)cbuf; a->code_len = 1 << 20;
-        memcpy(mem + WBASE, orig, WIN); memcpy((void *)0x1000, lowsave, sizeof lowsave);
+        memcpy(mem + WBASE, orig, WIN); if (lowrw) memcpy((void *)0x1000, lowsave, sizeof lowsave);
         jmp_buf jb; volatile int died_a = 0, died_b = 0;
         g_die_jmp = &jb; g_jit_on = false;
         if (setjmp(jb) == 0) run_until(a, stop); else died_a = 1;
@@ -1363,7 +1368,7 @@ static int jit_selftest(long count, uint64_t seed, const char *only, bool tails)
         // translated
         g_jit_on = true;
         *b = *init; b->pc = cpc; b->code_lo = (uint64_t)cbuf; b->code_len = 1 << 20;
-        memcpy(mem + WBASE, orig, WIN); memcpy((void *)0x1000, lowsave, sizeof lowsave);
+        memcpy(mem + WBASE, orig, WIN); if (lowrw) memcpy((void *)0x1000, lowsave, sizeof lowsave);
         jit_invalidate(cpc, cpc + 256);
         t_cpu = b;
         if (setjmp(jb) == 0) {

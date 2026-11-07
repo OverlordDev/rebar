@@ -2,6 +2,7 @@
 # Runs every sample under rebar and compares with the native x86_64 build of the same source.
 # Usage: ./run_tests.sh          (build the emulator first with ./build.sh)
 cd "$(dirname "$0")/samples" || exit 1
+unset CFProcessPath __CFBundleIdentifier   # (a launcher/IDE environment can make NSBundle point at its own bundle: the native oracle then sees the wrong name/bundle)
 R=../rebar
 pass=0; fail=0
 
@@ -44,6 +45,12 @@ run_to 60 $T/b $R t25_arm_O0;                                        check t25_s
 run_to 30 $T/b $R t28_wide_arm ./t28_wide_lib.dylib;                if [ "$(cat $T/b)" = "dlopen succeeded
 wide_len: 13 2" ]; then echo "PASS t28_wide_string_dlopen"; pass=$((pass + 1)); else echo "FAIL t28_wide_string_dlopen"; cat $T/b; fail=$((fail + 1)); fi
 run_to 30 $T/a ./t29_x86; run_to 60 $T/b $R t29_arm;                 check t29_fp16 $T/a $T/b
+# FP comparison flags: every ARM condition, ordered and unordered, through CSEL / FCSEL / B.cond (the JIT's flag kind 4)
+rm -f t95_arm
+clang -arch arm64 -O1 t95_fp_flags.c -o t95_arm || { echo "FAIL t95_fp_flags_build"; fail=$((fail + 1)); }
+printf 'all ok\n' > $T/a; run_to 30 $T/b $R t95_arm;                              grep -v '^nvrm' $T/b > $T/b2; check t95_fp_flags $T/a $T/b2
+printf 'all ok\n' > $T/a; run_to 30 $T/b env REBAR_JIT=0 $R t95_arm;               grep -v '^nvrm' $T/b > $T/b2; check t95_fp_flags_interp $T/a $T/b2
+printf 'all ok\n' > $T/a; run_to 30 $T/b env REBAR_JIT_NOFPFLAGS=1 $R t95_arm;    grep -v '^nvrm' $T/b > $T/b2; check t95_fp_flags_oldpath $T/a $T/b2
 run_to 60 $T/b $R t30_arm;                                           if [ "$(tail -1 $T/b)" = "all ok" ]; then echo "PASS t30_sha512_addhn"; pass=$((pass + 1)); else echo "FAIL t30_sha512_addhn"; cat $T/b; fail=$((fail + 1)); fi
 run_to 60 $T/b $R t33_arm;                                           if [ "$(tail -1 $T/b)" = "blend ok" ]; then echo "PASS t33_neon_blend"; pass=$((pass + 1)); else echo "FAIL t33_neon_blend"; cat $T/b; fail=$((fail + 1)); fi
 run_to 60 $T/b2 env REBAR_NO_SIMD_FAST=1 $R t33_arm;                if cmp -s $T/b $T/b2; then echo "PASS t33_neon_blend_general_path"; pass=$((pass + 1)); else echo "FAIL t33_neon_blend_general_path"; diff $T/b $T/b2 | head -3; fail=$((fail + 1)); fi

@@ -65,6 +65,10 @@ static uint32_t g_jit_offs[64];   // REBAR_JITDUMP: where in the block's host co
 static uint64_t *g_jit_cnt; static uint64_t g_jit_fbdyn[1 << 12];
 static bool jit_leaf_import(uint64_t target, void **fn, int *nargs, int *zext8);   // bridge.h: an import that translated code may call directly
 static bool g_jit_noleaf;       // REBAR_JIT_NOLEAF=1: every import goes through the dispatcher
+static bool g_loopwarm;         // REBAR_JIT_LOOPWARM=1: a self-loop back edge skips the block's first vector load (see jit_compile)
+static bool g_budgetopen;       // REBAR_JIT_BUDGETOPEN=1: the budget branch counts as an open forward branch (the old vector-cache behaviour, to bisect)
+static bool g_trace;            // REBAR_JIT_TRACE=1: unroll a self-loop body inside one block, keeping the cache across the back edge
+static int g_trace_unroll = 4;  // REBAR_JIT_TRACE_UNROLL=<n>: how many body copies (2..8)
 static int g_jittime;
 static uint64_t g_ji_ns, g_ji_maxns;
 static uint64_t g_ji_calls, g_ji_killed, g_ji_pages;   // REBAR_JITCOUNT: jit_invalidate calls, blocks they dropped
@@ -104,7 +108,7 @@ typedef struct {
     uint8_t rc_dirty;         // bit per slot: the host register is newer than the CPU structure
     uint8_t rc_pin;           // slots whose host registers the instruction being translated is using: they are not evicted
     int insn_left;            // how many more instructions the block being translated can take after the current one
-    struct { uint8_t *at; uint64_t target; uint8_t dirty; uint8_t reg_of[8]; uint8_t fkind; } sx[16];   // conditional branches taken out of the middle of the block (see side_exit)
+    struct { uint8_t *at; uint64_t target; uint8_t *direct; uint8_t dirty; uint8_t reg_of[8]; uint8_t vc_reg_of[6]; uint8_t fkind; } sx[16];   // conditional branches taken out of the middle of the block (see side_exit); direct: a jump inside this block (trace unroll)
     int nsx;
     uint32_t rc_age[8], rc_tick;
     uint8_t *bm_rel, *bm_cell, *bm_cont;   // a BLR through the return-address stack: where its cell check jumps on a miss (to a stub after the block), the cell, and the code after the call
@@ -118,7 +122,43 @@ typedef struct {
     uint8_t vc_reg_of[6]; uint32_t vc_age[6], vc_tick;
     uint32_t vc_touch, vc_keep;   // guest vector registers whose memory the instruction being translated touched / that it left cached
     int open_fwd;                 // forward branches of the instruction being translated whose target has not been placed yet
+    // the self-loop warm entry (REBAR_JIT_LOOPWARM): the vector loads of the block's first instruction,
+    // recorded so that a back edge to the block's own pc can take a cached one instead of loading it
+    uint8_t *start;               // first byte of the block's generated code
+    struct { int reg, xr, dbl; uint32_t off; bool safe, fwd; } first_lds[4];
+    int first_ld_n;
+    uint8_t *loop_stub;           // the warm entry, once emitted
 } JC;
+
+// The translator state that must be saved at a traced loop's back edge and restored for the next
+// body copy: the register/vector cache mappings, the flag state and the MOVZ/MOVK fusion.  The
+// code pointer, the site records and the side-exit list are deliberately not part of it.
+typedef struct {
+    uint8_t rc_slot_of[32], rc_reg_of[8], rc_dirty, rc_pin;
+    uint32_t rc_age[8], rc_tick;
+    uint8_t vc_reg_of[6]; uint32_t vc_age[6], vc_tick, vc_touch, vc_keep;
+    int flagkind; bool kind_set; uint64_t fl_pend_pc; int fl_pend_kind; bool fl_pend_taken, fl_pend_fall;
+    int open_fwd; uint8_t fresh;
+    uint8_t *mw_start, *mw_end; uint64_t mw_val, mw_pc; int mw_rd, mw_sf;
+} JState;
+static void jstate_save(JC *j, JState *s) {
+    memcpy(s->rc_slot_of, j->rc_slot_of, sizeof s->rc_slot_of); memcpy(s->rc_reg_of, j->rc_reg_of, sizeof s->rc_reg_of);
+    s->rc_dirty = j->rc_dirty; s->rc_pin = j->rc_pin; memcpy(s->rc_age, j->rc_age, sizeof s->rc_age); s->rc_tick = j->rc_tick;
+    memcpy(s->vc_reg_of, j->vc_reg_of, sizeof s->vc_reg_of); memcpy(s->vc_age, j->vc_age, sizeof s->vc_age);
+    s->vc_tick = j->vc_tick; s->vc_touch = j->vc_touch; s->vc_keep = j->vc_keep;
+    s->flagkind = j->flagkind; s->kind_set = j->kind_set; s->fl_pend_pc = j->fl_pend_pc; s->fl_pend_kind = j->fl_pend_kind;
+    s->fl_pend_taken = j->fl_pend_taken; s->fl_pend_fall = j->fl_pend_fall; s->open_fwd = j->open_fwd; s->fresh = j->fresh;
+    s->mw_start = j->mw_start; s->mw_end = j->mw_end; s->mw_val = j->mw_val; s->mw_pc = j->mw_pc; s->mw_rd = j->mw_rd; s->mw_sf = j->mw_sf;
+}
+static void jstate_load(JC *j, const JState *s) {
+    memcpy(j->rc_slot_of, s->rc_slot_of, sizeof s->rc_slot_of); memcpy(j->rc_reg_of, s->rc_reg_of, sizeof s->rc_reg_of);
+    j->rc_dirty = s->rc_dirty; j->rc_pin = s->rc_pin; memcpy(j->rc_age, s->rc_age, sizeof s->rc_age); j->rc_tick = s->rc_tick;
+    memcpy(j->vc_reg_of, s->vc_reg_of, sizeof s->vc_reg_of); memcpy(j->vc_age, s->vc_age, sizeof s->vc_age);
+    j->vc_tick = s->vc_tick; j->vc_touch = s->vc_touch; j->vc_keep = s->vc_keep;
+    j->flagkind = s->flagkind; j->kind_set = s->kind_set; j->fl_pend_pc = s->fl_pend_pc; j->fl_pend_kind = s->fl_pend_kind;
+    j->fl_pend_taken = s->fl_pend_taken; j->fl_pend_fall = s->fl_pend_fall; j->open_fwd = s->open_fwd; j->fresh = s->fresh;
+    j->mw_start = s->mw_start; j->mw_end = s->mw_end; j->mw_val = s->mw_val; j->mw_pc = s->mw_pc; j->mw_rd = s->mw_rd; j->mw_sf = s->mw_sf;
+}
 
 #define GX(r) ((int32_t)(offsetof(CPU, x) + 8 * (r)))
 #define GSP ((int32_t)offsetof(CPU, sp))
@@ -261,13 +301,15 @@ static void rc_flush(JC *j) { for (int k = g_npin; k < RC_N; k++) if (j->rc_dirt
 static void rc_clear(JC *j) { memset(j->rc_slot_of, 0, sizeof j->rc_slot_of); memset(j->rc_reg_of, 0, sizeof j->rc_reg_of); j->rc_dirty = 0; rc_pin_apply(j); }
 static void rc_sync_out(JC *j) { for (int k = 0; k < g_npin; k++) mov_mr(j, R15, rc_mem(g_pin[k]), RC_HOST[k], 1); }   // before translated code calls C: the pinned registers into the CPU structure
 static void rc_sync_in(JC *j) { for (int k = 0; k < g_npin; k++) mov_rm(j, RC_HOST[k], R15, rc_mem(g_pin[k]), 1); }    // and back after it (C may have changed them)
+static uint64_t g_rc_nalloc, g_rc_nevict, g_rc_nstore;   // REBAR_JITSTATS_RC=1: translation-time counts of register-cache fills, evictions of a live register, and write-backs of evicted dirty ones
+__attribute__((destructor)) static void rc_stats_print(void) { if (getenv("REBAR_JITSTATS_RC") && g_rc_nalloc) fprintf(stderr, "rc: %llu fills, %llu evictions, %llu dirty write-backs on eviction, blocks %llu insns %llu\n", (unsigned long long)g_rc_nalloc, (unsigned long long)g_rc_nevict, (unsigned long long)g_rc_nstore, (unsigned long long)g_jit_nblocks, (unsigned long long)g_jit_ninsns); }
 static int rc_alloc(JC *j, int g) {   // a slot for guest register g, which is not cached
-    int k = -1;
+    int k = -1; g_rc_nalloc++;
     for (int n = g_npin; n < RC_N; n++) if (!j->rc_reg_of[n]) { k = n; break; }
     if (k < 0) {
         for (int n = g_npin; n < RC_N; n++) if (!(j->rc_pin & (1u << n)) && (k < 0 || j->rc_age[n] < j->rc_age[k])) k = n;
         if (k < 0) k = g_npin;   // (an instruction names at most four registers)
-        if (j->rc_dirty & (1u << k)) rc_store_slot(j, k);
+        g_rc_nevict++; if (j->rc_dirty & (1u << k)) { g_rc_nstore++; rc_store_slot(j, k); }
         j->rc_slot_of[j->rc_reg_of[k] - 1] = 0;
     }
     j->rc_reg_of[k] = (uint8_t)(g + 1); j->rc_slot_of[g] = (uint8_t)(k + 1);
@@ -275,6 +317,7 @@ static int rc_alloc(JC *j, int g) {   // a slot for guest register g, which is n
 }
 typedef struct { uint8_t *at; } Fix;
 static Fix jcc_fwd(JC *j, int cc) { rc_flush(j); e1(j, 0x0F); e1(j, 0x80 + cc); Fix f = {j->p}; e4(j, 0); j->open_fwd++; return f; }   // (both ways out of the branch see the registers in memory)
+static Fix jcc_fwd_noopen(JC *j, int cc) { rc_flush(j); e1(j, 0x0F); e1(j, 0x80 + cc); Fix f = {j->p}; e4(j, 0); return f; }   // a branch that leaves the block at the end: not a data path through it (the budget check)
 static Fix jmp_fwd(JC *j) { rc_flush(j); rc_clear(j); e1(j, 0xE9); Fix f = {j->p}; e4(j, 0); j->open_fwd++; return f; }
 static void fix_here(JC *j, Fix f) { rc_flush(j); rc_clear(j); int32_t d = (int32_t)(j->p - (f.at + 4)); memcpy(f.at, &d, 4); if (j->open_fwd > 0) j->open_fwd--; }
 static void jmp_to(JC *j, uint8_t *target) { e1(j, 0xE9); int32_t d = (int32_t)(target - (j->p + 4)); e4(j, (uint32_t)d); }
@@ -443,7 +486,7 @@ static bool side_exit_room(JC *j) { return j->nsx < 15; }
 static void side_exit(JC *j, int cc, uint64_t target) {
     e1(j, 0x0F); e1(j, 0x80 + cc);
     int k = j->nsx++;
-    j->sx[k].at = j->p; j->sx[k].target = target; j->sx[k].dirty = j->rc_dirty; memcpy(j->sx[k].reg_of, j->rc_reg_of, RC_N);
+    j->sx[k].at = j->p; j->sx[k].target = target; j->sx[k].direct = NULL; j->sx[k].dirty = j->rc_dirty; memcpy(j->sx[k].reg_of, j->rc_reg_of, RC_N); memcpy(j->sx[k].vc_reg_of, j->vc_reg_of, sizeof j->vc_reg_of);
     e4(j, 0);
 }
 static void emit_side_exits(JC *j) {
@@ -453,7 +496,9 @@ static void emit_side_exits(JC *j) {
         if (j->sx[k].fkind == 0x10) flags_poison(j);
         else if (j->sx[k].fkind) flags_from_x86(j, j->sx[k].fkind);   // (the jump came straight from the instruction that set the flags)
         for (int n = 0; n < RC_N; n++) if (j->sx[k].dirty & (1u << n)) mov_mr(j, R15, rc_mem(j->sx[k].reg_of[n] - 1), RC_HOST[n], 1);
-        emit_goto(j, j->sx[k].target);
+        if (j->sx[k].direct) jmp_to(j, j->sx[k].direct);   // the next copy of a traced loop body
+        else if (j->loop_stub && j->sx[k].target == j->blockpc) jmp_to(j, j->loop_stub);   // the self-loop warm entry (REBAR_JIT_LOOPWARM)
+        else emit_goto(j, j->sx[k].target);
     }
     j->nsx = 0;
 }   // c->pc already holds the target
@@ -461,7 +506,20 @@ static void emit_side_exits(JC *j) {
 // ------------------------------------------------------------------------------------------------ flags and conditions
 
 // materialize N Z C V from the x86 flags just produced; kind 1: subtraction (ARM C = not borrow), 2: addition, 3: logical
+static void setcc_r8(JC *j, int cc, int reg) { rex(j, 0, 0, reg, 0); e1(j, 0x0F); e1(j, 0x90 + cc); modrm_rr(j, 0, reg); }   // setcc r8b..r15b (REX.B)
 static void flags_from_x86(JC *j, int kind) {
+    if (kind == 4) {   // FP compare: PF = unordered, CF = less or unordered, ZF = equal or unordered
+        setcc_m(j, CC_P, R15, GV);                 // V = unordered
+        setcc_r8(j, CC_NP, R9);                    // r9b = !PF
+        setcc_r8(j, CC_B, RDX);                    // dl = CF
+        setcc_r8(j, CC_E, R8);                     // r8b = ZF   (before the ands, which clobber the x86 flags)
+        alu_rr(j, 0x20, RDX, R9, 0); st_sized(j, R15, GN, RDX, 1);   // N = CF & !PF (less, ordered)
+        alu_ri(j, 6, RDX, 1, 0); st_sized(j, R15, GC, RDX, 1);        // C = !N (greater/equal or unordered)
+        alu_rr(j, 0x20, R8, R9, 0); st_sized(j, R15, GZ, R8, 1);     // Z = ZF & !PF (equal, ordered)
+        j->flagkind = 0;   // (the ands above clobbered the x86 flags: the result is only in memory now)
+        j->kind_set = true;
+        return;
+    }
     setcc_m(j, CC_S, R15, GN); setcc_m(j, CC_E, R15, GZ);
     if (kind == 1) setcc_m(j, CC_AE, R15, GC); else if (kind == 2) setcc_m(j, CC_B, R15, GC); else mov_m8_imm(j, R15, GC, 0);
     if (kind == 3) mov_m8_imm(j, R15, GV, 0); else setcc_m(j, CC_O, R15, GV);
@@ -495,7 +553,17 @@ static int g_fl_budget = 96;   // REBAR_JIT_FLBUDGET=<n>: how many guest instruc
 static bool g_fl_callscan = true;   // REBAR_JIT_NOCALLSCAN=1: a call keeps the flags live (to bisect)
 static uint64_t g_fl_live_hist[4096]; static uint32_t g_fl_live_enc[4096]; static bool g_fl_dbg;   // REBAR_JIT_FLAGDBG: which instructions made a scan answer 'live'
 static void fl_dbg_dump(void) { for (int k = 0; k < 4096; k++) if (g_fl_live_hist[k] > 20) fprintf(stderr, "flaglive %08x %llu\n", g_fl_live_enc[k], (unsigned long long)g_fl_live_hist[k]); }
-static bool fl_dead_from(uint64_t pc, int *budget) {   // true when the flags are overwritten (or irrelevant) on every path from the instruction at pc
+static bool g_fl_retdead = true;   // REBAR_JIT_NOFLRETDEAD=1: a RET / BR / BLR keeps the flags live as before (to bisect)
+// The arm64 procedure call standard does not hand NZCV across a return or a call: a function that returns after it has restored its frame (a load into x30, as LDP x29, x30, [sp], #n) returns
+// no flags, and neither does a tail call or an indirect call.  What does hand flags back are the compiler's outlined leaf functions (`cmp x10, #0x3f; ret`: no frame, x30 untouched), which
+// stay "live".  Before this, a `cmp` in a function's body kept all four flags stored for the exit through the epilogue's RET.
+static bool fl_loads_x30(uint32_t i) {
+    if (((i >> 22) & 1) && !((i >> 26) & 1) && ((i >> 27) & 7) == 5 && ((i >> 30) & 3) == 2) return (i & 31) == 30 || ((i >> 10) & 31) == 30;   // LDP X (not the non-temporal form's missing index: harmless)
+    if ((i & 0xffc00000) == 0xf9400000) return (i & 31) == 30;                                                                                     // LDR X, [Xn, #imm]
+    if ((i & 0xffe00000) == 0xf8400000 && (i & 0x400)) return (i & 31) == 30;                                                                      // LDR X post / pre index
+    return false;
+}
+static bool fl_dead_from_x(uint64_t pc, int *budget, bool fr) {   // true when the flags are overwritten (or irrelevant) on every path from the instruction at pc
     bool fell = false;   // arrived by running on from the previous instruction (the next page may not be mapped)
     while (*budget > 0) {
         if (fell && (pc & 4095) == 0) return false;
@@ -505,17 +573,18 @@ static bool fl_dead_from(uint64_t pc, int *budget) {   // true when the flags ar
             uint64_t t = pc + (uint64_t)(sext(B(i, 25, 0), 26) * 4);
             // BL: the flags are dead when the callee overwrites them before anything reads them; a return counts as a reader (outlined functions hand
             // flags back: `cmp x10, #0x3f; ret`), so a callee that returns without writing them keeps them live.  What the code after the call sees is what the callee left
-            if (B(i, 31, 31)) return g_fl_callscan && fl_dead_from(t, budget);
+            if (B(i, 31, 31)) return g_fl_callscan && fl_dead_from_x(t, budget, false);
             pc = t; fell = false; continue;
         }
-        if ((i & 0xfe1ffc1f) == 0xd61f0000) return false;   // BR / BLR / RET: the same
+        if ((i & 0xfe1ffc1f) == 0xd61f0000) return g_fl_retdead && (fr || (i & 0xfffffc1f) == 0xd63f0000);   // BR / BLR / RET: live, unless the frame was restored (or it is an indirect call: a callee does not read the flags)
         if ((i & 0xffe0001f) == 0xd4200000) return true;   // BRK: nothing runs after it
         if ((i & 0xfffff01f) == 0xd503201f || (i & 0xfffff09f) == 0xd5033f9f) { pc += 4; fell = true; continue; }   // hints (NOP...), DMB / DSB / ISB
         if (B(i, 30, 25) == 0x1a || B(i, 30, 25) == 0x1b) {   // CBZ CBNZ TBZ TBNZ: both ways
             uint64_t t = pc + (uint64_t)(sext(B(i, 30, 25) == 0x1a ? B(i, 23, 5) : B(i, 18, 5), B(i, 30, 25) == 0x1a ? 19 : 14) * 4);
-            if (!fl_dead_from(t, budget)) return false;
+            if (!fl_dead_from_x(t, budget, fr)) return false;
             pc += 4; fell = true; continue;
         }
+        if (fl_loads_x30(i)) fr = true;
         int c = fl_class(i);
         if (c == 2) return true;
         if (c == 1) { if (g_fl_dbg) { unsigned k = (i >> 20) & 4095; g_fl_live_hist[k]++; g_fl_live_enc[k] = i; } return false; }
@@ -523,8 +592,9 @@ static bool fl_dead_from(uint64_t pc, int *budget) {   // true when the flags ar
     }
     return false;
 }
+static bool fl_dead_from(uint64_t pc, int *budget) { return fl_dead_from_x(pc, budget, false); }
 // the x86 condition can stand for the ARM one for flags of this kind (see cond_cc)
-static bool fl_fusable(int kind, int cond) { return !(kind == 2 && (cond >> 1) == 4); }
+static bool fl_fusable(int kind, int cond) { return kind == 4 || !(kind == 2 && (cond >> 1) == 4); }
 // may the instruction being translated leave the flags in the x86 flags only?  Only when the next instruction is a conditional branch or
 // select in this same block (it reads the x86 flags) and the flags are dead after it, or when they are dead right away.
 static bool g_noflagskip;   // REBAR_JIT_NOFLAGSKIP=1: store the flags after every instruction that sets them (to bisect)
@@ -548,6 +618,11 @@ static bool flags_skippable(JC *j, int kind) {
         if (j->insn_left < 1 || !fl_fusable(kind, B(n, 15, 12))) return false;
         return fl_dead_from(p + 4, &budget);
     }
+    if ((n & 0xff200c00) == 0x1e200c00) {   // FCSEL (the FP flags are consumed like CSEL's)
+        if (g_skipmode && g_skipmode != 2) return false;
+        if (j->insn_left < 1 || !fl_fusable(kind, B(n, 15, 12))) return false;
+        return fl_dead_from(p + 4, &budget);
+    }
     if (g_skipmode && g_skipmode != 3) return false;
     return fl_dead_from(p, &budget);
 }
@@ -556,6 +631,7 @@ static bool g_noflagdefer;   // REBAR_JIT_NOFLAGDEFER=1: store the flags before 
 // stores then happen only on the way that needs them, right after the conditional jump (the fall-through) or at the start of the exit stub (the taken way), where
 // the x86 flags are still the ones the instruction produced.
 static bool flags_deferrable(JC *j, int kind) {
+    if (kind == 4) return false;   // (cond_cc's FP sequence clobbers the x86 flags: store before the branch instead)
     if (g_noflagdefer || g_noflagskip || j->pc < g_flagskip_lo || j->pc >= g_flagskip_hi || (j->pc >= g_noskip_lo && j->pc < g_noskip_hi)) return false;
     uint64_t p = j->pc + 4;
     if ((p & 4095) == 0) return false;
@@ -580,10 +656,35 @@ static void flags_out(JC *j, int kind) {
     flags_from_x86(j, kind);
 }
 
+// FP compare (flag kind 4): x86 PF = unordered, CF = less or unordered, ZF = equal or unordered.
+// A condition that is not a single x86 condition is built in r9b; the caller's values in rax / rcx
+// are untouched (FCSEL loads them before calling this).
+static int fp_cond_cc(JC *j, int cond) {
+    // ARM C is 1 for unordered too: C = !N = !(CF & !PF).  Z = ZF & !PF.
+    switch (cond) {
+    case 11: return CC_B;            // LT: CF (less or unordered)
+    case 6: return CC_P;             // VS: unordered
+    case 7: return CC_NP;            // VC: ordered
+    case 0: setcc_r8(j, CC_NP, R9); setcc_r8(j, CC_E, RDX); alu_rr(j, 0x20, R9, RDX, 0); break;   // EQ: ZF & !PF
+    case 1: setcc_r8(j, CC_P, R9);  setcc_r8(j, CC_NE, RDX); alu_rr(j, 0x08, R9, RDX, 0); break;  // NE: !ZF | PF
+    case 2: setcc_r8(j, CC_AE, R9); setcc_r8(j, CC_P, RDX); alu_rr(j, 0x08, R9, RDX, 0); break;   // CS: !CF | PF
+    case 3: case 4: setcc_r8(j, CC_B, R9); setcc_r8(j, CC_NP, RDX); alu_rr(j, 0x20, R9, RDX, 0); break;   // CC / MI: CF & !PF
+    case 5: setcc_r8(j, CC_AE, R9); setcc_r8(j, CC_P, RDX); alu_rr(j, 0x08, R9, RDX, 0); break;   // PL: !CF | PF
+    case 8: setcc_r8(j, CC_P, R9); setcc_r8(j, CC_AE, RDX); setcc_r8(j, CC_NE, R8); alu_rr(j, 0x20, RDX, R8, 0); alu_rr(j, 0x08, R9, RDX, 0); break;   // HI: PF | (!CF & !ZF)
+    case 9: setcc_r8(j, CC_B, R9); setcc_r8(j, CC_E, RDX); setcc_r8(j, CC_NP, R8); alu_rr(j, 0x08, R9, RDX, 0); alu_rr(j, 0x20, R9, R8, 0); break;   // LS: (CF | ZF) & !PF (all setcc before the or)
+    case 10: setcc_r8(j, CC_AE, R9); setcc_r8(j, CC_NP, RDX); alu_rr(j, 0x20, R9, RDX, 0); break;   // GE: !CF & !PF
+    case 12: setcc_r8(j, CC_NP, R9); setcc_r8(j, CC_AE, RDX); setcc_r8(j, CC_NE, R8); alu_rr(j, 0x20, RDX, R8, 0); alu_rr(j, 0x20, R9, RDX, 0); break;   // GT: !PF & !CF & !ZF
+    case 13: setcc_r8(j, CC_B, R9); setcc_r8(j, CC_E, RDX); alu_rr(j, 0x08, R9, RDX, 0); break;   // LE: CF | ZF
+    default: return CC_ALWAYS;
+    }
+    alu_rr(j, 0x84, R9, R9, 0);      // test r9b, r9b
+    return CC_NE;
+}
 // x86 condition (valid for the instructions emitted so far in this call) equivalent to ARM condition `cond`
 static int cond_cc(JC *j, int cond) {
     if ((cond & 14) == 14) return CC_ALWAYS;
     if (j->flagkind) {  // the x86 flags still hold what the last instruction produced
+        if (j->flagkind == 4) return fp_cond_cc(j, cond);
         static const int sub_cc[14] = {CC_E, CC_NE, CC_AE, CC_B, CC_S, CC_NS, CC_O, CC_NO, CC_A, CC_BE, CC_GE, CC_L, CC_G, CC_LE};
         if (j->flagkind == 1) return sub_cc[cond];
         if (j->flagkind == 2) {  // C is the carry itself: HI and LS have no single x86 condition
@@ -1469,7 +1570,7 @@ static uint8_t *jit_compile(uint64_t pc) {
     JC j; memset(&j, 0, sizeof j); rc_pin_apply(&j); j.sites = t_site_scratch; j.capsites = JSITE_SCRATCH;
     uint8_t *start = (uint8_t *)(((uintptr_t)g_jit_top + (g_jit_align - 1)) & ~(uintptr_t)(g_jit_align - 1)) + g_jit_align;   // (the guest pc sits in the 8 bytes before the code)
     memcpy(start - 8, &pc, 8);
-    j.p = start; j.limit = g_jit_end; j.blockpc = pc;
+    j.p = start; j.limit = g_jit_end; j.blockpc = pc; j.start = start;
     int n = 0, maxn = g_jit_maxn, room = (int)((4096 - (pc & 4095)) / 4);
     if (room < maxn) maxn = room;
     // every block that a loop can run through counts down the budget (a backward branch, an indirect branch or a return in it); a block that only
@@ -1480,7 +1581,10 @@ static uint8_t *jit_compile(uint64_t pc) {
     uint8_t *nptr = NULL; Fix budget = {0};
     if (counts) {
         rex(&j, 0, 0, R15, 0); e1(&j, 0x83); modrm_mem(&j, 5, R15, GBUDGET); nptr = j.p; e1(&j, 0);   // sub dword [r15+budget], n
-        budget = jcc_fwd(&j, CC_S);
+        // the warm entry needs the first instruction's vector store in the cache; the budget branch is not a data
+        // path through the block, so with REBAR_JIT_LOOPWARM it does not count as open_fwd.  The old behaviour is
+        // the default: it measured ~1% faster on the FP loop than the budget fix alone.
+        budget = (g_loopwarm && !g_budgetopen) ? jcc_fwd_noopen(&j, CC_S) : jcc_fwd(&j, CC_S);
     } else { e1(&j, 0x0F); e1(&j, 0x1F); e1(&j, 0x44); e1(&j, 0x00); e1(&j, 0x00); }   // a 5-byte nop: a dead block's entry is overwritten by a jmp, which must not reach into code that another thread is already running
     size_t blkid = g_jit_reg_n;
     if (g_jit_count && blkid < (1u << 20)) { mov_ri_nf(&j, R9, (uint64_t)&g_jit_cnt[blkid]); e1(&j, 0x49); e1(&j, 0xFF); e1(&j, 0x01); }   // inc qword [r9]
@@ -1492,22 +1596,111 @@ static uint8_t *jit_compile(uint64_t pc) {
         emit_indirect(&j, RAX);
         n = 3; ended = true;
     }
-    while (!leaf && n < maxn) {
-        j.pc = cur; j.kind_set = false; j.rc_pin = 0; j.fresh = 0; j.insn_left = maxn - n - 1;
-        if (precise && (*(uint32_t *)cur & 0x0a000000) == 0x08000000) {   // a load or store: the state a signal handler would see
-            mov_ri_nf(&j, RAX, cur); mov_mr(&j, R15, (int32_t)offsetof(CPU, pc), RAX, 1);
-            rc_sync_out(&j); rc_flush(&j);
+    // REBAR_JIT_TRACE: find a self-loop body and an exit code that ends the block, then translate
+    // the body and its own exit code several times.  Each copy has its own exit code and its own
+    // saved translator state, so a copy never jumps into code generated for another copy's cache.
+    uint64_t loop_end = 0; int loop_n = 0, exit_n = 0, trace_u = 0;
+    if (g_trace && !leaf) {
+        for (int k = 0; k < maxn; k++) {
+            uint64_t p = pc + 4 * (uint64_t)k; uint32_t i = *(const uint32_t *)p;
+            if ((i & 0xff000000) == 0x54000000) {
+                uint64_t t = p + (uint64_t)(sext(B(i, 23, 5), 19) * 4);
+                if (t == pc) { loop_end = p; loop_n = k + 1; break; }
+            }
+            if (B(i, 30, 26) == 0x5) break;                     // B / BL: the block ends before the back edge
+            if ((i & 0xfe1ffc1f) == 0xd61f0000) break;          // BR / BLR / RET
+            if ((i & 0xffe0001f) == 0xd4200000) break;          // BRK
         }
-        JI r = jit_emit(&j, *(uint32_t *)cur);
-        vc_end_insn(&j);
-        if (n < 64) g_jit_offs[n] = (uint32_t)(j.p - start);
-        if (!j.kind_set) j.flagkind = 0;
-        if (r == JI_NO) break;
-        n++; cur += 4;
-        if (r == JI_END) { ended = true; break; }
+        if (loop_n >= 2) {
+            bool exit_ends = false;
+            for (int k = loop_n; k < maxn; k++) {
+                uint32_t i = *(const uint32_t *)(pc + 4 * (uint64_t)k);
+                exit_n++;
+                if (B(i, 30, 26) == 0x5 || (i & 0xfe1ffc1f) == 0xd61f0000) { exit_ends = true; break; }
+            }
+            if (exit_ends) {
+                int bconds = 0;
+                for (int k = 0; k < loop_n + exit_n; k++) { uint32_t i = *(const uint32_t *)(pc + 4 * (uint64_t)k); if ((i & 0xff000000) == 0x54000000) bconds++; }
+                trace_u = g_trace_unroll;
+                while (trace_u > 1 && (loop_n + exit_n) * trace_u > maxn) trace_u--;
+                while (trace_u > 1 && bconds * trace_u > 12) trace_u--;
+                if (trace_u < 2) trace_u = 0;
+            }
+        }
+    }
+    if (!leaf && trace_u >= 2) {
+        JState st;
+        for (int u = 0; u < trace_u; u++) {
+            if (u > 0) jstate_load(&j, &st);
+            for (int k = 0; k < loop_n; k++) {
+                uint64_t ipc = pc + 4 * (uint64_t)k;
+                j.pc = ipc; j.kind_set = false; j.rc_pin = 0; j.fresh = 0; j.insn_left = maxn - n - 1;
+                if (precise && (*(uint32_t *)ipc & 0x0a000000) == 0x08000000) {
+                    mov_ri_nf(&j, RAX, ipc); mov_mr(&j, R15, (int32_t)offsetof(CPU, pc), RAX, 1);
+                    rc_sync_out(&j); rc_flush(&j);
+                }
+                JI r = jit_emit(&j, *(uint32_t *)ipc);
+                vc_end_insn(&j);
+                if (n < 64) g_jit_offs[n] = (uint32_t)(j.p - start);
+                if (!j.kind_set) j.flagkind = 0;
+                n++;
+                (void)r;
+            }
+            int back_sx = j.nsx - 1;
+            jstate_save(&j, &st);
+            for (int k = 0; k < exit_n; k++) {
+                uint64_t ipc = loop_end + 4 + 4 * (uint64_t)k;
+                j.pc = ipc; j.kind_set = false; j.rc_pin = 0; j.fresh = 0; j.insn_left = maxn - n - 1;
+                if (precise && (*(uint32_t *)ipc & 0x0a000000) == 0x08000000) {
+                    mov_ri_nf(&j, RAX, ipc); mov_mr(&j, R15, (int32_t)offsetof(CPU, pc), RAX, 1);
+                    rc_sync_out(&j); rc_flush(&j);
+                }
+                JI r = jit_emit(&j, *(uint32_t *)ipc);
+                vc_end_insn(&j);
+                if (n < 64) g_jit_offs[n] = (uint32_t)(j.p - start);
+                if (!j.kind_set) j.flagkind = 0;
+                n++;
+                if (r == JI_END) { ended = true; break; }
+            }
+            if (u + 1 < trace_u) j.sx[back_sx].direct = j.p;   // the next copy starts after this copy's exit code
+        }
+    } else if (!leaf) {
+        while (n < maxn) {
+            j.pc = cur; j.kind_set = false; j.rc_pin = 0; j.fresh = 0; j.insn_left = maxn - n - 1;
+            if (precise && (*(uint32_t *)cur & 0x0a000000) == 0x08000000) {   // a load or store: the state a signal handler would see
+                mov_ri_nf(&j, RAX, cur); mov_mr(&j, R15, (int32_t)offsetof(CPU, pc), RAX, 1);
+                rc_sync_out(&j); rc_flush(&j);
+            }
+            JI r = jit_emit(&j, *(uint32_t *)cur);
+            vc_end_insn(&j);
+            if (n < 64) g_jit_offs[n] = (uint32_t)(j.p - start);
+            if (!j.kind_set) j.flagkind = 0;
+            if (r == JI_NO) break;
+            n++; cur += 4;
+            if (r == JI_END) { ended = true; break; }
+        }
     }
     if (n == 0) { jit_insert(pc, NULL); t_jit_busy = false; pthread_mutex_unlock(&g_jit_mu); return NULL; }
     if (!ended) emit_goto(&j, cur);
+    if (g_loopwarm && !g_trace && !leaf && counts && j.first_ld_n > 0) {
+        int sx_self = -1;
+        for (int k = 0; k < j.nsx; k++) if (j.sx[k].target == pc) { sx_self = k; break; }
+        int pick = -1, slot = -1;
+        if (sx_self >= 0) for (int k = 0; k < j.first_ld_n; k++) {
+            if (!j.first_lds[k].safe || j.first_lds[k].fwd) continue;
+            for (int q = 0; q < 6; q++) if (j.sx[sx_self].vc_reg_of[q] == j.first_lds[k].reg + 1) { pick = k; slot = q; break; }
+            if (pick >= 0) break;
+        }
+        if (pick >= 0) {
+            j.loop_stub = j.p;
+            rex(&j, 0, 0, R15, 0); e1(&j, 0x83); modrm_mem(&j, 5, R15, GBUDGET); e1(&j, (uint8_t)n);   // sub dword [r15+budget], n
+            e1(&j, 0x0F); e1(&j, 0x88); { int32_t d = (int32_t)(start - (j.p + 4)); e4(&j, (uint32_t)d); }   // js start: the normal entry does the budget exit
+            for (int k = 0; k < pick; k++) sse_m(&j, j.first_lds[k].dbl ? 0xF2 : 0xF3, 0x10, j.first_lds[k].xr, R15, GVR(j.first_lds[k].reg));   // the loads before the cached one
+            if (j.first_lds[pick].dbl) sse_r(&j, 0xF3, 0x7E, j.first_lds[pick].xr, 8 + slot);                               // movq xmm, xmm: low 64 bits, upper cleared
+            else { sse_r(&j, 0, 0x57, j.first_lds[pick].xr, j.first_lds[pick].xr); sse_r(&j, 0xF3, 0x10, j.first_lds[pick].xr, 8 + slot); }
+            jmp_to(&j, start + j.first_lds[pick].off);
+        }
+    }
     emit_side_exits(&j);
     emit_blr_stub(&j);
     if (j.cs_rel) { int32_t d = (int32_t)(j.p - (j.cs_rel + 4)); memcpy(j.cs_rel, &d, 4); emit_exit_to(&j, j.cs_target); }   // until the callee is translated the call leads to the dispatcher
@@ -1709,11 +1902,17 @@ static void jit_init(void) {
     g_jit_hot = mmap(NULL, 1 << JIT_HOT_BITS, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
     if (g_jit_tab == MAP_FAILED || g_jit_ic == MAP_FAILED || g_jit_hot == MAP_FAILED) return;
     if (getenv("REBAR_JIT_NOFLAGSKIP")) g_noflagskip = true;
+    if (getenv("REBAR_JIT_NOFLRETDEAD")) g_fl_retdead = false;
     if (getenv("REBAR_JIT_NOFLAGSKIP_RANGE")) { char *e; g_noskip_lo = strtoull(getenv("REBAR_JIT_NOFLAGSKIP_RANGE"), &e, 16); if (*e == '-') g_noskip_hi = strtoull(e + 1, NULL, 16); }
     if (getenv("REBAR_JIT_FLAGPOISON")) g_flagpoison = true;
     if (getenv("REBAR_JIT_NOFP")) g_nofp = true;
+    if (getenv("REBAR_JIT_NOFPFLAGS")) g_no_fpflags = true;
     if (getenv("REBAR_JIT_BUDGET_ALL")) g_jit_budget_all = true;
     if (getenv("REBAR_JIT_NOLEAF")) g_jit_noleaf = true;
+    if (getenv("REBAR_JIT_LOOPWARM")) g_loopwarm = atoi(getenv("REBAR_JIT_LOOPWARM")) != 0;
+    if (getenv("REBAR_JIT_BUDGETOPEN")) g_budgetopen = atoi(getenv("REBAR_JIT_BUDGETOPEN")) != 0;
+    if (getenv("REBAR_JIT_TRACE")) g_trace = atoi(getenv("REBAR_JIT_TRACE")) != 0;
+    if (getenv("REBAR_JIT_TRACE_UNROLL")) { int u = atoi(getenv("REBAR_JIT_TRACE_UNROLL")); if (u >= 2 && u <= 8) g_trace_unroll = u; }
     if (getenv("REBAR_JIT_NOCALLSCAN")) g_fl_callscan = false;
     if (getenv("REBAR_JIT_RAS")) g_jit_ras = atoi(getenv("REBAR_JIT_RAS")) != 0;
     if (getenv("REBAR_JIT_ALIGN")) g_jit_align = (uintptr_t)atoi(getenv("REBAR_JIT_ALIGN"));
@@ -1734,7 +1933,7 @@ static void jit_init(void) {
     {   // REBAR_JIT_PIN=<guest register numbers, comma separated | none>: the pinned registers (at most four, among x0..x28)
         const char *e = getenv("REBAR_JIT_PIN"); if (!e) e = "8,9,0";
         g_npin = 0;
-        for (const char *q = e; *q && g_npin < 5;) { char *end; long v = strtol(q, &end, 10); if (end == q) break; if (v >= 0 && v <= 28) g_pin[g_npin++] = (uint8_t)v; q = *end == ',' ? end + 1 : end; }
+        for (const char *q = e; *q && g_npin < 5;) { char *end; long v = strtol(q, &end, 10); if (end == q) break; if (v >= 0 && v <= 31) g_pin[g_npin++] = (uint8_t)v; q = *end == ',' ? end + 1 : end; }
     }
     jit_make_thunks();
     g_jit_on = true;
