@@ -184,7 +184,14 @@ final class Launcher: NSObject, ObservableObject {
     private func iosEntry(_ p: String) -> AppEntry? {
         guard let info = NSDictionary(contentsOfFile: p + "/Info.plist"), let exeName = info["CFBundleExecutable"] as? String else { return nil }
         let exe = p + "/" + exeName
-        guard let m = machoInfo(atPath: exe), m.archs.contains("arm64") else { return nil }
+        guard var m = machoInfo(atPath: exe), m.archs.contains("arm64") else { return nil }
+        if !m.usesUI {   // (a launcher executable that only loads an embedded framework, Unity's UnityFramework: the UIKit code is in the framework)
+            let fw = p + "/Frameworks"
+            for n in ((try? FileManager.default.contentsOfDirectory(atPath: fw)) ?? []).sorted() where n.hasSuffix(".framework") {
+                let base = String(n.dropLast(".framework".count))
+                if let fm = machoInfo(atPath: fw + "/" + n + "/" + base), fm.usesUI { m.usesUI = true; break }
+            }
+        }
         let name = (info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String) ?? exeName
         return AppEntry(path: p, name: name, version: (info["CFBundleShortVersionString"] as? String) ?? "", exe: exe, engine: nil, ios: IOSInfo(usesUI: m.usesUI, simulator: m.simulator, encrypted: m.encrypted))
     }
