@@ -854,13 +854,14 @@ typedef struct { uint32_t seq; uint32_t rsize; uint64_t cls, sel, imp; char rkin
 #define MSGFAST_SLOTS 262144   // (Xcode sends tens of thousands of different (class, selector) pairs: with 8192 slots the table thrashed and every miss paid class_getInstanceMethod)
 static MsgFast g_msgfast_tab[MSGFAST_SLOTS];
 static bool bundle_load_hook(CPU *c, id self, SEL sel);   // (loader.h)
+static void ios_unity_prestart(CPU *c, id self, SEL sel);
 static bool msg_special_sel(SEL sel) {
     static SEL sp[40]; static int n;
     if (!n) {
         static const char *names[] = {"stringWithFormat:", "predicateWithFormat:", "raise:format:", "initWithFormat:", "appendFormat:", "stringByAppendingFormat:", "initWithFormat:arguments:", "predicateWithFormat:arguments:",
             "initWithFormat:locale:arguments:", "arrayWithObjects:", "dictionaryWithObjectsAndKeys:", "handleFailureInFunction:file:lineNumber:description:", "handleFailureInMethod:object:file:lineNumber:description:",
             "initWithColorsAndLocations:", "initWithObjects:", "initWithObjectsAndKeys:", "orderedSetWithObjects:", "setWithObjects:", "commit", "set", "setLayer:", "bundleForClass:", "mainBundle", "launch",
-            "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", "defaultContainer", "containerWithIdentifier:", "loadAndReturnError:", "preflightAndReturnError:", "isLoaded", "bundleWithIdentifier:", NULL};
+            "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", "defaultContainer", "containerWithIdentifier:", "loadAndReturnError:", "preflightAndReturnError:", "isLoaded", "bundleWithIdentifier:", "principalClass", "classNamed:", "surface", NULL};
         int k = 0; for (; names[k] && k < 40; k++) sp[k] = sel_registerName(names[k]);
         __atomic_store_n(&n, k, __ATOMIC_RELEASE);
     }
@@ -948,6 +949,7 @@ H(h_objc_msgSend) {
         }
     }
     if (bundle_load_hook(c, self, sel)) return;
+    ios_unity_prestart(c, self, sel);
     Class cls = object_getClass(self);
     // (a method lookup can run a class's +initialize and wait on libobjc's class initialization lock, which another thread may hold while it waits for the interpreter lock)
     bool gil_held_l = gil_release(); IMP imp_raw = class_getMethodImplementation(cls, sel); if (gil_held_l) gil_acquire();
@@ -1277,7 +1279,39 @@ static void swift_class_ensure_ready(CPU *c, uint64_t cls) {
 }
 // UIApplicationMain looks the delegate (and the principal class) up by name in the host's runtime, which does not know a Swift class that is still waiting for the Swift runtime to set it
 // up (Telegram's AppDelegate: "No class named AppDelegate is loaded"). Every class of that kind is set up before the call; there are some hundreds at most.
+// Unity (UnityAppController) starts its player inside didFinishLaunching and its graphics setup reads the main display's rendering surface at once. On iOS the window's first layout pass (run by
+// makeKeyAndVisible) has made the UnityView create it by then; a Mac Catalyst window that has no scene yet is not laid out, the surface ivar is nil and the first read (the Metal device setup inside
+// UnityInitApplicationGraphics) dereferences it. The getter is a plain ivar read: at the first read that finds nothing, the surface is made by -[DisplayConnection initRendering] (it builds the
+// Metal surface struct: layer, device, command queue, and hands it back; storing it is -recreateSurface:'s job, which needs quality settings that are not loaded yet) and stored in the ivar (its
+// offset comes from the getter's first instruction, ldr x0, [x0, #off]); -recreateSurface: finds and reuses it later. REBAR_NO_UNITY_PRESTART=1 turns it off, REBAR_TRACE_UNITY=1 reports.
+static void ios_unity_prestart(CPU *c, id self, SEL sel) {
+    (void)c;
+    static SEL s_surface, s_init; static Class cDC; static int off = -1; static __thread int busy;
+    if (off < 0) { off = getenv("REBAR_NO_UNITY_PRESTART") != NULL || !getenv("REBAR_IOS_UI"); s_surface = sel_registerName("surface"); s_init = sel_registerName("initRendering"); }
+    if (off || busy || sel != s_surface || !self) return;
+    if (!cDC) { cDC = objc_getClass("DisplayConnection"); if (!cDC) return; }
+    if (object_getClass(self) != cDC || !class_respondsToSelector(cDC, s_init)) return;
+    Method gm = class_getInstanceMethod(cDC, s_surface); if (!gm) return;
+    uint64_t gimp = (uint64_t)imp_unwrap((uint64_t)method_getImplementation(gm));
+    uint32_t w0 = in_guest(gimp) ? *(const uint32_t *)gimp : 0;
+    if ((w0 & 0xffc003ff) != 0xf9400000) return;   // (not a plain ivar getter)
+    uint64_t off_iv = ((w0 >> 10) & 0xfff) * 8;
+    if (*(uint64_t *)((char *)self + off_iv)) return;
+    busy = 1;
+    uint64_t surf = (uint64_t)send_h(self, s_init);
+    if (surf && !*(uint64_t *)((char *)self + off_iv)) *(uint64_t *)((char *)self + off_iv) = surf;
+    if (getenv("REBAR_TRACE_UNITY")) fprintf(stderr, "[unity] first read of the display surface finds none: initRendering -> %llx stored at +%llx\n", (unsigned long long)surf, (unsigned long long)off_iv);
+    busy = 0;
+}
 H(h_UIApplicationMain) {
+    if (getenv("REBAR_PRINT_IMPS")) {   // debugging: REBAR_PRINT_IMPS=Class:selector,Class:selector prints where the guest implementations are (to put into REBAR_WATCH)
+        char buf[1024]; snprintf(buf, sizeof buf, "%s", getenv("REBAR_PRINT_IMPS"));
+        for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) {
+            char *col = strchr(t, ':'); if (!col) continue; *col = 0;
+            Class k = objc_getClass(t); Method m = k ? class_getInstanceMethod(k, sel_registerName(col + 1)) : NULL;
+            fprintf(stderr, "[imp] -[%s %s] = %llx\n", t, col + 1, m ? (unsigned long long)imp_unwrap((uint64_t)method_getImplementation(m)) : 0ull);
+        }
+    }
     for (int k = 0; k < g_nswift_deferred; k++) swift_class_ensure_ready(c, g_swift_deferred[k]);
     host_call(c, HOSTFN("UIApplicationMain"), false);
 }

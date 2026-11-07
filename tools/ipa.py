@@ -67,6 +67,13 @@ def info(app):
     for n in os.listdir(app):
         if n.endswith(".dylib"): extra += [l.strip().split(" (")[0] for l in sh("otool", "-arch", "arm64", "-L", os.path.join(app, n)).split("\n")[1:] if l.strip()]
     d["uses_ui"] = any(("/%s.framework/" % f) in l for l in linked + extra for f in UI_FRAMEWORKS)
+    if not d["uses_ui"]:   # (a launcher executable that only loads an embedded framework: Unity's UnityFramework holds the UIKit code)
+        fwd = os.path.join(app, "Frameworks")
+        for n in sorted(os.listdir(fwd)) if os.path.isdir(fwd) else []:
+            if not n.endswith(".framework"): continue
+            exe_fw = os.path.join(fwd, n, n[:-len(".framework")])
+            if os.path.isfile(exe_fw) and any(("/%s.framework/" % f) in l for l in sh("otool", "-arch", "arm64", "-L", exe_fw).split("\n")[1:] for f in UI_FRAMEWORKS):
+                d["uses_ui"] = True; break
     enc = sh("otool", "-arch", "arm64", "-l", exe)
     d["encrypted"] = "cryptid 1" in enc
     fw = os.path.join(app, "Frameworks")

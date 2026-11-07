@@ -2959,7 +2959,9 @@ static bool host_lib_ok(const char *path) {
     for (int k = 0; k < g_nhostlibs; k++) if (!strcmp(g_hostlibs[k].path, path)) return g_hostlibs[k].ok;
     if (g_nhostlibs >= 512) return false;
     g_hostlibs[g_nhostlibs].path = strdup(path);
-    return g_hostlibs[g_nhostlibs++].ok = dlopen(path, RTLD_NOW | RTLD_GLOBAL) != NULL;
+    bool ok = dlopen(path, RTLD_NOW | RTLD_GLOBAL) != NULL;
+    if (!ok && !strncmp(path, "@rpath/libswift", 15)) { char sp[300]; snprintf(sp, sizeof sp, "/usr/lib/swift/%s", path + 7); ok = dlopen(sp, RTLD_NOW | RTLD_GLOBAL) != NULL; }   // (an iOS app's back-deployed Swift runtime: the host's own)
+    return g_hostlibs[g_nhostlibs++].ok = ok;
 }
 static bool lib_supported(const char *lib) { return !lib || host_lib_ok(lib); }
 static void load_host_libraries(void) {  // dlopen every system library the guest images name
@@ -3062,7 +3064,7 @@ static bool swift_returns_bool(const char *name) {
     static int off = -1; if (off < 0) off = getenv("REBAR_NO_SWIFT_BOOL") != NULL;
     if (off) return false;
     static const char *const rt[] = {"_swift_isUniquelyReferenced_nonNull", "_swift_isUniquelyReferenced_nonNull_native", "_swift_isUniquelyReferencedNonObjC", "_swift_isUniquelyReferencedNonObjC_nonNull",
-        "_swift_isUniquelyReferencedNonObjC_nonNull_bridgeObject", "_swift_isEscapingClosureAtFileLocation", "_swift_dynamicCast", "_swift_dynamicCastMetatype", "_swift_isClassType", "_swift_isOptionalType",
+        "_swift_isUniquelyReferencedNonObjC_nonNull_bridgeObject", "_swift_isEscapingClosureAtFileLocation", "_swift_dynamicCast", "_swift_isClassType", "_swift_isOptionalType",
         "_swift_isDeallocating", "_swift_unknownObjectUnownedIsDeallocating", "_swift_bridgeObjectUnownedIsDeallocating", "_swift_unownedRetainStrong", "_swift_stdlib_isStackAllocationSafe", "_swift_isOptionalType", "_swift_conformsToProtocolCommon", NULL};
     for (const char *const *q = rt; *q; q++) if (!strcmp(*q, name)) return !!strcmp(name, "_swift_unownedRetainStrong") && !!strcmp(name, "_swift_conformsToProtocolCommon");
     if (name[0] != '_' || name[1] != '$' || (name[2] != 's' && name[2] != 'S') || !strstr(name, "Sb")) return false;

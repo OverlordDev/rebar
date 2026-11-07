@@ -1803,7 +1803,36 @@ static void ios_patch_uikit(void) {
     Class ui = objc_getClass("UIColor");
     if (ui && !class_getInstanceMethod(ui, sel_registerName("colorUsingColorSpace:"))) class_addMethod(ui, sel_registerName("colorUsingColorSpace:"), (IMP)ios_color_using_cs, "@@:@");
 }
+// AVAudioSession on Mac Catalyst creates its session in a system service with a synchronous XPC call whose reply never comes on this machine: +sharedInstance (Unity, ad SDKs) blocks for good. An iOS app
+// gets a stand-in object instead: it accepts the session calls (setCategory:, setActive:, ... answer YES, numbers 0 / a sample rate) and has no audio of its own. REBAR_NO_AVSESSION_SHIM=1 turns it off.
+extern id objc_msgSend(id, SEL, ...);
+static id g_avsess;
+static id ios_avsess_shared(id self, SEL _cmd) { (void)self; (void)_cmd; return g_avsess; }
+static uint64_t ios_av_ret0(id self, SEL _cmd) { (void)self; (void)_cmd; return 0; }
+static uint64_t ios_av_ret1(id self, SEL _cmd) { (void)self; (void)_cmd; return 1; }
+static double ios_av_retd(id self, SEL _cmd) { (void)self; (void)_cmd; return 48000.0; }
+static float ios_av_retf(id self, SEL _cmd) { (void)self; (void)_cmd; return 1.0f; }
+static BOOL ios_avsess_resolve(id self, SEL _cmd, SEL sel) {
+    (void)_cmd; Class av = objc_getClass("AVAudioSession"); Method m = av ? class_getInstanceMethod(av, sel) : NULL; if (!m) return NO;
+    const char *e = method_getTypeEncoding(m); const char *r = e; while (r && (*r == 'r' || *r == 'n' || *r == 'o' || *r == 'N' || *r == 'O' || *r == 'R' || *r == 'V')) r++;
+    IMP imp = (IMP)ios_av_ret0;
+    if (r && (*r == 'B' || *r == 'c')) imp = (IMP)ios_av_ret1; else if (r && *r == 'd') imp = (IMP)ios_av_retd; else if (r && *r == 'f') imp = (IMP)ios_av_retf;
+    class_addMethod((Class)self, sel, imp, e);
+    return YES;
+}
+static void ios_avsession_shim(void) {
+    if (getenv("REBAR_NO_AVSESSION_SHIM")) return;
+    dlopen("/System/Library/Frameworks/AVFAudio.framework/AVFAudio", RTLD_NOW | RTLD_GLOBAL);
+    Class av = objc_getClass("AVAudioSession"); if (!av) return;
+    Class sh = objc_allocateClassPair(objc_getClass("NSObject"), "RebarAVAudioSession", 0); if (!sh) return;
+    class_addMethod(object_getClass((id)sh), sel_registerName("resolveInstanceMethod:"), (IMP)ios_avsess_resolve, "B@::");
+    objc_registerClassPair(sh);
+    g_avsess = ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)((id)sh, sel_registerName("alloc")), sel_registerName("init"));
+    Method m = class_getClassMethod(av, sel_registerName("sharedInstance"));
+    if (m && g_avsess) method_setImplementation(m, (IMP)ios_avsess_shared);
+}
 static void ios_prepare(void) {
+    ios_avsession_shim();
     dlopen("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", RTLD_NOW | RTLD_GLOBAL);
     Class app = objc_getClass("NSApplication");
     if (app && !class_getClassMethod(app, sel_registerName("_startWindowServerIfNecessary")))

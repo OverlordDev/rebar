@@ -245,6 +245,10 @@ static GImage *load_image(const char *real_path, GImage *loader, bool is_main) {
     // dependencies
     for (int k = 0; k < img->ndeps; k++) {
         char *gp = resolve_guest_dep(img, img->dep_path[k]);
+        if (gp) {   // the Swift runtime libraries an iOS app ships for back-deployment (libswift_Concurrency.dylib, libswiftCore.dylib, ...): the host's own copy is the one that works with the host's runtime
+            const char *bn = strrchr(img->dep_path[k], '/'); bn = bn ? bn + 1 : img->dep_path[k];
+            if (!strncmp(bn, "libswift", 8) && !getenv("REBAR_GUEST_SWIFT_LIBS")) { free(gp); gp = NULL; }
+        }
         if (gp) {
             const uint8_t *dfile; size_t dlen; int dfd = open(gp, O_RDONLY);
             bool arm = false;
@@ -502,8 +506,8 @@ static void install_host_bundle_hook(void) {
 // preflightAndReturnError: and isLoaded are answered here: the executable goes through the guest loader, as dlopen does. A bundle with an executable of the host's kind is left to the host.
 static GImage *g_bundle_img[256]; static char *g_bundle_path[256]; static int g_nbundle;
 static bool bundle_load_hook(CPU *c, id self, SEL sel) {
-    static SEL s_load, s_lre, s_pre, s_il, s_ep; static Class cB;
-    if (!s_load) { s_load = sel_registerName("load"); s_lre = sel_registerName("loadAndReturnError:"); s_pre = sel_registerName("preflightAndReturnError:"); s_il = sel_registerName("isLoaded"); s_ep = sel_registerName("executablePath"); cB = objc_getClass("NSBundle"); }
+    static SEL s_load, s_lre, s_pre, s_il, s_ep, s_pc, s_cn; static Class cB;
+    if (!s_load) { s_load = sel_registerName("load"); s_lre = sel_registerName("loadAndReturnError:"); s_pre = sel_registerName("preflightAndReturnError:"); s_il = sel_registerName("isLoaded"); s_ep = sel_registerName("executablePath"); s_pc = sel_registerName("principalClass"); s_cn = sel_registerName("classNamed:"); cB = objc_getClass("NSBundle"); }
     static SEL s_bwi, s_bi, s_bwp, s_ies;
     if (!s_bwi) { s_bwi = sel_registerName("bundleWithIdentifier:"); s_bi = sel_registerName("bundleIdentifier"); s_bwp = sel_registerName("bundleWithPath:"); s_ies = sel_registerName("isEqualToString:"); }
     if (sel == s_bwi && cB && self == (id)cB && c->x[2] > 0x10000) {   // +bundleWithIdentifier: knows the bundles of the images the host loaded; the guest's frameworks are looked up here
@@ -521,7 +525,7 @@ static bool bundle_load_hook(CPU *c, id self, SEL sel) {
         c->x[0] = (uint64_t)r; c->x[1] = 0;
         return true;
     }
-    if (sel != s_load && sel != s_lre && sel != s_pre && sel != s_il) return false;
+    if (sel != s_load && sel != s_lre && sel != s_pre && sel != s_il && sel != s_pc && sel != s_cn) return false;
     if (!cB) return false;
     Class k = object_getClass(self); while (k && k != cB) k = class_getSuperclass(k);
     if (!k) return false;
@@ -536,6 +540,7 @@ static bool bundle_load_hook(CPU *c, id self, SEL sel) {
         if (!arm) return false;
     }
     if (sel == s_il) { c->x[0] = idx >= 0 && g_bundle_img[idx] ? 1 : 0; c->x[1] = 0; return true; }
+    uint64_t cn_arg = c->x[2];
     if (sel == s_pre) { c->x[0] = 1; c->x[1] = 0; return true; }
     if (idx < 0 && g_nbundle < 256) {
         int first = g_nimages;
@@ -545,6 +550,14 @@ static bool bundle_load_hook(CPU *c, id self, SEL sel) {
         g_bundle_img[g_nbundle] = img; g_bundle_path[g_nbundle] = strdup(real); idx = g_nbundle++;
     }
     bool ok = idx >= 0 && g_bundle_img[idx];
+    if (sel == s_pc || sel == s_cn) {   // -principalClass / -classNamed: load the bundle themselves (inside the host's NSBundle, where a dlopen of arm64 code hangs): the class is found by name in the runtime the guest registered it in
+        Class r = NULL; const char *nm = NULL; id v = NULL;
+        if (ok && sel == s_pc) { id key = send_h((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "NSPrincipalClass"); v = key ? send_h(self, sel_registerName("objectForInfoDictionaryKey:"), key) : NULL; }
+        else if (ok) v = (id)cn_arg;
+        if (v > (id)0x10000) nm = (const char *)send_h(v, sel_registerName("UTF8String"));
+        if (nm && *nm) r = objc_getClass(nm);
+        c->x[0] = (uint64_t)r; c->x[1] = 0; return true;
+    }
     c->x[0] = ok ? 1 : 0; c->x[1] = 0;
     if (sel == s_lre && !ok && c->x[2] > 0x10000) *(uint64_t *)c->x[2] = 0;   // (no NSError is built here: the caller sees NO)
     return true;
