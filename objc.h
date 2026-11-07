@@ -24,7 +24,7 @@ static inline GRO *class_ro(const GClass *c) { return (GRO *)(c->data & ~7ull); 
 static void *p_msgSend, *p_msgSend_stret, *p_msgForward;
 static Class (*p_readClassPair)(Class, const void *);
 static SEL s_alloc, s_autorelease, s_release, s_load;
-static SEL s_initWithFormat_arguments, s_initWithFormat_locale_arguments, s_appendString, s_stringByAppendingString;
+static SEL s_localizedStringWithFormat, s_initWithFormat_locale, s_initWithFormat_arguments, s_initWithFormat_locale_arguments, s_appendString, s_stringByAppendingString;
 static SEL s_stringWithFormat, s_initWithFormat, s_appendFormat, s_stringByAppendingFormat, s_predicateWithFormat;
 static SEL s_predicateWithFormat_arguments;
 static SEL s_arrayWithObjects, s_initWithObjects, s_setWithObjects, s_orderedSetWithObjects;
@@ -42,6 +42,7 @@ static void objc_bridge_init(void) {
     p_readClassPair = dlsym(RTLD_DEFAULT, "objc_readClassPair");
 #define SELN(var, str) var = sel_registerName(str)
     SELN(s_alloc, "alloc"); SELN(s_autorelease, "autorelease"); SELN(s_release, "release"); SELN(s_load, "load");
+    SELN(s_localizedStringWithFormat, "localizedStringWithFormat:"); SELN(s_initWithFormat_locale, "initWithFormat:locale:");
     SELN(s_initWithFormat_arguments, "initWithFormat:arguments:");
     SELN(s_initWithFormat_locale_arguments, "initWithFormat:locale:arguments:");
     SELN(s_appendString, "appendString:"); SELN(s_stringByAppendingString, "stringByAppendingString:");
@@ -257,6 +258,13 @@ static bool variadic_send(CPU *c, id self, SEL sel) {
         } else c->x[0] = (uint64_t)send(self, init, (id)c->x[2], ap);
         return true;
     }
+    if (sel == s_localizedStringWithFormat) {   // +[NSString localizedStringWithFormat:]: the format's arguments are on the arm64 stack (AppLovin's request signing passed three objects: the host read garbage and called -description at 0)
+        id loc = send((id)objc_getClass("NSLocale"), sel_registerName("currentLocale"));
+        id obj = send(send((id)objc_getClass("NSString"), s_alloc), s_initWithFormat_locale_arguments, (id)c->x[2], loc, ap);
+        c->x[0] = (uint64_t)send(obj, s_autorelease);
+        return true;
+    }
+    if (sel == s_initWithFormat_locale) { c->x[0] = (uint64_t)send(self, s_initWithFormat_locale_arguments, (id)c->x[2], (id)c->x[3], ap); return true; }
     if (sel == s_raise_format) { send(self, s_raise_format_arguments, (id)c->x[2], (id)c->x[3], ap); return true; }
     if (sel == s_initWithFormat) { c->x[0] = (uint64_t)send(self, s_initWithFormat_arguments, (id)c->x[2], ap); return true; }
     if (sel == s_appendFormat || sel == s_stringByAppendingFormat) {
@@ -856,13 +864,13 @@ static MsgFast g_msgfast_tab[MSGFAST_SLOTS];
 static bool bundle_load_hook(CPU *c, id self, SEL sel);   // (loader.h)
 static void ios_unity_prestart(CPU *c, id self, SEL sel);
 static bool msg_special_sel(SEL sel) {
-    static SEL sp[40]; static int n;
+    static SEL sp[64]; static int n;
     if (!n) {
         static const char *names[] = {"stringWithFormat:", "predicateWithFormat:", "raise:format:", "initWithFormat:", "appendFormat:", "stringByAppendingFormat:", "initWithFormat:arguments:", "predicateWithFormat:arguments:",
-            "initWithFormat:locale:arguments:", "arrayWithObjects:", "dictionaryWithObjectsAndKeys:", "handleFailureInFunction:file:lineNumber:description:", "handleFailureInMethod:object:file:lineNumber:description:",
+            "initWithFormat:locale:arguments:", "localizedStringWithFormat:", "initWithFormat:locale:", "arrayWithObjects:", "dictionaryWithObjectsAndKeys:", "handleFailureInFunction:file:lineNumber:description:", "handleFailureInMethod:object:file:lineNumber:description:",
             "initWithColorsAndLocations:", "initWithObjects:", "initWithObjectsAndKeys:", "orderedSetWithObjects:", "setWithObjects:", "commit", "set", "setLayer:", "bundleForClass:", "mainBundle", "launch",
             "launchAndReturnError:", "run", "executableArchitecture", "openApplicationAtURL:configuration:completionHandler:", "defaultContainer", "containerWithIdentifier:", "loadAndReturnError:", "preflightAndReturnError:", "isLoaded", "bundleWithIdentifier:", "principalClass", "classNamed:", "surface", NULL};
-        int k = 0; for (; names[k] && k < 40; k++) sp[k] = sel_registerName(names[k]);
+        int k = 0; for (; names[k] && k < 64; k++) sp[k] = sel_registerName(names[k]);
         __atomic_store_n(&n, k, __ATOMIC_RELEASE);
     }
     int cnt = __atomic_load_n(&n, __ATOMIC_ACQUIRE);
@@ -1166,6 +1174,16 @@ H(h_CFStringCreateWithFormatAndArguments) {
     VA_INIT(ap, c->x[3]);
     uint64_t (*f)(uint64_t, uint64_t, uint64_t, va_list) = dlsym(RTLD_DEFAULT, "CFStringCreateWithFormatAndArguments");
     c->x[0] = f(c->x[0], c->x[1], c->x[2], ap);
+}
+H(h_CFStringAppendFormat) {   // CFStringAppendFormat(str, formatOptions, format, ...): the variadic arguments are on the arm64 stack (Unity's NSIndexPath description faulted in the host)
+    VA_INIT(ap, c->sp);
+    void (*f)(uint64_t, uint64_t, uint64_t, va_list) = dlsym(RTLD_DEFAULT, "CFStringAppendFormatAndArguments");
+    f(c->x[0], c->x[1], c->x[2], ap);
+}
+H(h_CFStringAppendFormatAndArguments) {
+    VA_INIT(ap, c->x[3]);
+    void (*f)(uint64_t, uint64_t, uint64_t, va_list) = dlsym(RTLD_DEFAULT, "CFStringAppendFormatAndArguments");
+    f(c->x[0], c->x[1], c->x[2], ap);
 }
 
 // NSLog and NSProcessInfo report the host process name unless told otherwise.

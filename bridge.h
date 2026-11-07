@@ -1620,6 +1620,7 @@ static const Special k_special[] = {
     {"_NSLog", h_NSLog}, {"_NSLogv", h_NSLogv},
     {"_CFStringCreateWithFormat", h_CFStringCreateWithFormat},
     {"_CFStringCreateWithFormatAndArguments", h_CFStringCreateWithFormatAndArguments},
+    {"_CFStringAppendFormat", h_CFStringAppendFormat}, {"_CFStringAppendFormatAndArguments", h_CFStringAppendFormatAndArguments},
     {NULL, NULL},
 };
 
@@ -1751,8 +1752,9 @@ static void deliver_mach_exception(CPU *c, int sig, uint64_t addr) {
     for (int k = 0; k < 32; k++) if (!g_mach_faulting[k].cpu) { slot = k; g_mach_faulting[k].port = me; g_mach_faulting[k].cpu = c; g_mach_faulting[k].far = addr; break; }
     pthread_mutex_unlock(&g_mach_fmu);
     bool had = gil_release();
-    kern_return_t kr = mach_msg(&req.h, MACH_SEND_MSG, sizeof req, 0, MACH_PORT_NULL, 2000, MACH_PORT_NULL);
-    if (kr == KERN_SUCCESS) kr = mach_msg(&rep.h, MACH_RCV_MSG, 0, sizeof rep, reply, 5000, MACH_PORT_NULL);
+    // (the timeouts only count with their option flags: without them a handler thread that never answers, Crashlytics' after it wrote its report, left the faulting thread and with it the whole game hanging for good instead of ending with rebar's fault report)
+    kern_return_t kr = mach_msg(&req.h, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof req, 0, MACH_PORT_NULL, 2000, MACH_PORT_NULL);
+    if (kr == KERN_SUCCESS) kr = mach_msg(&rep.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof rep, reply, 20000, MACH_PORT_NULL);
     if (had) gil_acquire();
     if (slot >= 0) { pthread_mutex_lock(&g_mach_fmu); g_mach_faulting[slot].cpu = NULL; pthread_mutex_unlock(&g_mach_fmu); }
     mach_port_mod_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1); mach_port_deallocate(mach_task_self(), me);
