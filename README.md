@@ -33,6 +33,10 @@ tools/rebar-wrap disable "/Applications/Some App.app"   # puts the original exec
 tools/rebar-wrap agent install                # a LaunchAgent: wrap new arm64-only apps in /Applications and ~/Applications as they appear
 ```
 
+The Rebar launcher has the same thing as one checkbox, “Start apps by themselves” (the gear next to it: watched folders, per-app switches and environment variables, the agent log).
+`WRAP=1 ./run_tests.sh` runs the whole regression suite through the wrapper: a scratch copy of the tree has every arm64-only executable wrapped and the tests start those files directly,
+as a double click would, instead of `rebar <file>`.
+
 The original executable is kept in `~/Library/Application Support/rebar/wrapped/`. The wrapped file is signed ad hoc. An app that updates itself replaces the file; the agent
 (or `tools/rebar-wrap auto`) wraps it again. More folders to watch: one per line in `~/Library/Application Support/rebar/autowrap-folders`.
 

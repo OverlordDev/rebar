@@ -57,6 +57,7 @@ final class Launcher: NSObject, ObservableObject {
     @Published var scanning = false
     @Published var message = ""
     private(set) var icons: [String: NSImage] = [:]
+    private(set) var wrapper: WrapperModel!             // the wrapper: arm64-only apps that start by themselves (Wrapper.swift)
 
     private let support: URL
     private let logs: URL
@@ -86,6 +87,8 @@ final class Launcher: NSObject, ObservableObject {
         try? fm.createDirectory(at: logs, withIntermediateDirectories: true)
         if let d = try? Data(contentsOf: support.appendingPathComponent("settings.json")), let s = try? JSONDecoder().decode(StoreFile.self, from: d) { store = s }
         prepareRebar()
+        let bin = support.appendingPathComponent("bin")
+        wrapper = WrapperModel(script: bin.appendingPathComponent("rebar-wrap").path, shim: bin.appendingPathComponent("rebar_wrap_shim").path, rebar: bin.appendingPathComponent("rebar").path)
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.poll() }
         scan()
     }
@@ -108,6 +111,12 @@ final class Launcher: NSObject, ObservableObject {
         if let sec = Bundle.main.url(forResource: "librebar_sec.dylib", withExtension: nil, subdirectory: "bin") {   // the keychain of iOS apps
             let sdst = dst.deletingLastPathComponent().appendingPathComponent("librebar_sec.dylib")
             if (try? Data(contentsOf: sec)) != (try? Data(contentsOf: sdst)) { try? fm.removeItem(at: sdst); try? fm.copyItem(at: sec, to: sdst); removexattr(sdst.path, "com.apple.quarantine", 0) }
+        }
+        for name in ["rebar-wrap", "rebar_wrap_shim"] {   // the wrapper's tool and its compiled Intel half (the background agent runs them from here, a place that stays when this app moves)
+            guard let src = Bundle.main.url(forResource: name, withExtension: nil, subdirectory: "bin") else { continue }
+            let d = dst.deletingLastPathComponent().appendingPathComponent(name)
+            if (try? Data(contentsOf: src)) != (try? Data(contentsOf: d)) { try? fm.removeItem(at: d); try? fm.copyItem(at: src, to: d) }
+            chmod(d.path, 0o755); removexattr(d.path, "com.apple.quarantine", 0)
         }
         if let shim = Bundle.main.url(forResource: "librebar_exec.dylib", withExtension: nil, subdirectory: "bin") {   // (rebar looks for it next to itself)
             let sdst = dst.deletingLastPathComponent().appendingPathComponent("librebar_exec.dylib")

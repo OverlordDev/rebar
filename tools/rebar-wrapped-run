@@ -1,0 +1,13 @@
+#!/bin/sh
+# Runs a program the way a double click would. An arm64-only executable that tools/rebar-wrap has wrapped (an x86_64 shim in front of the arm64 slice) starts itself:
+# the kernel runs the shim, the shim starts rebar. Everything else (rebar's own options, x86_64 programs, scripts, files that were not wrapped) goes to rebar as before.
+# Used by `WRAP=1 ./run_tests.sh` in place of ../rebar. REBAR_BIN names the rebar to use (default: the one next to the tools folder).
+here=$(cd "$(dirname "$0")/.." && pwd)
+REBAR_BIN=${REBAR_BIN:-$here/rebar}; export REBAR_BIN
+case "$1" in -*|"") exec "$REBAR_BIN" "$@" ;; esac
+prog=$1
+case "$prog" in */*) ;; *) [ -f "./$prog" ] && prog=./$prog ;; esac
+if [ -f "$prog" ] && [ -x "$prog" ] && head -c 1048576 "$prog" 2>/dev/null | grep -aq "REBAR-WRAPPED-1"; then
+    shift; exec "$prog" "$@"
+fi
+exec "$REBAR_BIN" "$@"

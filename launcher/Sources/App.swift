@@ -32,6 +32,7 @@ struct ContentView: View {
     @EnvironmentObject var model: Launcher
     @State private var filter = ""
     @State private var editing: AppEntry?
+    @State private var wrapperOpen = false
 
     private var shown: [AppEntry] { filter.isEmpty ? model.apps : model.apps.filter { $0.name.localizedCaseInsensitiveContains(filter) } }
 
@@ -43,6 +44,8 @@ struct ContentView: View {
                     Text("Apps for Apple Silicon (arm64) that you can run on this Mac").font(.callout).foregroundColor(.secondary)
                 }
                 Spacer()
+                WrapperCheckbox(wrap: model.wrapper, apps: model.apps)
+                Button(action: { wrapperOpen = true }) { Image(systemName: "gearshape.2") }.help("Wrapper: which apps, folders, environment")
                 Button(action: { model.scan() }) { Image(systemName: "arrow.clockwise") }.help("Refresh the list").disabled(model.scanning)
                 Button("Add…") { choose() }.help("Add an app, an iOS app (.ipa) or a folder with apps (for example from an open .dmg)")
             }
@@ -63,9 +66,12 @@ struct ContentView: View {
         }
         .padding(16)
         .sheet(item: $editing) { SettingsSheet(app: $0).environmentObject(model) }
+        .sheet(isPresented: $wrapperOpen) { WrapperSheet(wrap: model.wrapper).environmentObject(model) }
+        .onAppear { model.wrapper.refresh(extraApps: model.apps.filter { $0.ios == nil && $0.path.hasSuffix(".app") }.map { $0.path }) }
         .onAppear {   // (tests)
             let e = ProcessInfo.processInfo.environment
             if let p = e["RL_SETTINGS"] { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { editing = model.apps.first { $0.path == p } } }
+            if e["RL_WRAPPER"] != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { wrapperOpen = true } }
             if let p = e["RL_LAUNCH"] { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { if let a = model.apps.first(where: { $0.path == p }) { model.launch(a) } } }
         }
     }
@@ -146,5 +152,16 @@ struct SettingsSheet: View {
 
     private func hint(_ t: String) -> some View {
         Text(t).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// The one checkbox of the main window: the background agent that wraps arm64-only apps as they appear (details: the gear next to it).
+struct WrapperCheckbox: View {
+    @ObservedObject var wrap: WrapperModel
+    let apps: [AppEntry]
+    var body: some View {
+        Toggle("Start apps by themselves", isOn: Binding(get: { wrap.agentOn }, set: { wrap.setAgent($0, extraApps: apps.filter { $0.ios == nil && $0.path.hasSuffix(".app") }.map { $0.path }) }))
+            .toggleStyle(CheckboxToggleStyle()).disabled(!wrap.available || wrap.busy)
+            .help("A background agent wraps arm64-only apps as they appear: a double click, the Dock and Steam then start them through rebar without this window")
     }
 }

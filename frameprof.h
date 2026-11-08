@@ -1,7 +1,8 @@
 // REBAR_FRAMEPROF=<prefix> (or =1 for /tmp/rebar_frames): a frame profiler built into the bridge. Every frame is recorded, none is sampled or dropped.
 //
 // A frame ends at a present, whichever thread makes it (a game that renders with jobs presents from a different thread every time, so nothing here is per thread): the calls
-// -[MTLCommandBuffer presentDrawable:] (also atTime: / afterMinimumDuration:) and -[CAMetalDrawable present...].  Per frame it keeps
+// -[MTLCommandBuffer presentDrawable:] (also atTime: / afterMinimumDuration:) and -[CAMetalDrawable present...], and for OpenGL programs the swap:
+// -[NSOpenGLContext flushBuffer] (what SDL / GLFW / GLUT call; on macOS the GL driver is itself on Metal) or CGLFlushDrawable when called directly.  Per frame it keeps
 //   interval   wall time since the previous present
 //   drawable   time threads spent blocked in -[CAMetalLayer nextDrawable] (the display or the GPU is behind: back pressure)
 //   cpu        CPU time of the whole process in that interval (all threads); cpu / interval = cores busy
@@ -29,7 +30,7 @@ static uint64_t g_fp_host_ns, g_fp_wait_ns, g_fp_draw_ns, g_fp_gpu_ns, g_fp_gpu_
 static __thread int t_fp_depth, t_fp_gpu_busy;
 static __thread uint64_t t_tp_nested;   // ns of the imports finished inside the import that is running
 static uint8_t *g_fp_kind;             // per import: 0 unknown, 1 other, 2 plain wait
-static SEL s_fp_next, s_fp_pdraw, s_fp_pdraw_at, s_fp_pdraw_after, s_fp_present, s_fp_present_at, s_fp_present_after, s_fp_commit, s_fp_addcomp, s_fp_gs, s_fp_ge;
+static SEL s_fp_next, s_fp_pdraw, s_fp_pdraw_at, s_fp_pdraw_after, s_fp_present, s_fp_present_at, s_fp_present_after, s_fp_commit, s_fp_addcomp, s_fp_gs, s_fp_ge, s_fp_flush;
 static void *fp_msg(void) { static void *p; if (!p) p = dlsym(RTLD_DEFAULT, "objc_msgSend"); return p; }
 static uint64_t fp_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 static uint64_t fp_proc_cpu(void) { return clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID); }
@@ -67,7 +68,9 @@ static void tp_add(TpRow *tab, uint64_t key, uint64_t ns, const char *name) {
 }
 static void tp_entry_note(uint64_t target, uint64_t ns) { tp_add(g_tp_ent, target, ns, NULL); }
 static void fp_frame(void) {   // a present, from any thread: close the frame
-    uint64_t now = fp_now(), prev = __atomic_exchange_n(&g_fp_last_present, now, __ATOMIC_ACQ_REL);
+    uint64_t now = fp_now(), prev = __atomic_load_n(&g_fp_last_present, __ATOMIC_ACQUIRE);
+    if (prev && now - prev < 1000000ull) return;   // (a swap can be reported twice: flushBuffer and the CGL call under it)
+    prev = __atomic_exchange_n(&g_fp_last_present, now, __ATOMIC_ACQ_REL);
     if (!prev) { g_fp_last_cpu = fp_proc_cpu(); g_fp_last_commit = __atomic_load_n(&g_fp_ncommit, __ATOMIC_RELAXED); return; }
     uint64_t cpu = fp_proc_cpu(), cpu0 = __atomic_exchange_n(&g_fp_last_cpu, cpu, __ATOMIC_ACQ_REL);
     uint64_t commits = __atomic_load_n(&g_fp_ncommit, __ATOMIC_RELAXED), c0 = __atomic_exchange_n(&g_fp_last_commit, commits, __ATOMIC_ACQ_REL);
@@ -94,7 +97,7 @@ static void fp_summary(FILE *f, const char *title, const FpRec *r, size_t n) {
     double cpu_ms = (double)sc / N / 1000, host_ms = (double)sh / N / 1000;
     fprintf(f, "  an average frame of %.1f ms: process cpu %.1f ms = %.1f cores busy (of which in host calls: Metal / driver / libc %.1f ms, guest code under rebar and rebar itself about %.1f ms)\n",
             avg, cpu_ms, cpu_ms / avg, host_ms, cpu_ms > host_ms ? cpu_ms - host_ms : 0);
-    fprintf(f, "  threads idle in plain waits %.1f thread-ms per frame, blocked in nextDrawable %.1f ms per frame", (double)sw / N / 1000, (double)sd / N / 1000);
+    fprintf(f, "  threads idle in plain waits %.1f thread-ms per frame, blocked in nextDrawable / GL swap %.1f ms per frame", (double)sw / N / 1000, (double)sd / N / 1000);
     if (g_fp_gpu) fprintf(f, ", GPU busy %.1f ms per frame = %.0f %% of the frame (%.1f %% of command buffers reported no GPU time)", (double)sg / N / 1000, 100.0 * (double)sg / (double)siv, g_fp_gpu_cbs ? 100.0 * (double)g_fp_gpu_zero / (double)g_fp_gpu_cbs : 0);
     fprintf(f, "\n");
     size_t ng = 0, nd = 0, nc = 0, ni = 0, ns = 0;
@@ -103,7 +106,7 @@ static void fp_summary(FILE *f, const char *title, const FpRec *r, size_t n) {
         ns++; double iv_us = r[i].interval_us;
         if (g_fp_gpu && r[i].gpu_us >= 0.8 * iv_us) ng++; else if (r[i].drawable_us >= 0.5 * iv_us) nd++; else if (r[i].cpu_us >= 3.0 * iv_us) nc++; else ni++;
     }
-    fprintf(f, "  slow frames (> 1.5 x median or > 50 ms): %zu = GPU-bound (GPU busy >= 80 %%) %zu, blocked in nextDrawable (>= 50 %%) %zu, CPU-heavy (>= 3 cores) %zu, neither (idle threads: serialisation / latency) %zu\n", ns, ng, nd, nc, ni);
+    fprintf(f, "  slow frames (> 1.5 x median or > 50 ms): %zu = GPU-bound (GPU busy >= 80 %%) %zu, blocked in nextDrawable / GL swap (>= 50 %%) %zu, CPU-heavy (>= 3 cores) %zu, neither (idle threads: serialisation / latency) %zu\n", ns, ng, nd, nc, ni);
     free(iv);
 }
 static int fp_row_cmp(const void *a, const void *b) { uint64_t x = ((const TpRow *)a)->ns, y = ((const TpRow *)b)->ns; return x < y ? 1 : x > y ? -1 : 0; }
@@ -220,7 +223,7 @@ static void frameprof_start(const char *prefix) {
 #define FPSEL(v, s) v = sel_registerName(s)
     FPSEL(s_fp_next, "nextDrawable"); FPSEL(s_fp_pdraw, "presentDrawable:"); FPSEL(s_fp_pdraw_at, "presentDrawable:atTime:"); FPSEL(s_fp_pdraw_after, "presentDrawable:afterMinimumDuration:");
     FPSEL(s_fp_present, "present"); FPSEL(s_fp_present_at, "presentAtTime:"); FPSEL(s_fp_present_after, "presentAfterMinimumDuration:"); FPSEL(s_fp_commit, "commit");
-    FPSEL(s_fp_addcomp, "addCompletedHandler:"); FPSEL(s_fp_gs, "GPUStartTime"); FPSEL(s_fp_ge, "GPUEndTime");
+    FPSEL(s_fp_addcomp, "addCompletedHandler:"); FPSEL(s_fp_gs, "GPUStartTime"); FPSEL(s_fp_ge, "GPUEndTime"); FPSEL(s_fp_flush, "flushBuffer");
     FPSEL(s_tp_nextevent, "nextEventMatchingMask:untilDate:inMode:dequeue:");
     g_tp = getenv("REBAR_TIMEPROF") != NULL;
     if (g_tp) tp_install_observer();
@@ -250,10 +253,11 @@ static void tp_turn_begin(uint64_t now) {   // the main thread asks for the next
 static void fp_stub_call(CPU *c) {
     uint64_t off = c->pc - g_stub_base, idx = off / 16;
     bool valid = off < g_stub_size && idx < (uint64_t)g_nstubs;
-    bool is_next = false; SEL sel = NULL;
+    bool is_next = false, is_swap = false; SEL sel = NULL;
     if (valid && g_stubs[idx].handler == h_objc_msgSend) {
         sel = (SEL)c->x[1]; id self = (id)c->x[0];
         if (sel == s_fp_next) is_next = true;
+        else if (sel == s_fp_flush) is_swap = true;
         else if (sel == s_fp_commit) {
             if (self && strstr(class_getName(object_getClass(self)), "CommandBuffer")) {
                 __atomic_fetch_add(&g_fp_ncommit, 1, __ATOMIC_RELAXED);
@@ -263,6 +267,7 @@ static void fp_stub_call(CPU *c) {
         else if (sel == s_fp_pdraw || sel == s_fp_pdraw_at || sel == s_fp_pdraw_after) { if (self) fp_frame(); }
         else if ((sel == s_fp_present || sel == s_fp_present_at || sel == s_fp_present_after) && self && strstr(class_getName(object_getClass(self)), "Drawable")) fp_frame();
     }
+    if (!is_swap && valid && g_stubs[idx].name && (!strcmp(g_stubs[idx].name, "_CGLFlushDrawable") || !strcmp(g_stubs[idx].name, "CGLFlushDrawable"))) is_swap = true;   // (SDL / GLFW call the Objective-C method; a program that swaps through CGL directly gets here)
     int kind = valid ? fp_stub_kind(idx) : 1;
     // Imports nest (the host calls back into the guest, e.g. NSApplicationMain runs the whole program inside one import): each import is charged only its own time, what the imports called inside it took is taken out.
     uint64_t outer = t_tp_nested; t_tp_nested = 0;
@@ -272,7 +277,7 @@ static void fp_stub_call(CPU *c) {
     t_tp_nested = outer + d;
     __atomic_fetch_add(&g_fp_host_ns, own, __ATOMIC_RELAXED);
     if (kind == 2) __atomic_fetch_add(&g_fp_wait_ns, own, __ATOMIC_RELAXED);
-    if (is_next) __atomic_fetch_add(&g_fp_draw_ns, own, __ATOMIC_RELAXED);
+    if (is_next || is_swap) __atomic_fetch_add(&g_fp_draw_ns, own, __ATOMIC_RELAXED);
     if (g_tp && valid) {
         __atomic_fetch_add(&g_tp_imp_calls[idx], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_tp_imp_ns[idx], own, __ATOMIC_RELAXED);
         const char *nm = g_stubs[idx].name;
@@ -280,4 +285,5 @@ static void fp_stub_call(CPU *c) {
         if (!t_tp_main) t_tp_main = pthread_main_np() ? 1 : 2;
         if (t_tp_main == 1) { m_host += own; if (kind == 2) m_wait += own; if (own > m_max_ns) { m_max_ns = own; m_max_name = nm; } }
     }
+    if (is_swap) fp_frame();   // the frame ends when the swap returns: the time it was blocked is this frame's back-pressure
 }

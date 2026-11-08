@@ -14,7 +14,9 @@ if xcrun -f vtool >/dev/null 2>&1; then   # rebar as a Mac Catalyst process: the
 fi
 clang -arch x86_64 -mmacosx-version-min=11.0 -dynamiclib -O2 -Wno-everything ../execshim.c -o "$APP/Contents/Resources/bin/librebar_exec.dylib"   # (injected into the shells and tools that guests start: see execshim.c)
 clang -arch x86_64 -mmacosx-version-min=11.0 -dynamiclib -fobjc-arc -O2 -w -framework Foundation -framework Security ../ios_sec.m -o "$APP/Contents/Resources/bin/librebar_sec.dylib"   # (the keychain of iOS apps)
-swiftc -O -swift-version 5 -parse-as-library -target x86_64-apple-macos11.0 Sources/App.swift Sources/Model.swift Sources/Support.swift Sources/FastEditor.swift -o "$APP/Contents/MacOS/$NAME"
+clang -arch x86_64 -mmacosx-version-min=11.0 -O2 -Wall ../tools/rebar_wrap_shim.c -o "$APP/Contents/Resources/bin/rebar_wrap_shim"   # (the Intel half of a wrapped app: see ../tools/rebar-wrap)
+cp ../tools/rebar-wrap "$APP/Contents/Resources/bin/rebar-wrap"
+swiftc -O -swift-version 5 -parse-as-library -target x86_64-apple-macos11.0 Sources/App.swift Sources/Model.swift Sources/Support.swift Sources/FastEditor.swift Sources/Wrapper.swift -o "$APP/Contents/MacOS/$NAME"
 cp Info.plist "$APP/Contents/Info.plist"
 cp icon/AppIcon.icns icon/icon-light.png icon/icon-dark.png "$APP/Contents/Resources/"   # (made from the SVGs by icon/make_icon.sh)
 codesign --force --deep --sign - "$APP"

@@ -7,12 +7,14 @@ The kernel runs the x86_64 slice, which replaces itself with `rebar <that same f
 
     rebar-wrap enable  <App.app|folder> ...   wrap the arm64-only apps (a folder: every .app directly inside it)
     rebar-wrap disable <App.app|folder> ...   put the original executable back
+    rebar-wrap list    [--json] [<App.app|folder> ...]   the arm64-only apps of the watched folders (and those given) with their state (the launcher's Wrapper window uses --json)
+    rebar-wrap wrap-tree <dir>                wrap every arm64-only executable file below a folder in place (test copies)
     rebar-wrap env     <App.app> [KEY=VALUE ...]  the environment a wrapped app starts with (Steam ids, REBAR_* switches); no pairs: show it
     rebar-wrap update  <App.app|folder> ...   replace the shim of wrapped apps by the current one
     rebar-wrap seal    <App.app|folder> ...   sign the bundle of wrapped apps (enable does it for downloaded ones: Gatekeeper calls a downloaded app with a stale seal damaged)
     rebar-wrap status  [<App.app|folder> ...] what is arm64-only / wrapped (default: the folders of `auto`)
     rebar-wrap auto                           enable for the watched folders (what the agent runs)
-    rebar-wrap agent install | uninstall      a LaunchAgent that runs `auto` whenever a watched folder changes
+    rebar-wrap agent install | uninstall | status     a LaunchAgent that runs `auto` whenever a watched folder changes
     rebar-wrap setup                          only record where rebar is (done by every command)
 
 The original executable is kept in ~/Library/Application Support/rebar/wrapped/ (disable restores it byte for byte, with its signature). The wrapped executable is signed ad hoc, which
@@ -88,7 +90,10 @@ def run(cmd, **kw):
 
 
 def build_shim():
-    """The x86_64 shim, compiled once and cached next to the originals."""
+    """The x86_64 shim: $REBAR_WRAP_SHIM (the launcher ships it compiled), else compiled once from the source and cached next to the originals."""
+    for pre in (os.environ.get("REBAR_WRAP_SHIM"), os.path.join(HERE, "rebar_wrap_shim"), os.path.join(ROOT, "rebar_wrap_shim")):   # (the release zip has it compiled next to this file)
+        if pre and os.path.isfile(pre) and os.access(pre, os.X_OK):
+            return pre
     os.makedirs(SUPPORT, exist_ok=True)
     out = os.path.join(SUPPORT, "rebar_wrap_shim")
     src = os.path.join(HERE, "rebar_wrap_shim.c")
@@ -236,14 +241,18 @@ def cmd_status(args):
             print("arm64-only  ", a)
 
 
+def rest_nojson(rest):
+    return [x for x in rest if not x.startswith("--")]
+
+
 def agent_plist():
     return {
         "Label": LABEL,
-        "ProgramArguments": ["/usr/bin/python3", os.path.join(HERE, "rebar-wrap"), "auto"],
+        "ProgramArguments": ["/usr/bin/python3", os.path.realpath(__file__), "auto"],
         "WatchPaths": watched(),
         "ThrottleInterval": 20,
         "RunAtLoad": False,
-        "EnvironmentVariables": dict({"REBAR_BIN": rebar_binary(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        "EnvironmentVariables": dict({"REBAR_BIN": rebar_binary(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, **({"REBAR_WRAP_SHIM": os.environ["REBAR_WRAP_SHIM"]} if os.environ.get("REBAR_WRAP_SHIM") else {}),
                                      **({"REBAR_WRAP_FOLDERS": os.environ["REBAR_WRAP_FOLDERS"]} if os.environ.get("REBAR_WRAP_FOLDERS") else {})),
         "StandardErrorPath": os.path.join(SUPPORT, "autowrap.log"),
         "StandardOutPath": os.path.join(SUPPORT, "autowrap.log"),
@@ -268,6 +277,53 @@ def main():
                     continue   # (a folder: say nothing about the apps that run natively)
                 print("%s: %s" % (os.path.basename(app), fn(app)))
         return
+    if cmd == "wrap-tree":   # rebar-wrap wrap-tree <dir>: every arm64-only executable file below it (not a dylib, not an app) becomes shim + arm64 slice, in place, nothing saved (for test copies)
+        shim = build_shim(); setup(); n = 0
+        for d, dirs, files in os.walk(rest[0] if rest else "."):
+            for fn in files:
+                path = os.path.join(d, fn)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                try:
+                    with open(path, "rb") as f:
+                        h = f.read(16)
+                except OSError:
+                    continue
+                if len(h) < 16 or struct.unpack("<I", h[:4])[0] != 0xFEEDFACF or struct.unpack("<I", h[4:8])[0] != CPU_ARM64:
+                    continue
+                if struct.unpack("<I", h[12:16])[0] != 2 or (struct.unpack("<I", h[8:12])[0] & 0xFF) == 2:   # (MH_EXECUTE only; arm64e needs pointer authentication)
+                    continue
+                tmp = path + ".rebar-wrap"
+                if run(["lipo", "-create", "-arch", "x86_64", shim, "-arch", "arm64", path, "-output", tmp]).returncode:
+                    continue
+                os.chmod(tmp, os.stat(path).st_mode & 0o777 | 0o111)
+                run(["codesign", "--force", "-s", "-", tmp])
+                os.replace(tmp, path); n += 1
+        print("wrapped %d executable(s)" % n)
+        return
+    if cmd == "list":   # rebar-wrap list [--json] [<App.app|folder> ...]: the arm64-only apps (wrapped or not) with the environment they start with
+        import json
+        out = []
+        seen = set()
+        for a in [x for arg in (watched() + rest_nojson(rest)) for x in apps_in(arg)]:
+            if a in seen:
+                continue
+            seen.add(a)
+            exe = main_executable(a)
+            if not exe or not os.path.isfile(exe):
+                continue
+            w = is_wrapped(exe)
+            if not (w or arm64_only(exe)):
+                continue
+            envf = os.path.join(SUPPORT, "env", os.path.basename(exe))
+            out.append({"path": a, "name": os.path.basename(a)[:-4], "wrapped": w, "quarantined": quarantined(a),
+                        "writable": os.access(os.path.dirname(exe), os.W_OK), "env": open(envf).read() if os.path.exists(envf) else ""})
+        if "--json" in rest:
+            print(json.dumps(out))
+        else:
+            for o in out:
+                print("%-8s %s" % ("wrapped" if o["wrapped"] else "arm64", o["path"]))
+        return
     if cmd == "env":   # rebar-wrap env <App.app> [KEY=VALUE ...]: the environment the wrapped app starts with (no pairs: show it)
         if not rest:
             sys.exit("usage: rebar-wrap env <App.app> [KEY=VALUE ...]")
@@ -275,7 +331,9 @@ def main():
         if not exe:
             sys.exit("rebar-wrap: no such app")
         f = os.path.join(SUPPORT, "env", os.path.basename(exe))
-        if len(rest) > 1:
+        if rest[1:] == ["--clear"]:
+            os.path.exists(f) and os.remove(f)
+        elif len(rest) > 1:
             os.makedirs(os.path.dirname(f), exist_ok=True)
             with open(f, "w") as o:
                 o.write("".join(x + "\n" for x in rest[1:]))
@@ -326,12 +384,15 @@ def main():
             run(["launchctl", "bootout", "gui/" + uid + "/" + LABEL])
             r = run(["launchctl", "bootstrap", "gui/" + uid, AGENT])
             print(r.stderr.strip() or "agent installed: %s watches %s" % (LABEL, ", ".join(watched())))
+        elif sub == "status":   # exit status 0 and "installed" when launchd has the agent
+            on = os.path.exists(AGENT) and run(["launchctl", "print", "gui/" + uid + "/" + LABEL]).returncode == 0
+            print("installed" if on else "not installed"); sys.exit(0 if on else 1)
         elif sub == "uninstall":
             run(["launchctl", "bootout", "gui/" + uid + "/" + LABEL])
             os.path.exists(AGENT) and os.remove(AGENT)
             print("agent removed (wrapped apps stay wrapped: rebar-wrap disable <folder> puts them back)")
         else:
-            sys.exit("usage: rebar-wrap agent install|uninstall")
+            sys.exit("usage: rebar-wrap agent install|uninstall|status")
         return
     sys.exit("unknown command %r (rebar-wrap help)" % cmd)
 

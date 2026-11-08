@@ -1,9 +1,19 @@
 #!/bin/sh
 # Runs every sample under rebar and compares with the native x86_64 build of the same source.
 # Usage: ./run_tests.sh          (build the emulator first with ./build.sh)
+if [ -n "$WRAP" ] && [ -z "$REBAR_WRAP_COPY" ]; then
+    # WRAP=1 ./run_tests.sh: the same tests, but through the wrapper. A scratch copy of the tree has every arm64-only executable wrapped (tools/rebar-wrap wrap-tree: an x86_64 shim in front of
+    # the arm64 slice) and the tests start those files directly, as a double click would (kernel -> shim -> rebar), instead of `rebar <file>`. The scratch HOME keeps rebar-wrap's files away from yours.
+    here=$(cd "$(dirname "$0")" && pwd); W=/tmp/rebar_wrap_tree; rm -rf $W; mkdir -p $W/home
+    for f in "$here"/* "$here"/.[!.]*; do [ "$(basename "$f")" = samples ] || ln -s "$f" $W/ 2>/dev/null; done
+    cp -R "$here/samples" $W/samples
+    HOME=$W/home REBAR_BIN="$here/rebar" python3 -I "$here/tools/rebar-wrap" wrap-tree $W/samples || exit 1
+    REBAR_BIN="$here/rebar" REBAR_WRAP_COPY=1 exec "$W/run_tests.sh"
+fi
 cd "$(dirname "$0")/samples" || exit 1
 unset CFProcessPath __CFBundleIdentifier   # (a launcher/IDE environment can make NSBundle point at its own bundle: the native oracle then sees the wrong name/bundle)
 R=../rebar
+[ -n "$REBAR_WRAP_COPY" ] && R=../tools/rebar-wrapped-run   # (WRAP=1: programs start through the wrapper)
 pass=0; fail=0
 
 # run_to SECONDS OUTFILE cmd...   (stdout+stderr split: OUTFILE and OUTFILE.err), prints exit status via $RC
@@ -336,7 +346,7 @@ rw=$T/rw; rm -rf $rw; mkdir -p $rw/home $rw/Hello.app/Contents/MacOS
 if clang -arch arm64 -O1 rw_hello.c -o $rw/Hello.app/Contents/MacOS/Hello 2>/dev/null && printf '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>Hello</string><key>CFBundleIdentifier</key><string>com.rebar.test.hello</string><key>CFBundlePackageType</key><string>APPL</string><key>LSBackgroundOnly</key><true/></dict></plist>\n' > $rw/Hello.app/Contents/Info.plist && cp $rw/Hello.app/Contents/MacOS/Hello $rw/orig; then
     export HOME_SAVE=$HOME
     printf 'wrapped\nhello from arm64 app, argc=2 argv1=x\nrestored\n' > $T/a
-    {   HOME=$rw/home REBAR_BIN=$PWD/$R python3 -I ../tools/rebar-wrap enable $rw/Hello.app | sed 's/.*: //; s/ (.*//; s/ from the saved original//' | grep -v '^$'
+    {   HOME=$rw/home REBAR_BIN=$PWD/../rebar python3 -I ../tools/rebar-wrap enable $rw/Hello.app | sed 's/.*: //; s/ (.*//; s/ from the saved original//' | grep -v '^$'
         HOME=$rw/home RW_OUT=$rw/out $rw/Hello.app/Contents/MacOS/Hello x; cat $rw/out
         HOME=$rw/home python3 -I ../tools/rebar-wrap disable $rw/Hello.app >/dev/null; cmp -s $rw/orig $rw/Hello.app/Contents/MacOS/Hello && echo restored || echo "NOT restored"
     } > $T/b 2>&1
