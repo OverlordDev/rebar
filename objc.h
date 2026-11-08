@@ -984,6 +984,17 @@ H(h_objc_msgSend) {
         if (no_rt < 0) { no_rt = getenv("REBAR_NO_METAL_RT") != NULL; s_srt = sel_registerName("supportsRaytracing"); s_srtfr = sel_registerName("supportsRaytracingFromRender"); }
         if (no_rt && (sel == s_srt || sel == s_srtfr)) { c->x[0] = 0; c->x[1] = 0; return; }
     }
+    {   // +[UIAppearance appearanceWhenContainedIn:] takes a nil-terminated list of classes. arm64 passes the arguments after the first on the stack, the host's x86_64 method reads them as variadic
+        // registers: it ran off into garbage (faults at 0x100, 0xff, 0x13f...) and answered nil. The array form of the same call is given what the guest passed.
+        static SEL s_wci, s_wciarr, s_awo; if (!s_wci) { s_wci = sel_registerName("appearanceWhenContainedIn:"); s_wciarr = sel_registerName("appearanceWhenContainedInInstancesOfClasses:"); s_awo = sel_registerName("arrayWithObjects:count:"); }
+        if (sel == s_wci && c->x[2] && !getenv("REBAR_NO_APPEARANCE_FIX")) {
+            id objs[16]; int n = 0; objs[n++] = (id)c->x[2];
+            const uint64_t *st = (const uint64_t *)c->sp;
+            while (n < 16 && st[n - 1] > 0x10000) { objs[n] = (id)st[n - 1]; n++; }
+            id arr = ((id (*)(id, SEL, const id *, unsigned long))p_msgSend)((id)objc_getClass("NSArray"), s_awo, objs, (unsigned long)n);
+            if (arr && class_getClassMethod(object_getClass(self) == (Class)self ? (Class)self : object_getClass(self), s_wciarr)) { sel = s_wciarr; c->x[1] = (uint64_t)sel; c->x[2] = (uint64_t)arr; }
+        }
+    }
     ios_unity_prestart(c, self, sel);
     Class cls = object_getClass(self);
     // (a method lookup can run a class's +initialize and wait on libobjc's class initialization lock, which another thread may hold while it waits for the interpreter lock)
@@ -1436,6 +1447,12 @@ static void ensure_host_protocols(const char *m, size_t len) {
     static Protocol *(*gp)(const char *); static Protocol *(*ap)(const char *); static void (*rp)(Protocol *);
     if (!gp) { gp = dlsym(RTLD_DEFAULT, "objc_getProtocol"); ap = dlsym(RTLD_DEFAULT, "objc_allocateProtocol"); rp = dlsym(RTLD_DEFAULT, "objc_registerProtocol"); }
     if (!gp || !ap || !rp) return;
+    {   // the Objective-C names of Swift @objc protocols ("_TtP10TikTokFeed33FeedDetail..._"): the Swift runtime finds a protocol that has no descriptor of its own through the Objective-C runtime by that name
+        static int done; for (; done < g_nguest_protos; done++) {
+            const char *n = *(const char **)(g_guest_protos[done] + 8);
+            if (n && !strncmp(n, "_TtP", 4) && !gp(n)) { Protocol *np = ap(n); if (np) rp(np); }
+        }
+    }
     for (size_t i = 0; i + 3 < len; i++) {
         if (m[i] != 'S' || m[i + 1] != 'o' || m[i + 2] < '1' || m[i + 2] > '9') continue;
         size_t j = i + 2, n = 0; while (j < len && m[j] >= '0' && m[j] <= '9') n = n * 10 + (size_t)(m[j++] - '0');
@@ -1574,6 +1591,12 @@ static void swift_register_image(GImage *img) {
     if (reg_protos && (s = find_text_section(img->mh, "__swift5_protos")) && s->size) reg_protos((void *)(s->addr + img->slide), (void *)(s->addr + img->slide + s->size));
     if (reg_conf && (s = find_text_section(img->mh, "__swift5_proto")) && s->size) reg_conf((void *)(s->addr + img->slide), (void *)(s->addr + img->slide + s->size));
     if (reg_types && (s = find_text_section(img->mh, "__swift5_types")) && s->size) reg_types((void *)(s->addr + img->slide), (void *)(s->addr + img->slide + s->size));
+    if (getenv("REBAR_TEST_MANGLED")) {   // REBAR_TEST_MANGLED=<mangled name>[,<name>...]: what the runtime makes of each after this image's tables are registered
+        const void *(*gt)(const char *, size_t, const void *, const void *) = dlsym(RTLD_DEFAULT, "swift_getTypeByMangledNameInContext");
+        char *l = strdup(getenv("REBAR_TEST_MANGLED")), *sp = NULL;
+        for (char *t = strtok_r(l, ",", &sp); t && gt; t = strtok_r(NULL, ",", &sp)) { ensure_host_protocols(t, strlen(t)); fprintf(stderr, "[mangled test] %s -> %p (after %s)\n", t, gt(t, strlen(t), NULL, NULL), img->path ? img->path : "?"); }
+        free(l);
+    }
 }
 
 // The properties a category declares are told to the runtime too: CALayer (QuartzCore) answers +resolveInstanceMethod: for a @dynamic property of the layer by looking the property up with class_getProperty,

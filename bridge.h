@@ -1369,10 +1369,16 @@ H(h_swift_dynamicCast) {
     if (c->x[2] == any_md && c->x[1]) {
         uint64_t *w = (uint64_t *)c->x[1];
         if (tr) fprintf(stderr, "[dynamicCast of Any: src=%llx type word=%llx target=%llx flags=%llx lr=%llx]\n", (unsigned long long)c->x[1], (unsigned long long)w[3], (unsigned long long)c->x[3], (unsigned long long)c->x[4], (unsigned long long)c->x[30]);
-        if (w[3] < 0x1000 && !off) { c->x[0] = 0; return; }
+        if (w[3] < 0x1000 && !off) { if (getenv("REBAR_TRACE_CASTFAIL")) fprintf(stderr, "[cast guard] Any with type word %llx: words %llx %llx %llx %llx %llx, target %llx, from %llx\n", (unsigned long long)w[3], (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)c->x[3], (unsigned long long)c->x[30]); c->x[0] = 0; return; }
     }
     bool (*f)(void *, void *, const void *, const void *, uint64_t) = (bool (*)(void *, void *, const void *, const void *, uint64_t))dlsym(RTLD_DEFAULT, "swift_dynamicCast");
+    uint64_t cs[5] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4]}, clr = c->x[30];
     c->x[0] = f((void *)c->x[0], (void *)c->x[1], (const void *)c->x[2], (const void *)c->x[3], c->x[4]) ? 1 : 0;
+    { static int tf = -1; if (tf < 0) tf = getenv("REBAR_TRACE_CASTFAIL") != NULL;   // REBAR_TRACE_CASTFAIL=1: the type names of every swift_dynamicCast that said no
+      if (tf && !c->x[0] && cs[2] == any_md && cs[1] && ((uint64_t *)cs[1])[3] > 0x10000) { typedef struct { const char *p; uintptr_t n; } TNP; static TNP (*g2)(const void *, bool); if (!g2) g2 = (TNP (*)(const void *, bool))dlsym(RTLD_DEFAULT, "swift_getTypeName"); if (g2 && cs[3] > 0x10000) { TNP a = g2((const void *)((uint64_t *)cs[1])[3], true), b = g2((const void *)cs[3], true); fprintf(stderr, "[cast failed] dynamic type %.*s (%llx)  ->  %.*s  from %llx\n", (int)(a.n > 200 ? 200 : a.n), a.p ? a.p : "", (unsigned long long)((uint64_t *)cs[1])[3], (int)(b.n > 200 ? 200 : b.n), b.p ? b.p : "", (unsigned long long)clr); } }
+      if (tf && !c->x[0]) { typedef struct { const char *p; uintptr_t n; } TNP; static TNP (*gtn)(const void *, bool); if (!gtn) gtn = (TNP (*)(const void *, bool))dlsym(RTLD_DEFAULT, "swift_getTypeName");
+        if (!(cs[2] > 0x10000 && cs[3] > 0x10000)) fprintf(stderr, "[cast failed] raw: dest %llx src %llx srctype %llx desttype %llx flags %llx from %llx\n", (unsigned long long)cs[0], (unsigned long long)cs[1], (unsigned long long)cs[2], (unsigned long long)cs[3], (unsigned long long)cs[4], (unsigned long long)clr);
+        if (gtn && cs[2] > 0x10000 && cs[3] > 0x10000) { TNP a = gtn((const void *)cs[2], true), b = gtn((const void *)cs[3], true); fprintf(stderr, "[cast failed] %.*s  ->  %.*s  (flags %llx, from %llx)\n", (int)(a.n > 200 ? 200 : a.n), a.p ? a.p : "", (int)(b.n > 200 ? 200 : b.n), b.p ? b.p : "", (unsigned long long)cs[4], (unsigned long long)clr); } } }
 }
 H(h_asl_log)  { VA_INIT(ap, c->sp); int (*f)(void *, void *, int, const char *, va_list) = dlsym(RTLD_DEFAULT, "asl_vlog"); c->x[0] = f ? (uint64_t)(int64_t)f((void *)c->x[0], (void *)c->x[1], (int)c->x[2], S(3), ap) : 0; }
 static void exec_list(CPU *c, bool search, bool with_env) {   // execl / execlp / execle: arg0 in x1, the rest of the list on the stack, up to a NULL (and then the environment for execle)
@@ -1896,6 +1902,7 @@ static void deliver_mach_exception(CPU *c, int sig, uint64_t addr) {
     req.task.name = mach_task_self(); req.task.disposition = MACH_MSG_TYPE_COPY_SEND; req.task.type = MACH_MSG_PORT_DESCRIPTOR;
     req.ndr = NDR_record; req.exception = 1; req.codeCnt = 2; req.code[0] = 1; req.code[1] = (int64_t)addr;   // EXC_BAD_ACCESS, KERN_INVALID_ADDRESS, the address
     if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[mach exception: EXC_BAD_ACCESS at %llx, pc %llx, to port %u]\n", (unsigned long long)addr, (unsigned long long)c->pc, g_mach_exc_port);
+    { static int nbt; if (getenv("REBAR_TRACE_SIGNALS") && getenv("REBAR_TRACE_MACHEXC_BT") && nbt++ < 8) { fprintf(stderr, "  x0-x30:"); for (int k = 0; k < 31; k++) fprintf(stderr, " %llx", (unsigned long long)c->x[k]); fprintf(stderr, " sp %llx\n", (unsigned long long)c->sp); dump_backtrace(c); } }
     int slot = -1; pthread_mutex_lock(&g_mach_fmu);
     for (int k = 0; k < 32; k++) if (!g_mach_faulting[k].cpu) { slot = k; g_mach_faulting[k].port = me; g_mach_faulting[k].cpu = c; g_mach_faulting[k].far = addr; break; }
     pthread_mutex_unlock(&g_mach_fmu);
