@@ -1861,6 +1861,28 @@ static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
 // Gemini); libobjc then walks off the end of the chain (AutoreleasePoolPage::releaseUntil) and faults at address 0. Instead of dying, the fault is answered by unwinding the host stack
 // out of objc_autoreleasePoolPop and continuing in its caller as if the pop had returned: the pool's objects leak. Experimental and OFF by default: REBAR_POOL_GUARD=1 turns it on (the resumed job runner then returns to a bad address; the frame layout at the resume point is not understood).
 #include <libunwind.h>
+// An extra inhabitant of a pointer (the "none" of an Optional<Optional<AnyHashable>>, say) is written by arm64 code as index, by the host's x86_64 runtime as index << 1 (bit 0 is reserved for Objective-C
+// tagged pointers). A host value witness that destroys such a value reads the guest's 1 as a live metadata pointer and faults at 1 - 8 = 0xfffffffffffffff9 (Xcode's SwiftUI canvas, IDECanvasUI,
+// destroying a (AnyHashable?, AnyHashable) tuple; Logic Pro's Jet). Destroying an extra inhabitant is nothing to do, so the fault is answered by unwinding out of the destroy witness (a host function
+// whose name ends in "wxx") and continuing in its caller as if it had returned. REBAR_NO_XI_GUARD=1 turns it off. Copies and assignments of such values still fault.
+static bool unwind_out_of_xi_destroy(ucontext_t *uc) {
+    unw_context_t ctx; unw_cursor_t cur; memset(&ctx, 0, sizeof ctx); memcpy(&ctx, &uc->uc_mcontext->__ss, sizeof(uc->uc_mcontext->__ss));
+    if (unw_init_local(&cur, &ctx) != 0) return false;
+    bool found = false;
+    for (int guard = 0; guard < 8; guard++) {
+        char nm[256] = ""; unw_word_t off;
+        if (unw_get_proc_name(&cur, nm, sizeof nm, &off) == 0) { size_t n = strlen(nm); if (n > 3 && !strcmp(nm + n - 3, "wxx")) { found = true; break; } }
+        if (unw_step(&cur) <= 0) return false;
+    }
+    if (!found || unw_step(&cur) <= 0) return false;   // (the frame of the destroy witness, then its caller)
+    unw_word_t ip, sp, bp, bx, r12, r13, r14, r15;
+    unw_get_reg(&cur, UNW_REG_IP, &ip); unw_get_reg(&cur, UNW_REG_SP, &sp); unw_get_reg(&cur, UNW_X86_64_RBP, &bp); unw_get_reg(&cur, UNW_X86_64_RBX, &bx);
+    unw_get_reg(&cur, UNW_X86_64_R12, &r12); unw_get_reg(&cur, UNW_X86_64_R13, &r13); unw_get_reg(&cur, UNW_X86_64_R14, &r14); unw_get_reg(&cur, UNW_X86_64_R15, &r15);
+    _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
+    ss->__rip = ip; ss->__rsp = sp; ss->__rbp = bp; ss->__rbx = bx; ss->__r12 = r12; ss->__r13 = r13; ss->__r14 = r14; ss->__r15 = r15; ss->__rax = 0;
+    static int n; if (n++ < 3 && getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[destroy of a guest extra inhabitant skipped, continuing at %llx]\n", (unsigned long long)ip);
+    return true;
+}
 static bool unwind_out_of_pool_pop(ucontext_t *uc) {
     Dl_info di; if (!dladdr((void *)uc->uc_mcontext->__ss.__rip, &di) || !di.dli_fname || !strstr(di.dli_fname, "libobjc")) return false;   // (a fault inside libobjc; the stack must show a pool pop)
     unw_context_t ctx; unw_cursor_t cur; memset(&ctx, 0, sizeof ctx); memcpy(&ctx, &uc->uc_mcontext->__ss, sizeof(uc->uc_mcontext->__ss));   // (x86_64 libunwind's context starts with the same register block as the signal's thread state: the unwind begins at the faulting frame, with its registers)
@@ -1921,6 +1943,7 @@ static bool jit_recover_state(ucontext_t *uc, const JReg *jb, uint64_t *ea) {
 }
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
+    { static int xg = -1; if (xg < 0) xg = getenv("REBAR_NO_XI_GUARD") == NULL; if (xg && sig == SIGSEGV && (uint64_t)si->si_addr >= 0xffffffffffffff00ull && unwind_out_of_xi_destroy(uc)) return; }
     { static int pg = -1; if (pg < 0) pg = getenv("REBAR_POOL_GUARD") != NULL; if (pg && sig == SIGSEGV && (uint64_t)si->si_addr == 0 && unwind_out_of_pool_pop(uc)) return; }   // (getenv is a linear scan of the environment under a lock: not on every fault)
     if (sig == SIGILL || sig == SIGTRAP || sig == SIGFPE) {  // never an instruction-fetch bridge: report without touching any state
         { const JReg *jb = g_jit_on ? jit_block_of(uc->uc_mcontext->__ss.__rip) : NULL; if (jb) { char bb[160]; int nn = snprintf(bb, sizeof bb, "rebar: trap in translated code of the block at guest pc 0x%llx (%u instructions)\n", (unsigned long long)jb->pc, jb->n); write(2, bb, nn); } }
