@@ -19,3 +19,7 @@ This produces `./rebar`.
 ```sh
 ./rebar path/to/arm64/binary [args...]
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
