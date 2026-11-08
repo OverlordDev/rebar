@@ -2034,6 +2034,39 @@ static bool jit_recover_state(ucontext_t *uc, const JReg *jb, uint64_t *ea) {
     { uint64_t a = host_reg_of(r, hit->base) + (uint64_t)(int64_t)hit->disp; if (hit->idx >= 0) a += host_reg_of(r, hit->idx) << hit->scale; *ea = a; }   // (the address the access used: a general protection fault, as for a non-canonical address, reports none)
     return true;
 }
+// The same mismatch in guest code (Device Hub's DeviceKit: an outlined copy of a struct with an Optional<existential> field): a field written by the host's runtime as the extra inhabitant
+// 2 (= index 1 << 1) is read by arm64 code that expects 0 for "no existential": `cbz x24, empty; ...; mov x8, x24; ldr x16, [x8, #-8]!` loads the value witness table through 2 - 8 and faults at
+// 0xfffffffffffffffa. Such a value is empty: the guest continues where the cbz would have gone had the word been zero. Found by decoding the faulting `ldr x16, [xN, #-8]!`, the `mov xN, xM` before
+// it and the `cbz xM` before that (all within a few instructions); xM must hold a small number (1..0x1000, a host-encoded extra inhabitant). REBAR_NO_XI_GUARD=1 turns it off.
+static bool guest_xi_cbz_recover(CPU *c, uint64_t ea) {
+    if (ea < 0xffffffffffffff00ull || !c) return false;
+    const uint32_t *pc = (const uint32_t *)c->pc; uint32_t i = pc[0];
+    if ((i & 0xffe00c1f) != 0xf8400c10 || ((i >> 12) & 0x1ff) != 0x1f8) return false;   // ldr x16, [xN, #-8]!
+    int n = (i >> 5) & 31, m = n, mov_at = 0;
+    if (n == 17 && (pc[-1] & 0xffe0ffff) == 0xaa0003f1 && (pc[-2] & 0xffc003e0) == 0xf9400000 && ((pc[-2] >> 10) & 0xfff) == 3 && (int)(pc[-2] & 31) == (int)((pc[-1] >> 16) & 31)) {
+        // a frameless destroy of an existential (outlined `ldr x1, [x0, #0x18]; mov x17, x1; ldr x16, [x17, #-8]!` that begins the function: the instruction before it ends the previous function):
+        // an empty existential has nothing to destroy: return to the caller
+        uint32_t pv = pc[-3];
+        if ((pv == 0xd65f0fff || pv == 0xd65f03c0 || (pv & 0xfc000000) == 0x14000000) && c->x[(pc[-1] >> 16) & 31] != 0 && c->x[(pc[-1] >> 16) & 31] <= 0x1000) {
+            static int cnt; if (cnt++ < 3 && getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[destroy of an existential holding the extra inhabitant %llx skipped]\n", (unsigned long long)c->x[(pc[-1] >> 16) & 31]);
+            c->pc = c->x[30]; return true;
+        }
+    }
+    for (int k = 1; k <= 4; k++) { uint32_t j = pc[-k]; if ((j & 0xffe0ffe0) == 0xaa0003e0 && (int)(j & 31) == n) { m = (j >> 16) & 31; mov_at = k; break; } }
+    if (m == 31) return false;
+    for (int k = mov_at + 1; k <= mov_at + 10; k++) {
+        uint32_t j = pc[-k];
+        if ((j & 0xff000000) == 0xb4000000 && (int)(j & 31) == m) {   // cbz xM, target
+            uint64_t v = c->x[m]; if (v == 0 || v > 0x1000) return false;
+            int64_t off = (int64_t)(int32_t)((j >> 5) & 0x7ffff); if (off & 0x40000) off -= 0x80000;
+            c->pc = (uint64_t)(pc - k) + off * 4;
+            static int cnt; if (cnt++ < 3 && getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[an existential holding the extra inhabitant %llx taken as empty, continuing at %llx]\n", (unsigned long long)v, (unsigned long long)c->pc);
+            return true;
+        }
+        if ((j & 0xff000000) == 0xb5000000 || (j & 0xfc000000) == 0x14000000 || (j & 0xfffffc1f) == 0xd65f0000) return false;   // a cbnz, a branch or a return: not the straight-line shape
+    }
+    return false;
+}
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
     { static int xg = -1; if (xg < 0) xg = getenv("REBAR_NO_XI_GUARD") == NULL; if (xg && sig == SIGSEGV && (uint64_t)si->si_addr >= 0xffffffffffffff00ull && (skip_vwt_call_on_xi(uc) || unwind_out_of_xi_destroy(uc))) return; }
@@ -2110,6 +2143,8 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
     }
     bool jit_exact = false; uint64_t jit_ea = 0;   // a fault in a block that is not precise: rebuild the guest state from the access record, if there is one
     if (g_jit_on && t_cpu && t_fault_jb && (sig == SIGSEGV || sig == SIGBUS) && (uint64_t)si->si_addr != rip) { const JReg *jb0 = jit_block_of(rip); if (jb0 && !jb0->precise) jit_exact = jit_recover_state(uc, jb0, &jit_ea); }
+    { static int xg2 = -1; if (xg2 < 0) xg2 = getenv("REBAR_NO_XI_GUARD") == NULL;
+      if (xg2 && t_cpu && t_fault_jb && sig == SIGSEGV && (uint64_t)si->si_addr != rip - 0 && guest_xi_cbz_recover(t_cpu, (jit_exact && !si->si_addr) ? jit_ea : (uint64_t)si->si_addr)) _longjmp(*t_fault_jb, 1); }
     if (jit_exact && t_cpu && t_fault_jb && (sig == SIGSEGV || sig == SIGBUS) && (jit_ea >> 56) && !(jit_ea >> 63 && (jit_ea >> 56) == 0xff) && !getenv("REBAR_NO_TBI")) {   // a tag in the top byte of the address (arm64 ignores it): the interpreter makes this access, masked
         static uint64_t n; if (getenv("REBAR_TRACE_TBI") && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 50) { char bb[120]; int nn = snprintf(bb, sizeof bb, "[tbi] guest pc %llx address %llx\n", (unsigned long long)t_cpu->pc, (unsigned long long)jit_ea); write(2, bb, nn); }
         t_tbi_step = 1;

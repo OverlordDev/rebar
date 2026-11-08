@@ -7,6 +7,7 @@
 
 #define _XOPEN_SOURCE 600
 #define _DARWIN_C_SOURCE
+#include <execinfo.h>
 #include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -276,6 +277,10 @@ static void watch_mem_check(CPU *c) {
     fprintf(stderr, "[wmem %llx] %llx -> %llx by pc %llx:", (unsigned long long)g_wmem, (unsigned long long)g_wmem_last, (unsigned long long)v, (unsigned long long)c->pc);
     for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)c->x[k]);
     fprintf(stderr, "\n");
+    if (getenv("REBAR_WATCH_VAL") && v == strtoull(getenv("REBAR_WATCH_VAL"), 0, 16)) {   // REBAR_WATCH_VAL=<hex>: the host backtrace when the word becomes that value (a host function wrote it)
+        void *bt[40]; int n = backtrace(bt, 40);
+        fprintf(stderr, "[wmem-bt]\n"); backtrace_symbols_fd(bt, n, 2);
+    }
     g_wmem_last = v;
 }
 
@@ -1192,7 +1197,6 @@ static bool scan_load(const char *path) {
     }
     fprintf(stderr, "%s: no __TEXT,__text\n", path); return false;
 }
-#include <execinfo.h>
 // The host's terminate handler prints the name of the uncaught exception's type, and a guest typeinfo keeps the arm64 "non-unique" tag in bit 63 of its name pointer (see
 // unwind_setup_image): clear the tag of that one type before the handler reads it.
 static void (*g_orig_terminate)(void);
