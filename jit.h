@@ -557,10 +557,10 @@ static bool g_fl_retdead = true;   // REBAR_JIT_NOFLRETDEAD=1: a RET / BR / BLR 
 // The arm64 procedure call standard does not hand NZCV across a return or a call: a function that returns after it has restored its frame (a load into x30, as LDP x29, x30, [sp], #n) returns
 // no flags, and neither does a tail call or an indirect call.  What does hand flags back are the compiler's outlined leaf functions (`cmp x10, #0x3f; ret`: no frame, x30 untouched), which
 // stay "live".  Before this, a `cmp` in a function's body kept all four flags stored for the exit through the epilogue's RET.
+// A frame restore: `ldp x29, x30, [sp, ...]` (a function's own epilogue).  A lone `ldr x30, [sp], #16` is NOT one: an outlined function that makes a call saves and restores only x30 and can still
+// hand flags back (`cmp w0, #1; ldr x30, [sp], #16; ret`: Logic Pro's Optional<URL> comparison read stale flags when this counted as a frame restore).
 static bool fl_loads_x30(uint32_t i) {
-    if (((i >> 22) & 1) && !((i >> 26) & 1) && ((i >> 27) & 7) == 5 && ((i >> 30) & 3) == 2) return (i & 31) == 30 || ((i >> 10) & 31) == 30;   // LDP X (not the non-temporal form's missing index: harmless)
-    if ((i & 0xffc00000) == 0xf9400000) return (i & 31) == 30;                                                                                     // LDR X, [Xn, #imm]
-    if ((i & 0xffe00000) == 0xf8400000 && (i & 0x400)) return (i & 31) == 30;                                                                      // LDR X post / pre index
+    if (((i >> 22) & 1) && !((i >> 26) & 1) && ((i >> 27) & 7) == 5 && ((i >> 30) & 3) == 2) return (i & 31) == 29 && ((i >> 10) & 31) == 30;   // LDP X29, X30
     return false;
 }
 static bool fl_dead_from_x(uint64_t pc, int *budget, bool fr) {   // true when the flags are overwritten (or irrelevant) on every path from the instruction at pc

@@ -597,6 +597,36 @@ H(h_dlsym) {
     c->x[0] = a;
 }
 
+// CFBundleGetFunctionPointerForName(bundle, name) / CFBundleGetDataPointerForName: the host's CFBundle looks into the executable it never loaded (an arm64 file) and finds nothing, the answer was 0
+// for every name (Logic Pro's audio engine asks MADSP's bundle for its entry points). The executable goes through the guest loader (as dlopen does) and the export is looked up there.
+static bool bundle_export_lookup(CPU *c, uint64_t *out) {
+    if (getenv("REBAR_NO_CFBUNDLE_SYM")) return false;
+    void *b = P(0), *nm = P(1); if (!b || !nm) return false;
+    void *(*cu)(void *) = HOSTFN("CFBundleCopyExecutableURL");
+    bool (*fsr)(void *, bool, uint8_t *, long) = HOSTFN("CFURLGetFileSystemRepresentation");
+    bool (*gcs)(void *, char *, long, uint32_t) = HOSTFN("CFStringGetCString");
+    void (*rel)(void *) = HOSTFN("CFRelease");
+    if (!cu || !fsr || !gcs || !rel) return false;
+    void *u = cu(b); if (!u) return false;
+    char path[PATH_MAX], real[PATH_MAX], name[512] = "_";
+    bool ok = fsr(u, true, (uint8_t *)path, sizeof path); rel(u);
+    if (!ok || !realpath(path, real) || !gcs(nm, name + 1, sizeof name - 1, 0x08000100)) return false;   // (kCFStringEncodingUTF8)
+    GImage *img = find_image(real);
+    if (!img) {   // (only an executable of the guest's kind)
+        bool arm = false; int fd = open(real, O_RDONLY);
+        if (fd >= 0) { size_t l = (size_t)lseek(fd, 0, SEEK_END); const uint8_t *f = mmap(NULL, l, PROT_READ, MAP_PRIVATE, fd, 0); if (f != MAP_FAILED) { arm = arm64_slice_or_null(f, l) != NULL; munmap((void *)f, l); } close(fd); }
+        if (!arm) return false;
+        int first = g_nimages; img = load_image(real, NULL, false);
+        if (img) { start_images(c, first); if (g_nbundle < 256) { g_bundle_img[g_nbundle] = img; g_bundle_path[g_nbundle] = strdup(real); g_nbundle++; } }
+    }
+    if (!img) return false;
+    *out = image_export_lookup(img, name);
+    if (getenv("REBAR_TRACE_DLSYM")) fprintf(stderr, "[CFBundle symbol %s in %s -> %llx]\n", name, real, (unsigned long long)*out);
+    return true;
+}
+H(h_CFBundleGetFunctionPointerForName) { uint64_t a; if (bundle_export_lookup(c, &a)) { c->x[0] = a; return; } host_call(c, HOSTFN("CFBundleGetFunctionPointerForName"), false); }
+H(h_CFBundleGetDataPointerForName)     { uint64_t a; if (bundle_export_lookup(c, &a)) { c->x[0] = a; return; } host_call(c, HOSTFN("CFBundleGetDataPointerForName"), false); }
+
 H(h_dlclose) { c->x[0] = 0; }
 
 H(h_dladdr) {

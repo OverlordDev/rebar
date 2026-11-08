@@ -1326,6 +1326,29 @@ XML_VFWD(h_xmlw_fmt_dtd_element, "xmlTextWriterWriteVFormatDTDElement", 3)
 XML_VFWD(h_xmlw_fmt_dtd_attlist, "xmlTextWriterWriteVFormatDTDAttlist", 3)
 XML_VFWD(h_xmlw_fmt_dtd_entity, "xmlTextWriterWriteVFormatDTDInternalEntity", 4)
 H(h_xmlStrPrintf) { VA_INIT(ap, c->sp); int (*f)(void *, int, const void *, va_list) = HOSTFN("xmlStrVPrintf"); RET(f(P(0), (int)c->x[1], P(2), ap)); }
+// sqlite3_mprintf / sqlite3_snprintf / sqlite3_str_appendf: the variadic arguments are on the arm64 stack (Logic Pro's Alchemy preset database faulted in the host's formatter)
+H(h_sqlite3_mprintf)    { VA_INIT(ap, c->sp); char *(*f)(const char *, va_list) = HOSTFN("sqlite3_vmprintf"); c->x[0] = (uint64_t)f(S(0), ap); }
+H(h_sqlite3_snprintf)   { VA_INIT(ap, c->sp); char *(*f)(int, char *, const char *, va_list) = HOSTFN("sqlite3_vsnprintf"); c->x[0] = (uint64_t)f((int)c->x[0], P(1), S(2), ap); }
+H(h_sqlite3_str_appendf){ VA_INIT(ap, c->sp); void (*f)(void *, const char *, va_list) = HOSTFN("sqlite3_str_vappendf"); f(P(0), S(1), ap); }
+// CFCalendarDecomposeAbsoluteTime(cal, at, desc, ...) / CFCalendarComposeAbsoluteTime(cal, &at, desc, ...) / CFCalendarAddComponents(cal, &at, options, desc, ...): one variadic argument
+// per letter of the descriptor, in the arm64 stack slots (Logic Pro's audio unit support formats dates with them; the host read its out-pointers from registers that held other things).
+typedef bool (*CalVarFn)(void *, ...);
+static void calendar_var(CPU *c, int mode) {
+    const char *desc = S(mode == 2 ? 3 : 2 - (mode == 0 ? 1 : 0));   // Decompose: desc in x1; Compose: x2; Add: x3
+    const uint64_t *st = (const uint64_t *)c->sp; uint64_t v[8] = {0};
+    size_t n = desc ? strlen(desc) : 0; if (n > 8) n = 8;
+    for (size_t k = 0; k < n; k++) v[k] = st[k];
+    const char *names[3] = {"CFCalendarDecomposeAbsoluteTime", "CFCalendarComposeAbsoluteTime", "CFCalendarAddComponents"};
+    void *f = HOSTFN(names[mode]); if (!f) { c->x[0] = 0; return; }
+    bool r;
+    if (mode == 0) r = ((bool (*)(void *, double, const char *, ...))f)(P(0), c->vr[0].d[0], desc, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    else if (mode == 1) r = ((bool (*)(void *, void *, const char *, ...))f)(P(0), P(1), desc, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    else r = ((bool (*)(void *, void *, uint64_t, const char *, ...))f)(P(0), P(1), c->x[2], desc, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    c->x[0] = r;
+}
+H(h_CFCalendarDecomposeAbsoluteTime) { calendar_var(c, 0); }
+H(h_CFCalendarComposeAbsoluteTime)   { calendar_var(c, 1); }
+H(h_CFCalendarAddComponents)         { calendar_var(c, 2); }
 H(h_execl)   { exec_list(c, false, false); }
 H(h_execlp)  { exec_list(c, true, false); }
 H(h_execle)  { exec_list(c, false, true); }
@@ -1343,6 +1366,7 @@ static int qsort_cb(void *t, const void *a, const void *b) {
 }
 H(h_qsort)   { CbCtx x = {c, c->x[3], 0, false}; qsort_r(P(0), c->x[1], c->x[2], &x, qsort_cb); }
 H(h_qsort_r) { CbCtx x = {c, c->x[4], c->x[3], true}; qsort_r(P(0), c->x[1], c->x[2], &x, qsort_cb); }
+static void h_system_error_ctor(CPU *c);
 H(h_bsearch) {
     uint64_t key = c->x[0], base = c->x[1], n = c->x[2], w = c->x[3], fn = c->x[4];
     uint64_t lo = 0, hi = n;
@@ -1561,6 +1585,7 @@ H(h_Unwind_GetCFA); H(h_Unwind_SetGR); H(h_Unwind_SetIP); H(h_Unwind_GetIP); H(h
 H(h_objc_getProtocol); H(h_NSProtocolFromString); H(h_objc_alloc_init); H(h_objc_alloc); H(h_objc_opt_new); H(h_objc_allocWithZone);
 H(h_vfork); H(h_objc_claimAutoreleasedReturnValue); H(h_objc_autoreleaseReturnValue); H(h_objc_retainAutoreleasedReturnValue); H(h_objc_unsafeClaimAutoreleasedReturnValue); H(h_uname); H(h_thread_get_state); H(h_thread_set_state); H(h_thread_resume); H(h_posix_spawnattr_setbinpref_np); H(h_SSLSetIOFuncs); H(h_SecItemAdd); H(h_SecItemCopyMatching); H(h_SecItemUpdate); H(h_SecItemDelete); H(h_CGGetActiveDisplayList); H(h_CVDisplayLinkCreateWithActiveCGDisplays); H(h_CGDisplayIsActive); H(h_unw_getcontext); H(h_unw_init_local); H(h_unw_step); H(h_unw_get_reg); H(h_unw_set_reg); H(h_unw_get_fpreg); H(h_unw_set_fpreg); H(h_unw_is_signal_frame);
 H(h_abort_report); H(h_JRSFontGetBoundingBoxesForGlyphsAndStyle);
+H(h_CFBundleGetFunctionPointerForName); H(h_CFBundleGetDataPointerForName);
 H(h_dlopen); H(h_dlsym); H(h_dlclose); H(h_dladdr); H(h_dlerror);
 H(h_dyld_image_count); H(h_dyld_get_image_name); H(h_dyld_get_image_header);
 H(h_dyld_get_image_vmaddr_slide); H(h_dyld_register_func_for_add_image);
@@ -1622,6 +1647,7 @@ static const Special k_special[] = {
     {"_vfork", h_vfork}, {"_objc_claimAutoreleasedReturnValue", h_objc_claimAutoreleasedReturnValue}, {"_objc_autoreleaseReturnValue", h_objc_autoreleaseReturnValue}, {"_objc_retainAutoreleasedReturnValue", h_objc_retainAutoreleasedReturnValue}, {"_objc_unsafeClaimAutoreleasedReturnValue", h_objc_unsafeClaimAutoreleasedReturnValue}, {"_uname", h_uname}, {"_thread_get_state", h_thread_get_state}, {"_thread_set_state", h_thread_set_state}, {"_thread_resume", h_thread_resume}, {"_posix_spawnattr_setbinpref_np", h_posix_spawnattr_setbinpref_np}, {"_SSLSetIOFuncs", h_SSLSetIOFuncs}, {"_SecItemAdd", h_SecItemAdd}, {"_SecItemCopyMatching", h_SecItemCopyMatching}, {"_SecItemUpdate", h_SecItemUpdate}, {"_SecItemDelete", h_SecItemDelete}, {"_CGGetActiveDisplayList", h_CGGetActiveDisplayList}, {"_CVDisplayLinkCreateWithActiveCGDisplays", h_CVDisplayLinkCreateWithActiveCGDisplays}, {"_CGDisplayIsActive", h_CGDisplayIsActive}, {"_unw_getcontext", h_unw_getcontext}, {"_unw_init_local", h_unw_init_local}, {"_unw_step", h_unw_step}, {"_unw_get_reg", h_unw_get_reg}, {"_unw_set_reg", h_unw_set_reg}, {"_unw_get_fpreg", h_unw_get_fpreg}, {"_unw_set_fpreg", h_unw_set_fpreg}, {"_unw_is_signal_frame", h_unw_is_signal_frame}, {"_objc_getProtocol", h_objc_getProtocol}, {"_objc_alloc_init", h_objc_alloc_init}, {"_UIApplicationMain", h_UIApplicationMain}, {"_objc_alloc", h_objc_alloc}, {"_objc_opt_new", h_objc_opt_new}, {"_objc_allocWithZone", h_objc_allocWithZone}, {"_NSProtocolFromString", h_NSProtocolFromString}, {"_open", h_open}, {"_openat", h_openat}, {"_fcntl", h_fcntl}, {"_ioctl", h_ioctl}, {"_semctl", h_semctl}, {"_shm_open", h_shm_open}, {"_sem_open", h_sem_open}, {"_syslog", h_syslog}, {"_vsyslog", h_vsyslog}, {"_asl_log", h_asl_log}, {"_swift_allocObject", h_swift_allocObject}, {"_$ss15__VaListBuilderC7va_lists03CVaB7PointerVyF", h_VaListBuilder_va_list}, {"_syslog$DARWIN_EXTSN", h_syslog}, {"_execl", h_execl}, {"_xmlTextWriterWriteFormatString", h_xmlw_fmt_string}, {"_xmlTextWriterWriteFormatRaw", h_xmlw_fmt_raw}, {"_xmlTextWriterWriteFormatComment", h_xmlw_fmt_comment}, {"_xmlTextWriterWriteFormatCDATA", h_xmlw_fmt_cdata}, {"_xmlTextWriterWriteFormatElement", h_xmlw_fmt_element}, {"_xmlTextWriterWriteFormatAttribute", h_xmlw_fmt_attribute}, {"_xmlTextWriterWriteFormatPI", h_xmlw_fmt_pi}, {"_xmlTextWriterWriteFormatElementNS", h_xmlw_fmt_element_ns}, {"_xmlTextWriterWriteFormatAttributeNS", h_xmlw_fmt_attribute_ns}, {"_xmlTextWriterWriteFormatDTD", h_xmlw_fmt_dtd}, {"_xmlTextWriterWriteFormatDTDElement", h_xmlw_fmt_dtd_element}, {"_xmlTextWriterWriteFormatDTDAttlist", h_xmlw_fmt_dtd_attlist}, {"_xmlTextWriterWriteFormatDTDInternalEntity", h_xmlw_fmt_dtd_entity}, {"_xmlStrPrintf", h_xmlStrPrintf}, {"_curl_easy_setopt", h_curl_easy_setopt}, {"_curl_easy_getinfo", h_curl_easy_getinfo}, {"_curl_multi_setopt", h_curl_multi_setopt}, {"_curl_share_setopt", h_curl_share_setopt}, {"_sqlite3_db_config", h_sqlite3_db_config}, {"_sqlite3_config", h_sqlite3_config}, {"_execlp", h_execlp}, {"_execle", h_execle},
     {"_open$NOCANCEL", h_open}, {"_openat$NOCANCEL", h_openat}, {"_fcntl$NOCANCEL", h_fcntl},   // (the mode / argument of these variadic functions is on the stack on arm64, not in x2 / x3: Bun, Zig and Rust call the $NOCANCEL forms directly)
     {"_exit", h_exit}, {"_atexit", h_atexit}, {"___cxa_atexit", h_cxa_atexit}, {"___cxa_finalize", h_nop},
+    {"__ZNSt3__112system_errorC2ENS_10error_codeERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE", h_system_error_ctor}, {"__ZNSt3__112system_errorC1ENS_10error_codeERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE", h_system_error_ctor},
     {"_qsort", h_qsort}, {"_qsort_r", h_qsort_r}, {"_bsearch", h_bsearch}, {"__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv", h_dir_deref}, {"__ZNKSt3__14__fs10filesystem28recursive_directory_iterator13__dereferenceEv", h_rdir_deref}, {"_tsearch", h_tsearch}, {"_tfind", h_tfind}, {"_tdelete", h_tdelete}, {"_twalk", h_twalk}, {"_lfind", h_lfind}, {"_lsearch", h_lsearch},
     {"_setjmp", h_setjmp}, {"__setjmp", h_setjmp}, {"_sigsetjmp", h_setjmp},
     {"_longjmp", h_longjmp}, {"__longjmp", h_longjmp}, {"_siglongjmp", h_longjmp},
@@ -1640,6 +1666,9 @@ static const Special k_special[] = {
     {"_NSLog", h_NSLog}, {"_NSLogv", h_NSLogv},
     {"_CFStringCreateWithFormat", h_CFStringCreateWithFormat},
     {"_CFStringCreateWithFormatAndArguments", h_CFStringCreateWithFormatAndArguments},
+    {"_CFBundleGetFunctionPointerForName", h_CFBundleGetFunctionPointerForName}, {"_CFBundleGetDataPointerForName", h_CFBundleGetDataPointerForName},
+    {"_sqlite3_mprintf", h_sqlite3_mprintf}, {"_sqlite3_snprintf", h_sqlite3_snprintf}, {"_sqlite3_str_appendf", h_sqlite3_str_appendf},
+    {"_CFCalendarDecomposeAbsoluteTime", h_CFCalendarDecomposeAbsoluteTime}, {"_CFCalendarComposeAbsoluteTime", h_CFCalendarComposeAbsoluteTime}, {"_CFCalendarAddComponents", h_CFCalendarAddComponents},
     {"_CFStringAppendFormat", h_CFStringAppendFormat}, {"_CFStringAppendFormatAndArguments", h_CFStringAppendFormatAndArguments},
     {NULL, NULL},
 };
@@ -2116,6 +2145,19 @@ static void str_to_guest(uint8_t *g, const uint8_t *d) {
         o[23] = (uint8_t)n;
         memcpy(g, o, 24);
     }
+}
+
+// std::system_error(error_code, const std::string &what): the host's constructor builds the message by calling ec.category().message(value), a virtual of a category the guest defined
+// (AppleMediaServicesKit has its own); that virtual returns a std::string through a hidden pointer (x86: rdi, arm64: x8), so the host call arrived in the guest with x0 = 0 and faulted.
+// The exception is built with the host's system_category (the same value, so what() has a sensible text) and the guest's category pointer is stored afterwards.
+static void h_system_error_ctor(CPU *c) {
+    uint8_t *self = P(0); uint8_t tmp[24];
+    str_to_host(tmp, (const uint8_t *)c->x[3]);
+    void (*ctor)(void *, long, const void *, const void *) = HOSTFN("_ZNSt3__112system_errorC2ENS_10error_codeERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE");
+    const void *(*sysc)(void) = HOSTFN("_ZNSt3__115system_categoryEv");
+    ctor(self, (long)(int)c->x[1], sysc(), tmp);
+    *(uint64_t *)(self + 24) = c->x[2];
+    c->x[0] = c->x[0];
 }
 
 // std::filesystem::path::begin() / end() / iterator::__increment() / __decrement(). A path::iterator is 56 bytes: the current element as a path (a std::string, in the host's layout
@@ -2833,7 +2875,7 @@ static void stub_call_inner(CPU *c) {
             fn_returns_string = di.dli_sname && host_fn_returns_string(di.dli_sname);
             // a Swift closure or witness called by the guest (Combine's promise handed to Future's closure, a SwiftUI body): it takes its context in r13, a thrown error comes back in r12.
             // Its symbol is a mangled Swift name, or none at all (the dyld cache has no local symbols for the thunks)
-            fn_swift = !di.dli_sname || di.dli_sname[0] == '$' || (di.dli_sname[0] == '_' && di.dli_sname[1] == '$') || (di.dli_fname && strstr(di.dli_fname, "libswift")) || !strncmp(di.dli_sname, "swift_", 6) || !strncmp(di.dli_sname, "_ZN5swift", 9);   // (the runtime's completion and resume functions take the error in the swiftself register)
+            fn_swift = !di.dli_sname || (di.dli_saddr != (void *)fn && getenv("REBAR_NO_LOCAL_SWIFT_CC") == NULL) || di.dli_sname[0] == '$' || (di.dli_sname[0] == '_' && di.dli_sname[1] == '$') || (di.dli_fname && strstr(di.dli_fname, "libswift")) || !strncmp(di.dli_sname, "swift_", 6) || !strncmp(di.dli_sname, "_ZN5swift", 9);   // (the runtime's completion and resume functions take the error in the swiftself register)
             fn_enc = host_fn_enc(di.dli_sname);
             if (g_trace_stubs) fprintf(stderr, "[host fn by pointer] %p %s\n", fn, di.dli_sname ? di.dli_sname : "?");
             t_hostfn_cache[hci].fn = c->pc; t_hostfn_cache[hci].returns_string = fn_returns_string; t_hostfn_cache[hci].enc = fn_enc; t_hostfn_cache[hci].swift = fn_swift;
@@ -2859,7 +2901,11 @@ static void stub_call_inner(CPU *c) {
             else if (zc) c->x[0] = (uint64_t)zc->real;
         }
         t_swift = fn_swift && !getenv("REBAR_NO_SWIFT_PTR_CC");
+        static const char *trace_hf; static int trace_hf_init; if (!trace_hf_init) { trace_hf_init = 1; trace_hf = getenv("REBAR_TRACE_HOSTFN"); }   // REBAR_TRACE_HOSTFN=substring: arguments, the first 16 bytes at x0 before and after, and the result of host functions called by pointer
+        Dl_info tdi; bool tr = trace_hf && dladdr(fn, &tdi) && tdi.dli_sname && strstr(tdi.dli_sname, trace_hf);
+        uint64_t ta[4] = {c->x[0], c->x[1], c->x[2], c->x[3]}; uint64_t tb[2] = {0, 0}; if (tr && ta[0] > 0x10000) memcpy(tb, (void *)ta[0], 16);
         host_call(c, fn, false);
+        if (tr) { uint64_t tc[2] = {0, 0}; if (ta[0] > 0x10000) memcpy(tc, (void *)ta[0], 16); fprintf(stderr, "[hostfn %s] x0=%llx x1=%llx x2=%llx x3=%llx swift=%d before {%llx %llx} after {%llx %llx} -> x0=%llx\n", tdi.dli_sname, (unsigned long long)ta[0], (unsigned long long)ta[1], (unsigned long long)ta[2], (unsigned long long)ta[3], (int)t_swift, (unsigned long long)tb[0], (unsigned long long)tb[1], (unsigned long long)tc[0], (unsigned long long)tc[1], (unsigned long long)c->x[0]); }
         apply_landing(c);
         return;
     }
