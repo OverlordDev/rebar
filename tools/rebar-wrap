@@ -7,6 +7,7 @@ The kernel runs the x86_64 slice, which replaces itself with `rebar <that same f
 
     rebar-wrap enable  <App.app|folder> ...   wrap the arm64-only apps (a folder: every .app directly inside it)
     rebar-wrap disable <App.app|folder> ...   put the original executable back
+    rebar-wrap seal    <App.app|folder> ...   sign the bundle of wrapped apps (enable does it for downloaded ones: Gatekeeper calls a downloaded app with a stale seal damaged)
     rebar-wrap status  [<App.app|folder> ...] what is arm64-only / wrapped (default: the folders of `auto`)
     rebar-wrap auto                           enable for the watched folders (what the agent runs)
     rebar-wrap agent install | uninstall      a LaunchAgent that runs `auto` whenever a watched folder changes
@@ -102,13 +103,49 @@ def setup():
         f.write(rebar_binary() + "\n")
 
 
+def quarantined(app):
+    return "com.apple.quarantine" in (run(["xattr", app]).stdout or "")
+
+
+def _resources_hash(app):
+    try:
+        with open(os.path.join(app, "Contents", "_CodeSignature", "CodeResources"), "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def seal_bundle(app):
+    """Sign the whole bundle ad hoc (not its nested code: that keeps its own signature). A downloaded app (quarantine attribute) is checked by Gatekeeper as a bundle on its first
+    start and a main executable that no longer matches the bundle's seal makes it "damaged"; with a valid seal it is an app of an unidentified developer, which the user can allow
+    in System Settings > Privacy & Security. The original seal (_CodeSignature) is kept for disable."""
+    exe = main_executable(app)
+    keep = os.path.join(STORE, store_name(exe))
+    os.makedirs(keep, exist_ok=True)
+    sig = os.path.join(app, "Contents", "_CodeSignature")
+    saved, marker = os.path.join(keep, "_CodeSignature"), os.path.join(keep, "sealed")
+    try:
+        ours = open(marker).read().strip()
+    except OSError:
+        ours = ""
+    if os.path.isdir(sig) and (not ours or ours != _resources_hash(app)):   # (not made by us: the app's own seal, the one to keep)
+        shutil.rmtree(saved, ignore_errors=True)
+        shutil.copytree(sig, saved, symlinks=True)
+    r = run(["codesign", "--force", "-s", "-", app])
+    if r.returncode:
+        return "codesign failed: " + r.stderr.strip()
+    with open(marker, "w") as f:
+        f.write(_resources_hash(app) + "\n")
+    return "bundle signed"
+
+
 def enable(app, quiet=False):
     app = app.rstrip("/")
     exe = main_executable(app)
     if not exe or not os.path.isfile(exe):
         return "no main executable"
     if is_wrapped(exe):
-        return "already wrapped"
+        return "already wrapped" + (", " + seal_bundle(app) if quarantined(app) and run(["codesign", "--verify", app]).returncode != 0 else "")
     if not arm64_only(exe):
         return "not arm64-only (runs natively)"
     shim = build_shim()
@@ -134,6 +171,8 @@ def enable(app, quiet=False):
         os.remove(tmp)
         return "codesign failed: " + r.stderr.strip()
     os.replace(tmp, exe)
+    if quarantined(app):
+        return "wrapped, " + seal_bundle(app)
     return "wrapped"
 
 
@@ -144,10 +183,16 @@ def disable(app):
         return "no main executable"
     if not is_wrapped(exe):
         return "not wrapped"
-    orig = os.path.join(STORE, store_name(exe), "original")
+    keep = os.path.join(STORE, store_name(exe))
+    orig = os.path.join(keep, "original")
     if os.path.exists(orig):
         shutil.copy2(orig, exe + ".rebar-wrap")
         os.replace(exe + ".rebar-wrap", exe)
+        saved, sig = os.path.join(keep, "_CodeSignature"), os.path.join(app, "Contents", "_CodeSignature")
+        if os.path.exists(os.path.join(keep, "sealed")) and os.path.isdir(saved):   # (the bundle was sealed by us: the app's own seal goes back as well)
+            shutil.rmtree(sig, ignore_errors=True)
+            shutil.copytree(saved, sig, symlinks=True)
+            os.remove(os.path.join(keep, "sealed"))
         return "restored from the saved original"
     tmp = exe + ".rebar-wrap"
     r = run(["lipo", "-thin", "arm64", exe, "-output", tmp])   # (no saved original: the arm64 slice is the app)
@@ -220,6 +265,13 @@ def main():
                 if cmd == "enable" and exe and os.path.isfile(exe) and not arm64_only(exe) and not is_wrapped(exe):
                     continue   # (a folder: say nothing about the apps that run natively)
                 print("%s: %s" % (os.path.basename(app), fn(app)))
+        return
+    if cmd == "seal":   # (sign the bundle of wrapped apps: what enable does for a downloaded app)
+        for arg in rest:
+            for app in apps_in(arg):
+                exe = main_executable(app)
+                if exe and os.path.isfile(exe) and is_wrapped(exe):
+                    print("%s: %s" % (os.path.basename(app), seal_bundle(app)))
         return
     if cmd == "status":
         cmd_status(rest); return
