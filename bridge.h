@@ -535,9 +535,11 @@ static int fpos_callback_kind(uint64_t ra) {   // 1: seekoff, 2: seekpos, 0: nei
 
 static __thread bool t_forking; static __thread pid_t t_fork_ppid;   // inside fork() on this thread (set by rebar.c's atfork_prepare): in the child, guest code can run before rebar's own atfork handler (see fork_child_reinit)
 static void fork_child_reinit(void);
+static int g_tp; static uint64_t fp_now(void); static void tp_entry_note(uint64_t target, uint64_t ns);   // (frameprof.h)
 void rebar_bridge_enter(uint64_t *f) {
     if (__builtin_expect(t_forking, 0) && getpid() != t_fork_ppid) fork_child_reinit();   // the child of a guest fork(): libSystem's atfork handlers (xpc) release objects whose dealloc is guest code, before our handler has reset the locks the forking thread held
     if (((uintptr_t)f & 15) != 0 && getenv("REBAR_CHECK_ALIGN")) fprintf(stderr, "[align] guest entry with a misaligned host stack: frame %p target %llx caller-return %llx\n", (void *)f, (unsigned long long)f[14], (unsigned long long)((uint64_t *)f[15])[-1]);
+    uint64_t tp_t0 = g_tp ? fp_now() : 0;
     CPU *c = cur_cpu();
     CPU saved = *c;
     int sigent = t_sig_entry; t_sig_entry = 0;
@@ -580,6 +582,7 @@ void rebar_bridge_enter(uint64_t *f) {
     t_act = act.prev;
     *c = saved;
     if (held) gil_acquire(); else if (t_have_gil) gil_release();  // an exception that arrived from the host may have taken the lock
+    if (tp_t0) tp_entry_note(f[14], fp_now() - tp_t0);
 }
 
 static struct { uint64_t fn, arg; } g_atexit[256];

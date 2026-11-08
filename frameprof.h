@@ -13,6 +13,9 @@
 // <prefix>.<pid>.csv gets one row per frame (appended once a second: nothing is lost), <prefix>.<pid>.txt is rewritten once a second: fps and frame time percentiles of the last 10 s and of
 // the whole run, where an average frame goes, and what the slow frames (> 1.5x the median or > 50 ms) were limited by: the GPU, a drawable wait, busy CPU, or none (threads idle:
 // serialisation, latency).
+// REBAR_TIMEPROF=<prefix>: the same files, plus what any program needs (no frames required): per import and per Objective-C selector the calls and total time over all threads, the host -> guest
+// entries by target (calls and time, nested time included), and the main thread's event loop: every turn between two nextEventMatchingMask: calls is the time the app was busy with an event, so
+// the "hangs" (turns over 100 ms) are listed with what the main thread did in them (host calls, plain waits, guest code) and the single longest call.
 // Cost: two clock reads per import call on every thread, a few per frame; REBAR_FRAMEPROF_GPU=1 adds a completion handler to every command buffer.
 #include <time.h>
 static int g_fp;                       // 1 when the frame profiler is on
@@ -23,7 +26,8 @@ typedef struct { uint64_t t_ns; uint32_t interval_us, drawable_us, cpu_us, host_
 static FpRec *g_fp_ring;               // ring of frames; the writer thread drains it once a second
 static uint64_t g_fp_nframes, g_fp_ncommit, g_fp_start_ns, g_fp_last_present, g_fp_last_commit, g_fp_last_cpu;   // (atomic where threads share them)
 static uint64_t g_fp_host_ns, g_fp_wait_ns, g_fp_draw_ns, g_fp_gpu_ns, g_fp_gpu_cbs, g_fp_gpu_zero;
-static __thread int t_fp_depth;
+static __thread int t_fp_depth, t_fp_gpu_busy;
+static __thread uint64_t t_tp_nested;   // ns of the imports finished inside the import that is running
 static uint8_t *g_fp_kind;             // per import: 0 unknown, 1 other, 2 plain wait
 static SEL s_fp_next, s_fp_pdraw, s_fp_pdraw_at, s_fp_pdraw_after, s_fp_present, s_fp_present_at, s_fp_present_after, s_fp_commit, s_fp_addcomp, s_fp_gs, s_fp_ge;
 static void *fp_msg(void) { static void *p; if (!p) p = dlsym(RTLD_DEFAULT, "objc_msgSend"); return p; }
@@ -40,6 +44,28 @@ static int fp_stub_kind(uint64_t idx) {
     g_fp_kind[idx] = k;
     return k;
 }
+// ---- REBAR_TIMEPROF
+static int g_tp;                       // 1 when the time profiler is on (g_fp is on too)
+typedef struct { uint64_t key, calls, ns; const char *name; } TpRow;
+#define TP_SLOTS 16384
+static TpRow g_tp_sel[TP_SLOTS], g_tp_ent[TP_SLOTS];
+static uint64_t g_tp_imp_calls[65536], g_tp_imp_ns[65536];
+static SEL s_tp_nextevent;
+static __thread int t_tp_main;         // 0 unknown, 1 main thread, 2 another thread
+// the main thread's event loop (only the main thread touches these; the writer thread reads them without a lock: a diagnostic)
+static uint64_t m_wake, m_last_ret, m_host, m_wait, m_max_ns, m_turns, m_busy_ns, m_idle_ns, m_over50, m_over100, m_over500, m_longest;
+static const char *m_max_name;
+typedef struct { uint64_t t_ns, turn_ns, host_ns, wait_ns, max_ns; const char *max_name; } TpHang;
+static TpHang g_tp_hang[16];
+static void tp_add(TpRow *tab, uint64_t key, uint64_t ns, const char *name) {
+    uint64_t h = (key * 0x9e3779b97f4a7c15ull) >> 50;
+    for (int k = 0; k < 64; k++) {
+        TpRow *r = &tab[(h + k) & (TP_SLOTS - 1)]; uint64_t cur = __atomic_load_n(&r->key, __ATOMIC_ACQUIRE);
+        if (!cur) { uint64_t z = 0; if (__atomic_compare_exchange_n(&r->key, &z, key, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { r->name = name; cur = key; } else cur = z; }
+        if (cur == key) { __atomic_fetch_add(&r->calls, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&r->ns, ns, __ATOMIC_RELAXED); return; }
+    }
+}
+static void tp_entry_note(uint64_t target, uint64_t ns) { tp_add(g_tp_ent, target, ns, NULL); }
 static void fp_frame(void) {   // a present, from any thread: close the frame
     uint64_t now = fp_now(), prev = __atomic_exchange_n(&g_fp_last_present, now, __ATOMIC_ACQ_REL);
     if (!prev) { g_fp_last_cpu = fp_proc_cpu(); g_fp_last_commit = __atomic_load_n(&g_fp_ncommit, __ATOMIC_RELAXED); return; }
@@ -80,6 +106,49 @@ static void fp_summary(FILE *f, const char *title, const FpRec *r, size_t n) {
     fprintf(f, "  slow frames (> 1.5 x median or > 50 ms): %zu = GPU-bound (GPU busy >= 80 %%) %zu, blocked in nextDrawable (>= 50 %%) %zu, CPU-heavy (>= 3 cores) %zu, neither (idle threads: serialisation / latency) %zu\n", ns, ng, nd, nc, ni);
     free(iv);
 }
+static int fp_row_cmp(const void *a, const void *b) { uint64_t x = ((const TpRow *)a)->ns, y = ((const TpRow *)b)->ns; return x < y ? 1 : x > y ? -1 : 0; }
+static void fp_tp_report(FILE *f, uint64_t tnow) {
+    uint64_t wall = tnow ? tnow : 1;
+    fprintf(f, "\n--- time profile (the whole run so far, %.0f s) ---\n", wall / 1e9);
+    if (m_turns) {
+        fprintf(f, "main thread run loop: %llu turns; busy %.1f s (%.0f %% of the run), asleep %.1f s; turns over 50 ms %llu, over 100 ms %llu, over 500 ms %llu; longest turn %.0f ms\n",
+                (unsigned long long)m_turns, m_busy_ns / 1e9, 100.0 * m_busy_ns / wall, m_idle_ns / 1e9, (unsigned long long)m_over50, (unsigned long long)m_over100, (unsigned long long)m_over500, m_longest / 1e6);
+        fprintf(f, "worst main-thread hangs (t s: turn ms | in host calls, in plain waits, guest code | longest single call):\n");
+        TpHang h[16]; memcpy(h, g_tp_hang, sizeof h);
+        for (int i = 0; i < 16; i++) for (int j = i + 1; j < 16; j++) if (h[j].turn_ns > h[i].turn_ns) { TpHang t = h[i]; h[i] = h[j]; h[j] = t; }
+        for (int i = 0; i < 10 && h[i].turn_ns; i++) {
+            double host = h[i].host_ns / 1e6, wait = h[i].wait_ns / 1e6, turn = h[i].turn_ns / 1e6;
+            fprintf(f, "  %8.1f: %8.1f | %8.1f %8.1f %8.1f | %s %.1f ms\n", h[i].t_ns / 1e9, turn, host - wait, wait, turn > host ? turn - host : 0, h[i].max_name ? h[i].max_name : "-", h[i].max_ns / 1e6);
+        }
+    } else fprintf(f, "main thread run loop: no turns seen (not a Cocoa / CoreFoundation program, or it has not reached its run loop yet)\n");
+    static TpRow rows[TP_SLOTS]; int n;
+    // imports (all threads), plain waits listed apart
+    n = 0; uint64_t wait_total = 0, busy_total = 0;
+    for (int i = 2; i < g_nstubs && i < 65536; i++) if (g_tp_imp_calls[i]) {
+        rows[n].key = i; rows[n].calls = g_tp_imp_calls[i]; rows[n].ns = g_tp_imp_ns[i]; rows[n].name = g_stubs[i].name;
+        if (fp_stub_kind(i) == 2) wait_total += rows[n].ns; else busy_total += rows[n].ns; n++;
+    }
+    qsort(rows, n, sizeof rows[0], fp_row_cmp);
+    fprintf(f, "imports (calls from the guest into the host), all threads, thread-seconds in the call: %.1f s in calls that work, %.1f s in plain waits\n", busy_total / 1e9, wait_total / 1e9);
+    fprintf(f, "  %10s %10s %9s  name\n", "calls", "total ms", "avg us");
+    int shown = 0; for (int i = 0; i < n && shown < 14; i++) { if (fp_stub_kind(rows[i].key) == 2) continue; shown++; fprintf(f, "  %10llu %10.0f %9.1f  %s\n", (unsigned long long)rows[i].calls, rows[i].ns / 1e6, rows[i].ns / 1e3 / rows[i].calls, rows[i].name); }
+    shown = 0; fprintf(f, "  plain waits:\n"); for (int i = 0; i < n && shown < 5; i++) { if (fp_stub_kind(rows[i].key) != 2) continue; shown++; fprintf(f, "  %10llu %10.0f %9.1f  %s\n", (unsigned long long)rows[i].calls, rows[i].ns / 1e6, rows[i].ns / 1e3 / rows[i].calls, rows[i].name); }
+    // Objective-C messages
+    n = 0; for (int i = 0; i < TP_SLOTS; i++) if (g_tp_sel[i].key) rows[n++] = g_tp_sel[i];
+    qsort(rows, n, sizeof rows[0], fp_row_cmp);
+    fprintf(f, "Objective-C messages by selector (time inside the send, everything the callee does included), all threads:\n");
+    for (int i = 0; i < n && i < 14; i++) fprintf(f, "  %10llu %10.0f %9.1f  %s\n", (unsigned long long)rows[i].calls, rows[i].ns / 1e6, rows[i].ns / 1e3 / rows[i].calls, rows[i].name);
+    // host -> guest entries
+    n = 0; uint64_t ec = 0, en = 0; for (int i = 0; i < TP_SLOTS; i++) if (g_tp_ent[i].key) { rows[n++] = g_tp_ent[i]; ec += g_tp_ent[i].calls; en += g_tp_ent[i].ns; }
+    qsort(rows, n, sizeof rows[0], fp_row_cmp);
+    fprintf(f, "host -> guest entries (the host calls a guest function: callbacks, blocks, methods): %llu calls, %.1f s (nested time included, so the rows overlap); by target:\n", (unsigned long long)ec, en / 1e9);
+    for (int i = 0; i < n && i < 12; i++) {
+        GImage *im = image_by_addr(rows[i].key); const char *nm = im ? strrchr(im->path, '/') : NULL;
+        fprintf(f, "  %10llu %10.0f %9.1f  %s+0x%llx\n", (unsigned long long)rows[i].calls, rows[i].ns / 1e6, rows[i].ns / 1e3 / rows[i].calls, im ? (nm ? nm + 1 : im->path) : "?", (unsigned long long)(im ? rows[i].key - im->base : rows[i].key));
+    }
+}
+static int g_tp_obs;
+static void tp_install_observer(void);
 static void *fp_writer(void *arg) {
     (void)arg;
     char csv[PATH_MAX], txt[PATH_MAX], tmp[PATH_MAX];
@@ -88,6 +157,7 @@ static void *fp_writer(void *arg) {
     uint64_t done = 0; FpRec *all = NULL; size_t nall = 0, capall = 0;
     for (;;) {
         sleep(1);
+        if (g_tp && !g_tp_obs) tp_install_observer();
         uint64_t n = __atomic_load_n(&g_fp_nframes, __ATOMIC_ACQUIRE);
         if (n - done > FP_RING) done = n - FP_RING;   // (the writer fell behind by more than the ring: only then frames are lost)
         for (; done < n; done++) {
@@ -109,9 +179,39 @@ static void *fp_writer(void *arg) {
             fprintf(f, "worst frames (t s: interval | drawable cpu host wait gpu, ms):\n");
             for (int q = 0; q < m; q++) { const FpRec *r = &all[idx[q]]; fprintf(f, "  %7.2f: %7.1f | %6.1f %7.1f %6.1f %7.1f %6.1f\n", r->t_ns / 1e9, r->interval_us / 1e3, r->drawable_us / 1e3, r->cpu_us / 1e3, r->host_us / 1e3, r->wait_us / 1e3, r->gpu_us / 1e3); }
         }
+        if (g_tp) fp_tp_report(f, tnow);
         fclose(f); rename(tmp, txt);
     }
     return NULL;
+}
+// The main run loop: a turn is the time between waking up and going back to sleep (CFRunLoopObserver on the main run loop, called on the main thread by the host itself, so it sees every Cocoa
+// program whether the guest calls nextEvent or not).
+static void tp_runloop_cb(void *obs, unsigned long activity, void *info) {
+    (void)obs; (void)info; uint64_t now = fp_now();
+    { static int n; if (getenv("REBAR_TIMEPROF_DEBUG") && n++ < 6) fprintf(stderr, "rebar: run loop activity %lu\n", activity); }
+    if (activity == 64) {   // kCFRunLoopAfterWaiting: awake, a turn starts
+        if (m_last_ret) m_idle_ns += now - m_last_ret;
+        m_wake = now; m_host = m_wait = m_max_ns = 0; m_max_name = NULL;
+    } else if (activity == 32 && m_wake) {   // kCFRunLoopBeforeWaiting: the turn is over
+        uint64_t turn = now - m_wake; m_turns++; m_busy_ns += turn; m_last_ret = now;
+        m_over50 += turn > 50000000ull; m_over100 += turn > 100000000ull; m_over500 += turn > 500000000ull; if (turn > m_longest) m_longest = turn;
+        if (turn > 100000000ull) {
+            int lo = 0; for (int k = 1; k < 16; k++) if (g_tp_hang[k].turn_ns < g_tp_hang[lo].turn_ns) lo = k;
+            if (turn > g_tp_hang[lo].turn_ns) g_tp_hang[lo] = (TpHang){now - g_fp_start_ns, turn, m_host, m_wait, m_max_ns, m_max_name};
+        }
+        m_wake = 0;
+    }
+}
+static void tp_install_observer(void) {
+    if (g_tp_obs) return;
+    void *(*create)(void *, unsigned long, bool, long, void (*)(void *, unsigned long, void *), void *) = dlsym(RTLD_DEFAULT, "CFRunLoopObserverCreate");
+    void *(*getmain)(void) = dlsym(RTLD_DEFAULT, "CFRunLoopGetMain");
+    void (*add)(void *, void *, void *) = dlsym(RTLD_DEFAULT, "CFRunLoopAddObserver");
+    void **common = dlsym(RTLD_DEFAULT, "kCFRunLoopCommonModes");
+    if (!create || !getmain || !add || !common) return;   // (CoreFoundation is not loaded yet: the writer thread tries again every second)
+    void *o = create(NULL, 32 | 64, true, 0, tp_runloop_cb, NULL);
+    if (o) { add(getmain(), o, *common); g_tp_obs = 1; }
+    if (getenv("REBAR_TIMEPROF_DEBUG")) fprintf(stderr, "rebar: time profiler: run loop observer %p on %p\n", o, getmain());
 }
 static void frameprof_start(const char *prefix) {
     g_fp_prefix = (!prefix || !strcmp(prefix, "1")) ? "/tmp/rebar_frames" : strdup(prefix);
@@ -121,9 +221,12 @@ static void frameprof_start(const char *prefix) {
     FPSEL(s_fp_next, "nextDrawable"); FPSEL(s_fp_pdraw, "presentDrawable:"); FPSEL(s_fp_pdraw_at, "presentDrawable:atTime:"); FPSEL(s_fp_pdraw_after, "presentDrawable:afterMinimumDuration:");
     FPSEL(s_fp_present, "present"); FPSEL(s_fp_present_at, "presentAtTime:"); FPSEL(s_fp_present_after, "presentAfterMinimumDuration:"); FPSEL(s_fp_commit, "commit");
     FPSEL(s_fp_addcomp, "addCompletedHandler:"); FPSEL(s_fp_gs, "GPUStartTime"); FPSEL(s_fp_ge, "GPUEndTime");
+    FPSEL(s_tp_nextevent, "nextEventMatchingMask:untilDate:inMode:dequeue:");
+    g_tp = getenv("REBAR_TIMEPROF") != NULL;
+    if (g_tp) tp_install_observer();
     g_fp = 1;
     pthread_t th; pthread_create(&th, NULL, fp_writer, NULL); pthread_detach(th);
-    fprintf(stderr, "rebar: frame profiler on%s: %s.%d.txt (summary, once a second) and .csv (every frame)\n", g_fp_gpu ? " (with GPU times)" : "", g_fp_prefix, (int)getpid());
+    fprintf(stderr, "rebar: %s on%s: %s.%d.txt (summary, once a second) and .csv (every frame)\n", g_tp ? "time profiler" : "frame profiler", g_fp_gpu ? " (with GPU times)" : "", g_fp_prefix, (int)getpid());
 }
 // A command buffer finished on the GPU: its busy time goes into the frame that is open now.
 static void fp_cb_done(id cb) {
@@ -132,29 +235,49 @@ static void fp_cb_done(id cb) {
     if (e > s && s > 0) __atomic_fetch_add(&g_fp_gpu_ns, (uint64_t)((e - s) * 1e9), __ATOMIC_RELAXED); else __atomic_fetch_add(&g_fp_gpu_zero, 1, __ATOMIC_RELAXED);
 }
 static void stub_call_plain(CPU *c);
+static void tp_turn_begin(uint64_t now) {   // the main thread asks for the next event: the time since the last one was handed out is the app being busy
+    if (m_last_ret) {
+        uint64_t turn = now - m_last_ret; m_turns++; m_busy_ns += turn;
+        m_over50 += turn > 50000000ull; m_over100 += turn > 100000000ull; m_over500 += turn > 500000000ull; if (turn > m_longest) m_longest = turn;
+        if (turn > 100000000ull) {
+            int lo = 0; for (int k = 1; k < 16; k++) if (g_tp_hang[k].turn_ns < g_tp_hang[lo].turn_ns) lo = k;
+            if (turn > g_tp_hang[lo].turn_ns) g_tp_hang[lo] = (TpHang){now - g_fp_start_ns, turn, m_host, m_wait, m_max_ns, m_max_name};
+        }
+    }
+    m_host = m_wait = m_max_ns = 0; m_max_name = NULL;
+}
 // Called instead of the plain stub_call while the profiler is on.
 static void fp_stub_call(CPU *c) {
     uint64_t off = c->pc - g_stub_base, idx = off / 16;
     bool valid = off < g_stub_size && idx < (uint64_t)g_nstubs;
-    bool is_next = false;
+    bool is_next = false; SEL sel = NULL;
     if (valid && g_stubs[idx].handler == h_objc_msgSend) {
-        SEL sel = (SEL)c->x[1]; id self = (id)c->x[0];
+        sel = (SEL)c->x[1]; id self = (id)c->x[0];
         if (sel == s_fp_next) is_next = true;
         else if (sel == s_fp_commit) {
             if (self && strstr(class_getName(object_getClass(self)), "CommandBuffer")) {
                 __atomic_fetch_add(&g_fp_ncommit, 1, __ATOMIC_RELAXED);
-                if (g_fp_gpu && !t_fp_depth) { t_fp_depth++; ((void (*)(id, SEL, void *))fp_msg())(self, s_fp_addcomp, (void *)^(id cb) { fp_cb_done(cb); }); t_fp_depth--; }
+                if (g_fp_gpu && !t_fp_gpu_busy) { t_fp_gpu_busy = 1; ((void (*)(id, SEL, void *))fp_msg())(self, s_fp_addcomp, (void *)^(id cb) { fp_cb_done(cb); }); t_fp_gpu_busy = 0; }
             }
         }
         else if (sel == s_fp_pdraw || sel == s_fp_pdraw_at || sel == s_fp_pdraw_after) { if (self) fp_frame(); }
         else if ((sel == s_fp_present || sel == s_fp_present_at || sel == s_fp_present_after) && self && strstr(class_getName(object_getClass(self)), "Drawable")) fp_frame();
     }
-    if (t_fp_depth) { stub_call_plain(c); return; }
     int kind = valid ? fp_stub_kind(idx) : 1;
+    // Imports nest (the host calls back into the guest, e.g. NSApplicationMain runs the whole program inside one import): each import is charged only its own time, what the imports called inside it took is taken out.
+    uint64_t outer = t_tp_nested; t_tp_nested = 0;
     uint64_t a = fp_now();
     t_fp_depth++; stub_call_plain(c); t_fp_depth--;
-    uint64_t d = fp_now() - a;
-    __atomic_fetch_add(&g_fp_host_ns, d, __ATOMIC_RELAXED);
-    if (kind == 2) __atomic_fetch_add(&g_fp_wait_ns, d, __ATOMIC_RELAXED);
-    if (is_next) __atomic_fetch_add(&g_fp_draw_ns, d, __ATOMIC_RELAXED);
+    uint64_t d = fp_now() - a, own = d > t_tp_nested ? d - t_tp_nested : 0;
+    t_tp_nested = outer + d;
+    __atomic_fetch_add(&g_fp_host_ns, own, __ATOMIC_RELAXED);
+    if (kind == 2) __atomic_fetch_add(&g_fp_wait_ns, own, __ATOMIC_RELAXED);
+    if (is_next) __atomic_fetch_add(&g_fp_draw_ns, own, __ATOMIC_RELAXED);
+    if (g_tp && valid) {
+        __atomic_fetch_add(&g_tp_imp_calls[idx], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_tp_imp_ns[idx], own, __ATOMIC_RELAXED);
+        const char *nm = g_stubs[idx].name;
+        if (sel) { nm = sel_getName(sel); tp_add(g_tp_sel, (uint64_t)sel, own, nm); }
+        if (!t_tp_main) t_tp_main = pthread_main_np() ? 1 : 2;
+        if (t_tp_main == 1) { m_host += own; if (kind == 2) m_wait += own; if (own > m_max_ns) { m_max_ns = own; m_max_name = nm; } }
+    }
 }
