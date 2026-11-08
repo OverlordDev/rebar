@@ -204,7 +204,8 @@ static bool decode_bitmask(int N, int imms, int immr, int sf, uint64_t *out) {
 
 static void do_syscall(CPU *c) {
     uint64_t n = c->x[16];
-    uint64_t a0 = c->x[0], a1 = c->x[1], a2 = c->x[2];
+    uint64_t a0 = c->x[0], a1 = c->x[1], a2 = c->x[2], a3 = c->x[3], a4 = c->x[4], a5 = c->x[5];
+    if (n == 0) { n = a0; a0 = a1; a1 = a2; a2 = a3; a3 = a4; a4 = a5; a5 = c->x[6]; }   // syscall(number, args...): the number is the first argument
     int64_t ret = 0;
     errno = 0;
     switch (n) {
@@ -215,9 +216,12 @@ static void do_syscall(CPU *c) {
     case 6:  ret = close((int)a0); break;
     case 20: ret = getpid(); break;
     case 24: ret = getuid(); break;
+    // plain system calls whose arguments are the same on both architectures (numbers and structure layouts of macOS are shared): apps' jailbreak / debugger checks make them with svc directly
+    case 33: case 39: case 25: case 43: case 47: case 58: case 190: case 189: case 338: case 339: case 340: case 336: case 337: case 199: case 202: case 274: case 294:
+        ret = (int64_t)syscall((int)n, a0, a1, a2, a3, a4, a5); break;
     default:
-        fprintf(stderr, "rebar: unimplemented syscall %llu at pc 0x%llx\n",
-                (unsigned long long)n, (unsigned long long)c->pc);
+        fprintf(stderr, "rebar: unimplemented syscall %llu at pc 0x%llx (x0 %llx x1 %llx x2 %llx x3 %llx)\n",
+                (unsigned long long)n, (unsigned long long)c->pc, (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);
         exit(127);
     }
     if (ret == -1 && errno) { c->x[0] = errno; c->c = true; }

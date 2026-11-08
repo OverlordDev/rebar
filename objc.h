@@ -1385,6 +1385,7 @@ static void register_class(GClass *c) {
     register_class_now(c);
 }
 static void register_class_now(GClass *c) {
+    { static int tr = -1; if (tr < 0) tr = getenv("REBAR_TRACE_REGCLASS") != NULL; if (tr) fprintf(stderr, "[regclass] %p %s super %llx data %llx\n", (void *)c, (const char *)class_ro(c)->name, (unsigned long long)c->superclass, (unsigned long long)c->data); }   // (a fault inside objc_readClassPair: the last line names the class)
     Class r = p_readClassPair((Class)c, g_imageinfo);
     if (r != (Class)c) {
         // A class whose superclass is a weak import that this macOS lacks (a view class of a newer system, say) is dropped by the runtime: it does not exist
@@ -1425,6 +1426,24 @@ static uint64_t g_guest_protos[65536]; static int g_nguest_protos;
 static uint64_t guest_protocol_named(const char *name) {
     for (int k = 0; k < g_nguest_protos; k++) { const char *n = *(const char **)(g_guest_protos[k] + 8); if (n && !strcmp(n, name)) return g_guest_protos[k]; }
     return 0;
+}
+// The host's Swift runtime resolves a mangled name such as `So27TTKECPDPDataServiceProtocol_p` (an Objective-C protocol used as a type) by asking the Objective-C runtime for that protocol
+// by name. The protocols of the guest's images are not in the host's runtime, so the lookup failed and the runtime built a broken existential (TikTok: swift_getTypeName faulted on it).
+// Before such a name is resolved, a plain host protocol of the same name is registered for each guest protocol it mentions. REBAR_NO_PROTO_REGISTER=1 turns it off.
+static void ensure_host_protocols(const char *m, size_t len) {
+    static int off = -1; if (off < 0) off = getenv("REBAR_NO_PROTO_REGISTER") != NULL;
+    if (off || !m || !g_nguest_protos) return;
+    static Protocol *(*gp)(const char *); static Protocol *(*ap)(const char *); static void (*rp)(Protocol *);
+    if (!gp) { gp = dlsym(RTLD_DEFAULT, "objc_getProtocol"); ap = dlsym(RTLD_DEFAULT, "objc_allocateProtocol"); rp = dlsym(RTLD_DEFAULT, "objc_registerProtocol"); }
+    if (!gp || !ap || !rp) return;
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (m[i] != 'S' || m[i + 1] != 'o' || m[i + 2] < '1' || m[i + 2] > '9') continue;
+        size_t j = i + 2, n = 0; while (j < len && m[j] >= '0' && m[j] <= '9') n = n * 10 + (size_t)(m[j++] - '0');
+        if (n == 0 || n > 200 || j + n > len) continue;
+        char nm[208]; memcpy(nm, m + j, n); nm[n] = 0;
+        if (gp(nm) || !guest_protocol_named(nm)) continue;
+        Protocol *np = ap(nm); if (np) rp(np);
+    }
 }
 H(h_objc_getProtocol) { uint64_t g = guest_protocol_named(S(0)); if (g) { c->x[0] = g; return; } host_call(c, dlsym(RTLD_DEFAULT, "objc_getProtocol"), false); }
 H(h_NSProtocolFromString) {

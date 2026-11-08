@@ -138,7 +138,7 @@ static void uframe_from_cpu(const CPU *c, UFrame *f) {
 
 typedef void (*StubHandler)(CPU *);
 typedef struct { uint8_t mask, wb, uninit, wide, iter; bool dtor, sret, sb, sretw; } StrSpec;   // iter: 1 + the argument that is a __wrap_iter<char const*> into the string (insert, erase)  // which argument registers hold std::string objects (see string_call)
-typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; bool ffi_abi, ffi_closure, cb9; bool strret; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
+typedef struct { char *name, *lib; void *host; StubHandler handler; bool sret; const char *enc; char narrow; const char *stk; StrSpec *str; bool maps, thisret, swift, throwing, async_host; uint8_t heapret, pathmask, txn_mask; bool ffi_abi, ffi_closure, cb9; bool strret; uint8_t xi_state, mangled_pre; } Stub;  // maps: (task, *address, size, ...) creates memory the guest owns
 static __thread Stub *t_last_stub;   // the import this thread called last, for the crash report
 static __thread uint64_t t_last_lr;  // and where it was called from
 
@@ -1263,7 +1263,15 @@ H(h_clear_cache) { jit_invalidate(c->x[0], c->x[1]); }   // __clear_cache(begin,
 // suspension the target cannot be inside jit_compile / jit_invalidate when it stops.
 static CPU *mach_faulting_cpu(uint32_t port, uint64_t *far);
 H(h_thread_suspend) {
+    if (getenv("REBAR_TRACE_SUSPEND")) fprintf(stderr, "[thread_suspend] target %x, this thread %x, from %llx\n", (unsigned)c->x[0], (unsigned)mach_thread_self(), (unsigned long long)c->x[30]);
     if (mach_faulting_cpu((uint32_t)c->x[0], NULL)) { c->x[0] = 0; return; }   // (a thread that waits for its exception reply is stopped already)
+    if ((uint32_t)c->x[0] == (uint32_t)mach_thread_self() && !getenv("REBAR_NO_SELF_SUSPEND_FIX")) {
+        // A thread that suspends itself (a crash reporter's listener thread parks itself this way: ByteDance's Heimdallr in TikTok) must not hold the bridge lock and the translator lock
+        // while it sleeps for good: every other thread would wait for them. The lock is dropped (the thread is not running guest code that could be inconsistent) and the thread suspends itself.
+        gil_release();
+        c->x[0] = (uint32_t)thread_suspend((thread_act_t)c->x[0]);
+        return;
+    }
     pthread_mutex_lock(&g_jit_mu);
     c->x[0] = (uint32_t)thread_suspend((thread_act_t)c->x[0]);
     pthread_mutex_unlock(&g_jit_mu);
@@ -2003,6 +2011,7 @@ static void dump_metadata_chain(uint64_t em, int depth) {   // debugging aid: me
         uint64_t mw[6] = {0}, vt = 0, vw[20] = {0}; mach_vm_size_t g = 0;
         if (mach_vm_read_overwrite(mach_task_self(), em, 48, (mach_vm_address_t)mw, &g) != KERN_SUCCESS) return;
         mach_vm_read_overwrite(mach_task_self(), em - 8, 8, (mach_vm_address_t)&vt, &g); mach_vm_read_overwrite(mach_task_self(), vt, 160, (mach_vm_address_t)vw, &g);
+        { typedef struct { const char *p; uintptr_t n; } TNP; static TNP (*gtn)(const void *, bool); if (!gtn) gtn = (TNP (*)(const void *, bool))dlsym(RTLD_DEFAULT, "swift_getTypeName"); if (gtn) { TNP t = gtn((const void *)em, true); fprintf(stderr, "    [type] %.*s\n", (int)(t.n > 300 ? 300 : t.n), t.p ? t.p : ""); } }
         fprintf(stderr, "    [chain %d.%d] metadata %llx kind %llx size %llu flags %llx xi %llu\n", depth, d, (unsigned long long)em, (unsigned long long)mw[0], (unsigned long long)vw[8], (unsigned long long)(vw[10] & 0xffffffff), (unsigned long long)(vw[10] >> 32));
         for (int k = 0; k < 20; k++) { if (k >= 8 && k <= 10) continue; Dl_info dv; const char *sn = (vw[k] > 0x10000 && dladdr((void *)vw[k], &dv) && dv.dli_sname) ? dv.dli_sname : "?"; fprintf(stderr, "       vw[%d] = %llx %.90s\n", k, (unsigned long long)vw[k], sn); }
         if (mw[0] == 0x202 || mw[0] == 0x201 || mw[0] == 0x200) em = mw[2]; else break;
@@ -2234,7 +2243,7 @@ static void on_segv(int sig, siginfo_t *si, void *ctx) {
       for (int k = 0; k < 14; k++) { GImage *gi = image_by_addr(hv[k]); if (gi && gi->path) fprintf(stderr, "  %s = %llx is in %s +0x%llx\n", hn[k], (unsigned long long)hv[k], gi->path, (unsigned long long)(hv[k] - gi->base)); } }
     if (t_cpu && getenv("REBAR_DUMP_REGS_MEM")) for (int k = 0; k < 3; k++) { uint64_t base = (k == 0 ? t_cpu->x[1] : k == 1 ? t_cpu->x[20] : t_cpu->x[0]); if (base > 0x10000 && base < 0x7fffffffffffull) { fprintf(stderr, "  mem at x%d=%llx:", k == 0 ? 1 : k == 1 ? 20 : 0, (unsigned long long)base); mach_vm_size_t got = 0; uint64_t w[24]; if (mach_vm_read_overwrite(mach_task_self(), base, sizeof w, (mach_vm_address_t)w, &got) == KERN_SUCCESS) for (int j = 0; j < 24; j++) fprintf(stderr, " %llx", (unsigned long long)w[j]); fprintf(stderr, "\n"); } }
     if (t_cpu) { fprintf(stderr, "  guest registers (pc %llx):", (unsigned long long)t_cpu->pc); for (int k = 0; k < 31; k++) fprintf(stderr, " x%d=%llx", k, (unsigned long long)t_cpu->x[k]); fprintf(stderr, " sp=%llx\n", (unsigned long long)t_cpu->sp); }
-    if (t_ring_n) { const RingEnt *e = &t_ring[(t_ring_n - 1) & 127]; fprintf(stderr, "  last import: %s(0x%llx, 0x%llx, 0x%llx)\n", e->name, (unsigned long long)e->x0, (unsigned long long)e->x1, (unsigned long long)e->x2); }
+    if (t_ring_n) { const RingEnt *e = &t_ring[(t_ring_n - 1) & 127]; fprintf(stderr, "  last import: %s(0x%llx, 0x%llx, 0x%llx)\n", e->name, (unsigned long long)e->x0, (unsigned long long)e->x1, (unsigned long long)e->x2); if (getenv("REBAR_DUMP_META_X0") && e->x0 > 0x10000) { if (getenv("REBAR_DUMP_META_RAW")) { uint64_t *mw = (uint64_t *)e->x0; fprintf(stderr, "  metadata words: %llx %llx %llx %llx %llx %llx\n", (unsigned long long)mw[0], (unsigned long long)mw[1], (unsigned long long)mw[2], (unsigned long long)mw[3], (unsigned long long)mw[4], (unsigned long long)mw[5]); if (mw[1] > 0x10000) { uint64_t *d = (uint64_t *)mw[1]; fprintf(stderr, "  descriptor words: %llx %llx %llx %llx\n", (unsigned long long)d[0], (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3]); } } else dump_metadata_chain(e->x0, 0); if (t_cpu) { fprintf(stderr, "  guest frame words below x29 (%llx):", (unsigned long long)t_cpu->x[29]); for (int q = 20; q >= 6; q--) fprintf(stderr, " [-%x]%llx", q * 8, (unsigned long long)((uint64_t *)t_cpu->x[29])[-q]); fprintf(stderr, "\n"); } } }   // (REBAR_DUMP_META_X0=1: the first argument of the last import as type metadata)
     if (t_cpu) {   // where the guest was: image and offset of the pc and the return address, and the frame-pointer chain
         fprintf(stderr, "  guest frames at the fault:\n"); dump_frames(t_cpu->pc, t_cpu->x[30], t_cpu->x[29]);
         for (Act *a = t_act; a && a->saved; a = a->prev) { fprintf(stderr, "  -- entered from the host --\n"); dump_frames(a->saved->pc, a->saved->x[30], a->saved->x[29]); }
@@ -2808,6 +2817,7 @@ static inline void apply_landing(CPU *c) {
 }
 
 static void stub_call_inner(CPU *c);
+static void ensure_host_protocols(const char *m, size_t len);
 static void ti_canonicalize_tree(uint64_t ti, int depth);
 static bool trace_stub_wanted(const char *name);
 // Handlers share the bridge's data and run one at a time; imports that only forward to a host function do not take the lock.
@@ -3018,6 +3028,27 @@ static void swift_string_to_native(CPU *c) {
     }
     free(buf);
 }
+// SwiftUI's State / Binding hand a generic Value across the boundary by pointer. When Value holds an Optional<any P> (or Optional<Optional<any P>>, a struct wrapping one) the "none" of an outer enum or
+// optional is an extra inhabitant of the existential's metadata word (offset 0x18): arm64 code writes and reads index i as i, the host's runtime as 2 * (i + 1) (measured: Optional<any P>.none is 0 for arm64 code and 2 for the host's State). A value the host getter wrote for the guest is converted down, a value the guest passes to the host setter up. Only a small non-zero metadata word is touched (a real metadata is a pointer).
+// REBAR_NO_XI_STATE=1 turns it off; REBAR_TRACE_XIST=1 logs each conversion.
+static bool xi_has_opt_existential(uint64_t md) {
+    for (int d = 0; d < 3 && md > 0x10000 && md < 0x7fffffffffffull; d++) {
+        uint64_t k = *(uint64_t *)md;
+        if (k == 0x303) { uint64_t vt = *(uint64_t *)(md - 8); return vt > 0x10000 && ((uint64_t *)vt)[8] == 40; }   // an opaque existential with one witness table: 5 words
+        if (k == 0x202) md = ((uint64_t *)md)[2];                  // Optional<Wrapped>
+        else if (k == 0x200 && d == 0) md = ((uint64_t *)md)[2];   // a struct generic over it (first generic argument)
+        else return false;
+    }
+    return false;
+}
+static void xi_state_convert(uint64_t buf, uint64_t md, bool to_host, const char *name) {
+    if (buf < 0x10000 || md < 0x10000 || md >= 0x7fffffffffffull || !xi_has_opt_existential(md)) return;
+    uint64_t *w = (uint64_t *)(buf + 0x18), v = *w;
+    if (to_host ? (v >= 1 && v <= 0x7ff) : (v >= 2 && v <= 0xffe && !(v & 1))) {
+        *w = to_host ? (v + 1) << 1 : (v >> 1) - 1;   // (the host's index i is the word 2 * (i + 1), arm64's is i)
+        static int n; if (getenv("REBAR_TRACE_XIST") && n++ < 20) fprintf(stderr, "[xi-state] %s %s: %llx -> %llx\n", name, to_host ? "to host" : "to guest", (unsigned long long)v, (unsigned long long)*w);
+    }
+}
 static void stub_call_inner(CPU *c) {
     { static int chk = -1; if (chk < 0) chk = getenv("REBAR_CHECK_ALIGN") != NULL; if (chk && ((uintptr_t)__builtin_frame_address(0) & 15) != 0) { static int n; if (n++ < 6) fprintf(stderr, "[align] stub_call_inner frame %p misaligned (pc %llx, lr %llx)\n", __builtin_frame_address(0), (unsigned long long)c->pc, (unsigned long long)c->x[30]); } }
     if (c->pc - g_stub_base >= g_stub_size) {  // an x86 host function reached through a pointer
@@ -3142,7 +3173,11 @@ static void stub_call_inner(CPU *c) {
         if (s->ffi_abi && (uint32_t)c->x[1] == 1) c->x[1] = 2;
         if (s->ffi_closure && c->x[0] < 128) c->x[0] = 128;
         if (s->txn_mask) for (int k = 0; k < 8; k++) if (((s->txn_mask >> k) & 1) && c->x[k] == 1) c->x[k] = 2;
+        if (__builtin_expect(s->mangled_pre, 0)) { int a = s->mangled_pre - 1; if (c->x[a] > 0x10000 && c->x[a + 1] > 0 && c->x[a + 1] < 4096) ensure_host_protocols((const char *)c->x[a], c->x[a + 1]); }
+        uint64_t xs_res = 0, xs_md = 0;
+        if (__builtin_expect(s->xi_state, 0)) { if (s->xi_state == 1) { xs_res = c->x[8]; xs_md = c->x[0]; } else xi_state_convert(c->x[0], c->x[1], true, s->name); }
         t_stk = s->stk; t_swift = s->swift; t_async_call = s->async_host && !g_no_async_tail; if (s->cb9) t_cb_stackargs++; host_call(c, s->host, s->sret); if (s->cb9) t_cb_stackargs--; t_stk = NULL;
+        if (__builtin_expect(s->xi_state == 1, 0) && !t_landed) xi_state_convert(xs_res, xs_md, false, s->name);
         if (s->maps && (uint32_t)c->x[0] == 0 && !t_landed) { own_add(*(uint64_t *)addr_ptr, size); strip_exec_region(*(uint64_t *)addr_ptr, size); }  // vm_map & co.: the guest owns what came back
     }
     else {
@@ -3401,6 +3436,10 @@ static uint64_t stub_for(const char *name, const char *lib, bool weak) {
     if (host && !h) g_stubs[idx].cb9 = lib && (strstr(lib, "libxml2") || strstr(lib, "libexpat") || strstr(lib, "libxslt"));   // these parsers call SAX / declaration handlers with nine arguments (startElementNs, expat's EntityDeclHandler): the ninth is on the arm64 callee's stack
     if (host && !h) g_stubs[idx].ffi_closure = !strcmp(name, "_ffi_closure_alloc");   // the caller sizes the closure by the arm64 ffi_closure (40 bytes); the x86_64 libffi keeps its trampoline table and entry after its own, larger fields
     if (host && !h) g_stubs[idx].ffi_abi = !strcmp(name, "_ffi_prep_cif") || !strcmp(name, "_ffi_prep_cif_var");   // an arm64 libffi caller passes FFI_DEFAULT_ABI (FFI_SYSV = 1); the host libffi is the x86_64 one, where 1 is no ABI (FFI_UNIX64 = 2 is the default)
+    if (host && !h && !strncmp(name, "_swift_getTypeByMangledName", 27)) g_stubs[idx].mangled_pre = strstr(name, "InMetadataState") ? 2 : 1;   // (the argument that holds the name: x1 after a metadata state, else x0)
+    if (host && !h && g_stubs[idx].swift && !getenv("REBAR_NO_XI_STATE") && (!strncmp(name, "_$s7SwiftUI5StateV12wrappedValuex", 33) || !strncmp(name, "_$s7SwiftUI7BindingV12wrappedValuex", 35))) {
+        size_t nl = strlen(name); if (!strcmp(name + nl - 3, "xvg")) g_stubs[idx].xi_state = 1; else if (!strcmp(name + nl - 3, "xvs")) g_stubs[idx].xi_state = 2;
+    }
     if (host && !h && g_stubs[idx].swift) { g_stubs[idx].txn_mask = transaction_arg_mask(name); if (g_stubs[idx].txn_mask && g_trace_stubs) fprintf(stderr, "[stub] %s: Transaction? arguments %02x\n", name, g_stubs[idx].txn_mask); }
     if (host && !h) g_stubs[idx].maps = !strcmp(name, "_vm_map") || !strcmp(name, "_mach_vm_map") || !strcmp(name, "_vm_remap") || !strcmp(name, "_mach_vm_remap");
     if (host && !h) {
@@ -3539,6 +3578,16 @@ static uint64_t resolve_import(GImage *img, const char *name, int ordinal, bool 
     if (lib_supported(lib)) {
         uint64_t a = host_data_addr(name);
         if (a) return a;
+    }
+    if (!weak && !strncmp(name, "_OBJC_CLASS_$_", 14) && getenv("REBAR_IOS") && !getenv("REBAR_NO_CLASS_STANDIN")) {
+        // An iOS framework that has no counterpart in Mac Catalyst (OpenGLES: EAGLContext; Google Maps' GMSIOSGLContext derives from it): the class does not exist, so a class that
+        // derives from it could not be registered (objc_readClassPair faulted on the stub that stood for its superclass). A plain NSObject subclass of that name stands in.
+        static Class (*gc)(const char *); static Class (*alloc)(Class, const char *, size_t); static void (*reg)(Class); if (!gc) { gc = dlsym(RTLD_DEFAULT, "objc_getClass"); alloc = dlsym(RTLD_DEFAULT, "objc_allocateClassPair"); reg = dlsym(RTLD_DEFAULT, "objc_registerClassPair"); }
+        const char *cn = name + 14;
+        if (gc && alloc && reg && !gc(cn)) {
+            Class no = gc("NSObject"), k = no ? alloc(no, cn, 0) : NULL;
+            if (k) { reg(k); if (getenv("REBAR_TRACE_BINDS")) fprintf(stderr, "[bind] class %s (lib %s) does not exist here: an NSObject subclass stands in\n", cn, lib ? lib : "?"); return (uint64_t)k; }
+        } else if (gc && gc(cn)) return (uint64_t)gc(cn);
     }
     if (getenv("REBAR_TRACE_BINDS") && !strncmp(name, "_OBJC_CLASS_$_", 14)) fprintf(stderr, "[bind] class %s ordinal %d lib %s supported %d -> stub\n", name, ordinal, lib ? lib : "(none)", lib ? (int)lib_supported(lib) : -1);
     return stub_for(name, lib, weak);
