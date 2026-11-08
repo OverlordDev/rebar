@@ -7,6 +7,8 @@ The kernel runs the x86_64 slice, which replaces itself with `rebar <that same f
 
     rebar-wrap enable  <App.app|folder> ...   wrap the arm64-only apps (a folder: every .app directly inside it)
     rebar-wrap disable <App.app|folder> ...   put the original executable back
+    rebar-wrap env     <App.app> [KEY=VALUE ...]  the environment a wrapped app starts with (Steam ids, REBAR_* switches); no pairs: show it
+    rebar-wrap update  <App.app|folder> ...   replace the shim of wrapped apps by the current one
     rebar-wrap seal    <App.app|folder> ...   sign the bundle of wrapped apps (enable does it for downloaded ones: Gatekeeper calls a downloaded app with a stale seal damaged)
     rebar-wrap status  [<App.app|folder> ...] what is arm64-only / wrapped (default: the folders of `auto`)
     rebar-wrap auto                           enable for the watched folders (what the agent runs)
@@ -265,6 +267,38 @@ def main():
                 if cmd == "enable" and exe and os.path.isfile(exe) and not arm64_only(exe) and not is_wrapped(exe):
                     continue   # (a folder: say nothing about the apps that run natively)
                 print("%s: %s" % (os.path.basename(app), fn(app)))
+        return
+    if cmd == "env":   # rebar-wrap env <App.app> [KEY=VALUE ...]: the environment the wrapped app starts with (no pairs: show it)
+        if not rest:
+            sys.exit("usage: rebar-wrap env <App.app> [KEY=VALUE ...]")
+        exe = main_executable(rest[0].rstrip("/"))
+        if not exe:
+            sys.exit("rebar-wrap: no such app")
+        f = os.path.join(SUPPORT, "env", os.path.basename(exe))
+        if len(rest) > 1:
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w") as o:
+                o.write("".join(x + "\n" for x in rest[1:]))
+        print(open(f).read() if os.path.exists(f) else "(none)", end="")
+        return
+    if cmd == "update":   # the shim of wrapped apps is replaced by the current one (after tools/rebar_wrap_shim.c changed)
+        shim = build_shim()
+        for arg in rest:
+            for app in apps_in(arg):
+                exe = main_executable(app)
+                if not (exe and os.path.isfile(exe) and is_wrapped(exe)):
+                    continue
+                arm, tmp, out = exe + ".rebar-arm64", exe + ".rebar-wrap", None
+                r = run(["lipo", "-thin", "arm64", exe, "-output", arm])
+                if r.returncode == 0:
+                    r = run(["lipo", "-create", "-arch", "x86_64", shim, "-arch", "arm64", arm, "-output", tmp])
+                os.path.exists(arm) and os.remove(arm)
+                if r.returncode:
+                    print("%s: lipo failed: %s" % (os.path.basename(app), r.stderr.strip())); continue
+                os.chmod(tmp, 0o755)
+                run(["codesign", "--force", "-s", "-", tmp])
+                os.replace(tmp, exe)
+                print("%s: shim updated" % os.path.basename(app))
         return
     if cmd == "seal":   # (sign the bundle of wrapped apps: what enable does for a downloaded app)
         for arg in rest:

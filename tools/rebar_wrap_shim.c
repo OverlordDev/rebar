@@ -26,6 +26,23 @@ int main(int argc, char **argv) {
     if (!rebar[0] || access(rebar, X_OK) != 0) snprintf(rebar, sizeof rebar, "/usr/local/bin/rebar");
     if (access(rebar, X_OK) != 0) { fprintf(stderr, "rebar shim: rebar not found (set REBAR_BIN, or run tools/rebar-wrap setup)\n"); return 71; }
     if (!getenv("MallocNanoZone")) setenv("MallocNanoZone", "0", 1);
+    {   // per-app environment: ~/Library/Application Support/rebar/env/<name of this executable>, one KEY=VALUE per line (what a launch from Finder or Steam does not have: Steam's ids, rebar switches)
+        const char *home = getenv("HOME"); const char *slash = strrchr(real, '/');
+        if (home && slash) {
+            char path[PATH_MAX]; snprintf(path, sizeof path, "%s/Library/Application Support/rebar/env/%s", home, slash + 1);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char line[2048];
+                while (fgets(line, sizeof line, f)) {
+                    line[strcspn(line, "\r\n")] = 0;
+                    char *eq = strchr(line, '=');
+                    if (line[0] == '#' || !eq || eq == line) continue;
+                    *eq = 0; setenv(line, eq + 1, 0);   // (what the caller already set wins: Steam's own SteamAppId, say)
+                }
+                fclose(f);
+            }
+        }
+    }
     char **nv = calloc((size_t)argc + 3, sizeof *nv); int k = 0;
     nv[k++] = rebar; nv[k++] = real;
     for (int i = 1; i < argc; i++) nv[k++] = argv[i];
