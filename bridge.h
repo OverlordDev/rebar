@@ -264,8 +264,13 @@ __asm__(
 static __thread bool t_async_call, t_async_tailed;
 static __thread jmp_buf *t_async_jb;
 static __thread uint64_t t_tail_regs[8];   // rdi, rsi, rdx, rcx, r8, r9, r12 (the error), r13 at the jump
+static void trace_ctx_entry(uint64_t pc, uint64_t ctx, const char *how, const uint64_t *regs, uint64_t x20) {   // REBAR_TRACE_CTX=<guest pc>[,pc...]: the async context and its first 0xe0 bytes whenever the guest is entered at one of those pcs (async continuations)
+    static uint64_t tc[4]; static int ntc = -1; if (ntc < 0) { ntc = 0; const char *e = getenv("REBAR_TRACE_CTX"); while (e && *e && ntc < 4) { tc[ntc++] = strtoull(e, (char **)&e, 16); if (*e == ',') e++; } }
+    for (int q = 0; q < ntc; q++) if (pc == tc[q]) { const uint64_t *cx = (const uint64_t *)ctx; fprintf(stderr, "[ctx entry %s] pc %llx ctx %p thread %p regs %llx %llx %llx %llx %llx %llx:", how, (unsigned long long)pc, (void *)cx, (void *)pthread_self(), (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2], (unsigned long long)regs[3], (unsigned long long)regs[4], (unsigned long long)regs[5]); if (ctx > 0x10000) for (int k = 0; k < 28; k++) fprintf(stderr, "%s%llx", k == 0 ? " " : k % 4 == 0 ? " | " : " ", (unsigned long long)cx[k]); fprintf(stderr, "\n");
+        if (x20 > 0x10000 && x20 < 0x7fffffffffffull) { const uint64_t *o = (const uint64_t *)x20; fprintf(stderr, "    x20 object %p:", (void *)o); for (int k = 0; k < 8; k++) fprintf(stderr, " %llx", (unsigned long long)o[k]); fprintf(stderr, "\n"); } }
+}
 [[noreturn]] static void rebar_tail_to_guest(uint64_t target, uint64_t ctx) {
-    CPU *c = t_cpu; c->pc = target; c->x[22] = ctx; t_async_tailed = true;
+    CPU *c = t_cpu; trace_ctx_entry(target, ctx, "tail", t_tail_regs, t_tail_regs[7]); c->pc = target; c->x[22] = ctx; t_async_tailed = true;
     for (int k = 0; k < 6; k++) c->x[k] = t_tail_regs[k];   // the continuation's other arguments: results in x0.., a thrown error in x21 (r12), self / context in x20 (r13)
     if (t_tail_regs[6]) c->x[21] = t_tail_regs[6];
     c->x[20] = t_tail_regs[7];
@@ -542,6 +547,7 @@ void rebar_bridge_enter(uint64_t *f) {
     static int trace_entry = -1; if (trace_entry < 0) trace_entry = getenv("REBAR_TRACE_ENTRY") != NULL;   // REBAR_TRACE_ENTRY=1: every host call into a guest function (methods: self, selector)
     if (trace_entry) fprintf(stderr, "[entry] %llx%s%s self=%llx sel=%s a2=%llx a3=%llx\n", (unsigned long long)f[14], enc ? " enc=" : "", enc ? enc : "", (unsigned long long)f[0], (f[1] >> 36) == 0x7ff && ((int (*)(void *))dlsym(RTLD_DEFAULT, "sel_isMapped"))((void *)f[1]) ? ((const char *(*)(void *))dlsym(RTLD_DEFAULT, "sel_getName"))((void *)f[1]) : "-", (unsigned long long)f[2], (unsigned long long)f[3]);
     if (trace_entry) { void *ra = ((void **)f[15])[-1]; Dl_info di; fprintf(stderr, "        called from host %p %s+0x%llx (%s)\n", ra, dladdr(ra, &di) && di.dli_sname ? di.dli_sname : "?", dladdr(ra, &di) ? (unsigned long long)((char *)ra - (char *)di.dli_saddr) : 0ull, di.dli_fname ? strrchr(di.dli_fname, '/') + 1 : "?"); }
+    trace_ctx_entry(f[14], f[25], "host", f, f[21]);
     EntryState st;
     int fpos_kind = 0;
     bool held = gil_release();               // entering the guest from host code: the bridge lock is not held while it runs
@@ -1349,6 +1355,14 @@ static void calendar_var(CPU *c, int mode) {
 H(h_CFCalendarDecomposeAbsoluteTime) { calendar_var(c, 0); }
 H(h_CFCalendarComposeAbsoluteTime)   { calendar_var(c, 1); }
 H(h_CFCalendarAddComponents)         { calendar_var(c, 2); }
+// swift_bridgeObjectRetain / Release / _n of a value that cannot be a pointer (a non-zero value below 0x10000: Logic Pro's AppAnalytics retained a String whose object word was 2,
+// read from the context of an async function that had been given another value there): the host's version dereferences it (SIGSEGV at 8). Such a value is no object, so nothing is retained
+// (REBAR_NO_BRIDGEOBJ_GUARD=1: call the host function as before).
+static bool bridge_obj_bogus(uint64_t p) { static int off = -1; if (off < 0) off = getenv("REBAR_NO_BRIDGEOBJ_GUARD") != NULL; return !off && p != 0 && p < 0x10000; }
+H(h_swift_bridgeObjectRetain)    { if (bridge_obj_bogus(c->x[0])) return; host_call(c, HOSTFN("swift_bridgeObjectRetain"), false); }
+H(h_swift_bridgeObjectRelease)   { if (bridge_obj_bogus(c->x[0])) return; host_call(c, HOSTFN("swift_bridgeObjectRelease"), false); }
+H(h_swift_bridgeObjectRetain_n)  { if (bridge_obj_bogus(c->x[0])) return; host_call(c, HOSTFN("swift_bridgeObjectRetain_n"), false); }
+H(h_swift_bridgeObjectRelease_n) { if (bridge_obj_bogus(c->x[0])) return; host_call(c, HOSTFN("swift_bridgeObjectRelease_n"), false); }
 H(h_execl)   { exec_list(c, false, false); }
 H(h_execlp)  { exec_list(c, true, false); }
 H(h_execle)  { exec_list(c, false, true); }
@@ -1669,6 +1683,7 @@ static const Special k_special[] = {
     {"_CFBundleGetFunctionPointerForName", h_CFBundleGetFunctionPointerForName}, {"_CFBundleGetDataPointerForName", h_CFBundleGetDataPointerForName},
     {"_sqlite3_mprintf", h_sqlite3_mprintf}, {"_sqlite3_snprintf", h_sqlite3_snprintf}, {"_sqlite3_str_appendf", h_sqlite3_str_appendf},
     {"_CFCalendarDecomposeAbsoluteTime", h_CFCalendarDecomposeAbsoluteTime}, {"_CFCalendarComposeAbsoluteTime", h_CFCalendarComposeAbsoluteTime}, {"_CFCalendarAddComponents", h_CFCalendarAddComponents},
+    {"_swift_bridgeObjectRetain", h_swift_bridgeObjectRetain}, {"_swift_bridgeObjectRelease", h_swift_bridgeObjectRelease}, {"_swift_bridgeObjectRetain_n", h_swift_bridgeObjectRetain_n}, {"_swift_bridgeObjectRelease_n", h_swift_bridgeObjectRelease_n},
     {"_CFStringAppendFormat", h_CFStringAppendFormat}, {"_CFStringAppendFormatAndArguments", h_CFStringAppendFormatAndArguments},
     {NULL, NULL},
 };

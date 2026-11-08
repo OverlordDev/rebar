@@ -957,6 +957,12 @@ H(h_objc_msgSend) {
         }
     }
     if (bundle_load_hook(c, self, sel)) return;
+    {   // REBAR_NO_METAL_RT=1: the GPU "has no ray tracing" for this program. The driver (nullmoth 2.8) now answers YES to -[MTLDevice supportsRaytracing]; Cyberpunk 2077 then builds all its path tracing kernels
+        // (rgs_reference_main and the like: minutes of shader compilation on the render path) at load and its EngineWatchdog kills it before the first frame.
+        static int no_rt = -1; static SEL s_srt, s_srtfr;
+        if (no_rt < 0) { no_rt = getenv("REBAR_NO_METAL_RT") != NULL; s_srt = sel_registerName("supportsRaytracing"); s_srtfr = sel_registerName("supportsRaytracingFromRender"); }
+        if (no_rt && (sel == s_srt || sel == s_srtfr)) { c->x[0] = 0; c->x[1] = 0; return; }
+    }
     ios_unity_prestart(c, self, sel);
     Class cls = object_getClass(self);
     // (a method lookup can run a class's +initialize and wait on libobjc's class initialization lock, which another thread may hold while it waits for the interpreter lock)
