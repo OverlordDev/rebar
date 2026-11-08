@@ -1374,6 +1374,11 @@ H(h_swift_dynamicCast) {
     bool (*f)(void *, void *, const void *, const void *, uint64_t) = (bool (*)(void *, void *, const void *, const void *, uint64_t))dlsym(RTLD_DEFAULT, "swift_dynamicCast");
     uint64_t cs[5] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4]}, clr = c->x[30];
     c->x[0] = f((void *)c->x[0], (void *)c->x[1], (const void *)c->x[2], (const void *)c->x[3], c->x[4]) ? 1 : 0;
+    { static uint64_t tlr = ~0ull; if (tlr == ~0ull) tlr = getenv("REBAR_TRACE_CASTLR") ? strtoull(getenv("REBAR_TRACE_CASTLR"), 0, 16) : 0;   // REBAR_TRACE_CASTLR=<hex return address>: every cast from that call site with its types and answer
+      if (tlr && clr == tlr) { typedef struct { const char *p; uintptr_t n; } TNP; static TNP (*gt3)(const void *, bool); if (!gt3) gt3 = (TNP (*)(const void *, bool))dlsym(RTLD_DEFAULT, "swift_getTypeName");
+        const uint64_t *w = (const uint64_t *)cs[1]; uint64_t dyn = (cs[2] == any_md && w) ? w[3] : cs[2];
+        TNP a = dyn > 0x10000 ? gt3((const void *)dyn, true) : (TNP){"?", 1}, b = cs[3] > 0x10000 ? gt3((const void *)cs[3], true) : (TNP){"?", 1};
+        fprintf(stderr, "[cast@lr] %.*s -> %.*s : %s (flags %llx)\n", (int)(a.n > 120 ? 120 : a.n), a.p, (int)(b.n > 120 ? 120 : b.n), b.p, c->x[0] ? "ok" : "FAILED", (unsigned long long)cs[4]); } }
     { static int tf = -1; if (tf < 0) tf = getenv("REBAR_TRACE_CASTFAIL") != NULL;   // REBAR_TRACE_CASTFAIL=1: the type names of every swift_dynamicCast that said no
       if (tf && !c->x[0] && cs[2] == any_md && cs[1] && ((uint64_t *)cs[1])[3] > 0x10000) { typedef struct { const char *p; uintptr_t n; } TNP; static TNP (*g2)(const void *, bool); if (!g2) g2 = (TNP (*)(const void *, bool))dlsym(RTLD_DEFAULT, "swift_getTypeName"); if (g2 && cs[3] > 0x10000) { TNP a = g2((const void *)((uint64_t *)cs[1])[3], true), b = g2((const void *)cs[3], true); fprintf(stderr, "[cast failed] dynamic type %.*s (%llx)  ->  %.*s  from %llx\n", (int)(a.n > 200 ? 200 : a.n), a.p ? a.p : "", (unsigned long long)((uint64_t *)cs[1])[3], (int)(b.n > 200 ? 200 : b.n), b.p ? b.p : "", (unsigned long long)clr); } }
       if (tf && !c->x[0]) { typedef struct { const char *p; uintptr_t n; } TNP; static TNP (*gtn)(const void *, bool); if (!gtn) gtn = (TNP (*)(const void *, bool))dlsym(RTLD_DEFAULT, "swift_getTypeName");

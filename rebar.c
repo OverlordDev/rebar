@@ -100,6 +100,9 @@ static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr);
 static const char *g_die_why;   // (what --probe-insns reports)
 [[noreturn]] static void die(CPU *c, const char *why, uint32_t insn) {
     if (g_die_jmp) { g_die_why = why; longjmp(*g_die_jmp, 1); }
+    if (getenv("REBAR_DUMP_WORDS_ON_TRAP") && !strncmp(why, "unimplemented", 13)) {   // REBAR_DUMP_WORDS_ON_TRAP=1: x19 and x20 as pointers to words (a type metadata and a witness table, say), and the code each word of x20 points to
+        for (int r = 19; r <= 20; r++) { uint64_t p = c->x[r]; fprintf(stderr, "[trap] x%d=%llx words:", r, (unsigned long long)p); if (p > 0x10000 && p < 0x7fffffffffffull) for (int k = 0; k < 10; k++) fprintf(stderr, " %llx", (unsigned long long)((uint64_t *)p)[k]); fprintf(stderr, "\n"); }
+    }
     if (t_fault_jb && g_guest_fault_handler[2] && !strncmp(why, "unimplemented", 13)) deliver_guest_signal(c, SIGILL, 1, c->pc);   // an instruction the guest wants to trap on (HotSpot's deoptimization instruction)
     { const char *lf = getenv("REBAR_FAULT_LOG"); if (lf) { int fd = open(lf, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { char tag[64]; int n = snprintf(tag, sizeof tag, "=== pid %d\n", getpid()); write(fd, tag, n); dup2(fd, 2); } } }
     fprintf(stderr, "rebar: %s (insn 0x%08x at pc 0x%llx)\n", why, insn, (unsigned long long)c->pc);
