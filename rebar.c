@@ -1937,6 +1937,7 @@ int main(int argc, char **argv) {
     if (getenv("REBAR_PROFILE")) prof_start(getenv("REBAR_PROFILE")), prof_register(&cpu);
     if (getenv("REBAR_HOSTPROF")) hostprof_start(getenv("REBAR_HOSTPROF"));
     if (getenv("REBAR_JITPROF")) jitprof_start(getenv("REBAR_JITPROF"));
+    if (getenv("REBAR_FRAMEPROF")) frameprof_start(getenv("REBAR_FRAMEPROF"));
     if (getenv("REBAR_ENTRYSTATS")) { g_entry_stats = true; pthread_t es; pthread_create(&es, NULL, entstats_thread, (void *)getenv("REBAR_ENTRYSTATS")); pthread_detach(es); }
     if (getenv("REBAR_HELPERSTATS")) { g_helperstats = true; pthread_t hs; pthread_create(&hs, NULL, helperstats_thread, (void *)getenv("REBAR_HELPERSTATS")); pthread_detach(hs); }
     if (getenv("REBAR_JITSTATS")) { pthread_t st; pthread_create(&st, NULL, jitstats_thread, (void *)getenv("REBAR_JITSTATS")); pthread_detach(st); }

@@ -2739,7 +2739,7 @@ static void slow_stub_log(CPU *c, uint64_t off, uint64_t lr0, double ms) {
 }
 static void h_objc_msgSend(CPU *c);
 static bool msgsend_fast(CPU *c);
-static void stub_call(CPU *c) {
+static void stub_call_plain(CPU *c) {
     uint64_t off = c->pc - g_stub_base;
     if (__builtin_expect(off < g_stub_size && off / 16 >= 2 && off / 16 < (uint64_t)g_nstubs && g_stubs[off / 16].handler == h_chkstk_darwin && !g_stubprof && g_slow_ms <= 0, 1)) { c->pc = c->x[30]; return; }   // (the stack probe does nothing: embree's traversal calls it for a 9.7 KB frame millions of times a second)
     if (__builtin_expect(g_slow_ms > 0, 0) && !g_stubprof) {
@@ -2786,6 +2786,8 @@ static void stub_call(CPU *c) {
     if (!had && t_have_gil) gil_release();  // (also when an exception that arrived from the host took the lock meanwhile)
     urg_deliver_pending(c);
 }
+#include "frameprof.h"
+static void stub_call(CPU *c) { if (__builtin_expect(!g_fp, 1)) { stub_call_plain(c); return; } fp_stub_call(c); }
 // The host's seekoff / seekpos of a stream buffer (reached through the vtable of a buffer the host created, such as an ofstream's filebuf: tellp() ends there) return a 136-byte
 // std::fpos by value and seekpos takes one; the type encodings let forward_enc do the sret and by-value conversions.
 static const char *host_fn_enc(const char *sym) {
