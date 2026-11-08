@@ -836,8 +836,29 @@ static bool exe_is_arm64_only(const char *path) {
     return false;
 }
 static bool try_open_arm64_app(CPU *c, id self, SEL sel) {
-    static SEL s_open; if (!s_open) s_open = sel_registerName("openApplicationAtURL:configuration:completionHandler:");
-    if (sel != s_open || getenv("REBAR_NO_APP_REDIRECT")) return false;
+    // The ways an app starts another one through NSWorkspace; the application URL / path is argument 2, except openURLs:withApplicationAtURL:... (3) and launchApplication: (an NSString: a name or path).
+    static SEL s_open, s_launchurl, s_openurl, s_openurls, s_launchapp, s_openfile; if (!s_open) {
+        s_open = sel_registerName("openApplicationAtURL:configuration:completionHandler:"); s_launchurl = sel_registerName("launchApplicationAtURL:options:configuration:error:");
+        s_openurl = sel_registerName("openURL:"); s_openurls = sel_registerName("openURLs:withApplicationAtURL:configuration:completionHandler:"); s_launchapp = sel_registerName("launchApplication:");
+        s_openfile = sel_registerName("openFile:"); }
+    if (getenv("REBAR_NO_APP_REDIRECT")) return false;
+    if (sel == s_launchurl || sel == s_openurl || sel == s_openurls || sel == s_launchapp || sel == s_openfile) {
+        id arg = (id)c->x[sel == s_openurls ? 3 : 2]; if (!arg || !strstr(class_getName(object_getClass(arg)), "NS")) return false;
+        bool isurl = sel != s_launchapp && sel != s_openfile;
+        id pathstr = isurl ? send_h(arg, sel_registerName("path")) : arg; if (!pathstr) return false;
+        const char *app = (const char *)send_h(pathstr, sel_registerName("UTF8String")); if (!app) return false;
+        char full[PATH_MAX]; if (!strchr(app, '/')) { snprintf(full, sizeof full, "/Applications/%s%s", app, strstr(app, ".app") ? "" : ".app"); app = full; }
+        size_t l = strlen(app); while (l > 1 && app[l - 1] == '/') l--;
+        if (l < 5 || strncmp(app + l - 4, ".app", 4)) return false;   // only application bundles
+        char exe[PATH_MAX]; if (!bundle_executable(app, exe, sizeof exe) || !exe_is_arm64_only(exe)) return false;
+        pid_t pid = 0; char *argv[3] = {(char *)g_self_path, exe, NULL};
+        int r = posix_spawn(&pid, g_self_path, NULL, NULL, argv, environ);
+        if (getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[%s %s -> started through rebar as pid %d (%d)]\n", sel_getName(sel), app, (int)pid, r);
+        if (sel == s_openurls) { uint64_t blk = c->x[5]; if (blk && in_guest(*(uint64_t *)(blk + 16))) call_guest(c, *(uint64_t *)(blk + 16), blk, 0, 0, 0); c->x[0] = 0; }
+        else c->x[0] = (sel == s_launchurl) ? 0 : (r == 0);   // (launchApplicationAtURL returns the running app or nil without an error; the BOOL ones say yes)
+        return true;
+    }
+    if (sel != s_open) return false;
     id url = (id)c->x[2]; if (!url) return false;
     id pathstr = send_h(url, sel_registerName("path")); if (!pathstr) return false;
     const char *app = (const char *)send_h(pathstr, sel_registerName("UTF8String")); if (!app) return false;

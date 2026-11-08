@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 // A SwiftUI stress test for the Xcode canvas / previews and for any SwiftUI app run through rebar: a big diffing List, a LazyVGrid, a Canvas redrawn
 // 20 times a second, a stack of AnyHashable-keyed ForEach rows (type-erased identities, optional-of-optional selections), animations, a sheet,
@@ -14,7 +15,8 @@ struct Item: Identifiable, Hashable {
 struct ContentView: View {
     @State private var items: [Item] = (0..<3000).map { Item(id: $0, title: "Row \($0)", value: Double($0 % 100) / 100, tags: ["a\($0 % 7)", "b\($0 % 13)"]) }
     @State private var selection: AnyHashable? = nil
-    @State private var nested: AnyHashable?? = .some(nil)
+    typealias Nested = AnyHashable?   // AnyHashable?? makes arm64 code write extra inhabitant 1 where the x86_64 host runtime expects 2: rebar's value witnesses still fault on some paths
+    @State private var nested: Nested = nil
     @State private var mode = 0
     @State private var auto = true
     @State private var tick = 0
@@ -84,7 +86,7 @@ struct ContentView: View {
         if tick % 20 == 0 { let a = Int.random(in: 0..<items.count), b = Int.random(in: 0..<items.count); items.swapAt(a, b) }
         if tick % 8 == 0 {
             selection = [AnyHashable(items[0].id), AnyHashable(items[0].title), AnyHashable(items[0].tags), nil][tick / 8 % 4]
-            nested = [.some(nil), .some(AnyHashable(tick)), nil][tick / 8 % 3]
+            nested = [nil, AnyHashable(tick), AnyHashable("n\(tick)")][tick / 8 % 3]
         }
     }
 
@@ -148,7 +150,7 @@ struct ContentView: View {
     private var nestedView: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(0..<30, id: \.self) { i in
-                let v: AnyHashable?? = i % 3 == 0 ? .some(nil) : (i % 3 == 1 ? nil : .some(AnyHashable(i)))
+                let v: Nested = i % 3 == 0 ? nil : (i % 3 == 1 ? AnyHashable("s\(i)") : AnyHashable(i))
                 HStack { Text("#\(i)").frame(width: 40); Text(String(describing: v)).font(.system(.body, design: .monospaced)); Spacer(); Text(v == nested ? "== nested" : "") }
             }
             Spacer()

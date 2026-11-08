@@ -1126,10 +1126,64 @@ static char **env_with_shim(char *const *envp) {
     return v;
 }
 static void env_free_shim(char **v, char *const *orig) { if (v != (char **)orig && v != environ) { int n = 0; while (v[n]) n++; free(v[n - 2]); free(v[n - 1]); free(v); } }
+// System tools that only start another program for the caller are SIP-protected, so the shim is not loaded into them and they fail with "Bad CPU type" when that program is arm64-only: the guest's
+// spawn of one of these is looked through. sandbox-exec [-f file | -n name | -p profile | -D k=v]... command args: the command runs under rebar without the sandbox (Swift's macro plug-in server
+// is started this way: swift-frontend -> sandbox-exec -> swift-plugin-server); arch [-arm64 | -x86_64 | -e VAR=val | -d VAR]... command args; open [-a app | /path/App.app] [--args ...]: an arm64-only
+// application bundle is started as rebar <its executable> (LaunchServices answers "not supported on this Mac"). REBAR_NO_UNWRAP=1 turns it off.
+static bool bundle_executable(const char *app, char *out, size_t n) {   // /path/Name.app -> /path/Name.app/Contents/MacOS/<CFBundleExecutable>
+    size_t l = strlen(app); while (l > 1 && app[l - 1] == '/') l--;
+    if (l < 5 || strncmp(app + l - 4, ".app", 4)) return false;
+    char plist[PATH_MAX], cmd[PATH_MAX + 128];
+    snprintf(plist, sizeof plist, "%.*s/Contents/Info.plist", (int)l, app);
+    if (access(plist, R_OK) != 0) return false;
+    snprintf(cmd, sizeof cmd, "/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \"%s\" 2>/dev/null", plist);
+    FILE *f = popen(cmd, "r"); if (!f) return false;
+    char name[256] = ""; if (!fgets(name, sizeof name, f)) name[0] = 0; pclose(f);
+    name[strcspn(name, "\n")] = 0; if (!name[0]) return false;
+    snprintf(out, n, "%.*s/Contents/MacOS/%s", (int)l, app, name);
+    return access(out, X_OK) == 0;
+}
+static bool unwrap_launcher(const char *path, char *const *argv, char **inner_argv_out, char *inner_path) {
+    static int off = -1; if (off < 0) off = getenv("REBAR_NO_UNWRAP") != NULL; if (off || !path || !argv || !argv[0]) return false;
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    int i = 1;
+    if (!strcmp(b, "sandbox-exec")) {
+        while (argv[i] && argv[i][0] == '-') { i += (!strcmp(argv[i], "-f") || !strcmp(argv[i], "-n") || !strcmp(argv[i], "-p") || !strcmp(argv[i], "-D")) ? 2 : 1; }
+        if (!argv[i]) return false;
+        char tmp[PATH_MAX]; const char *inner = strchr(argv[i], '/') ? argv[i] : resolve_exec_path(argv[i], tmp);
+        if (!inner || !needs_rebar(inner)) return false;
+        snprintf(inner_path, PATH_MAX, "%s", inner); *(char ***)inner_argv_out = rebar_argv(inner_path, argv + i); return true;
+    }
+    if (!strcmp(b, "arch")) {
+        while (argv[i] && argv[i][0] == '-') { i += (!strcmp(argv[i], "-e") || !strcmp(argv[i], "-d")) ? 2 : 1; }
+        if (!argv[i]) return false;
+        char tmp[PATH_MAX]; const char *inner = strchr(argv[i], '/') ? argv[i] : resolve_exec_path(argv[i], tmp);
+        if (!inner || !needs_rebar(inner)) return false;
+        snprintf(inner_path, PATH_MAX, "%s", inner); *(char ***)inner_argv_out = rebar_argv(inner_path, argv + i); return true;
+    }
+    if (!strcmp(b, "open")) {
+        const char *app = NULL; int args_at = 0;
+        for (; argv[i]; i++) {
+            if (!strcmp(argv[i], "--args")) { args_at = i + 1; break; }
+            if (!strcmp(argv[i], "-a") && argv[i + 1]) { app = argv[++i]; continue; }
+            if (argv[i][0] != '-' && !app) app = argv[i];
+        }
+        if (!app) return false;
+        char exe[PATH_MAX], appbuf[PATH_MAX];
+        if (!strchr(app, '/')) { snprintf(appbuf, sizeof appbuf, "/Applications/%s%s", app, strstr(app, ".app") ? "" : ".app"); app = appbuf; }
+        if (!bundle_executable(app, exe, sizeof exe) || !needs_rebar(exe)) return false;
+        int n = 0; if (args_at) while (argv[args_at + n]) n++;
+        char **v = calloc((size_t)n + 3, sizeof *v); v[0] = g_self_path; v[1] = exe; for (int k = 0; k < n; k++) v[2 + k] = argv[args_at + k];
+        snprintf(inner_path, PATH_MAX, "%s", exe); *(char ***)inner_argv_out = v; return true;
+    }
+    return false;
+}
 static bool exec_shim(const char *file, bool search, char *const *argv, char **new_argv, char *resolved) {
     if (!g_self_path[0] || !file) return false;
     const char *path = search ? resolve_exec_path(file, resolved) : file;
-    if (!path || !needs_rebar(path)) return false;
+    if (!path) return false;
+    if (unwrap_launcher(path, argv, new_argv, resolved)) return true;
+    if (!needs_rebar(path)) return false;
     if (path != resolved) snprintf(resolved, PATH_MAX, "%s", path);
     char **v = rebar_argv(resolved, argv);
     *(char ***)new_argv = v;
@@ -1224,7 +1278,26 @@ H(h_vm_protect) {  // (task, addr, size, set_maximum, prot) - also used for mach
 }
 H(h_vm_allocate) {  // (task, *addr, size, flags)
     kern_return_t (*f)(uint64_t, uint64_t *, uint64_t, int) = HOSTFN("mach_vm_allocate");
-    int r = f(c->x[0], (uint64_t *)c->x[1], c->x[2], (int)c->x[3]);
+    uint64_t want = c->x[2];
+    int r;
+    if (getenv("REBAR_TRACE_VMALLOC")) fprintf(stderr, "[vm_allocate] size %llx flags %llx caller %llx\n", (unsigned long long)want, (unsigned long long)c->x[3], (unsigned long long)c->x[30]);
+    // VM_FLAGS_ANYWHERE: an arm64 kernel hands out 16 KB pages, so the block starts on a 16 KB boundary and is a whole number of them (Apple's linker asserts getpagesize() alignment of the output buffer it
+    // allocates this way: "ld: Assertion failed: buffer.data() & (minHeaderAlignment - 1)"). The host's 4 KB pages: reserve the next 16 KB multiple plus one page, keep the aligned part.
+    static int tool = -1;   // (the programs that write Mach-O files into vm_allocate'd buffers; aligning the blocks of every program broke Swift's macro plug-in server, which asks for small ones too)
+    if (tool < 0) { const char *b = g_main_image && g_main_image->path ? strrchr(g_main_image->path, '/') : NULL; b = b ? b + 1 : (g_main_image ? g_main_image->path : ""); tool = !getenv("REBAR_NO_VM_ALIGN") && (!strcmp(b, "ld") || !strcmp(b, "lipo") || !strcmp(b, "strip") || !strcmp(b, "codesign_allocate") || !strcmp(b, "libtool") || !strcmp(b, "install_name_tool") || !strcmp(b, "dsymutil") || !strcmp(b, "ld-prime") || !strcmp(b, "nm") || !strcmp(b, "otool") || !strcmp(b, "ranlib") || !strcmp(b, "ar")) || getenv("REBAR_VM_ALIGN_ALL") != NULL; }
+    if ((c->x[3] & 1) && want && want < (1ull << 40) && tool) {
+        uint64_t len = (want + GUEST_PAGE - 1) & ~(GUEST_PAGE - 1), got = 0;
+        r = f(c->x[0], &got, len + GUEST_PAGE, (int)c->x[3]);   // (the caller's flags: a purgeable or tagged block stays one)
+        if (r == 0) {
+            uint64_t al = (got + GUEST_PAGE - 1) & ~(GUEST_PAGE - 1);
+            kern_return_t (*dealloc)(uint64_t, uint64_t, uint64_t) = HOSTFN("mach_vm_deallocate");
+            if (al > got) dealloc(c->x[0], got, al - got);
+            if (got + len + GUEST_PAGE > al + len) dealloc(c->x[0], al + len, got + len + GUEST_PAGE - (al + len));
+            *(uint64_t *)c->x[1] = al; own_add(al, len);
+        }
+        RET(r); return;
+    }
+    r = f(c->x[0], (uint64_t *)c->x[1], c->x[2], (int)c->x[3]);
     if (r == 0) own_add(*(uint64_t *)c->x[1], c->x[2]);
     RET(r);
 }
@@ -1861,6 +1934,26 @@ static void deliver_guest_signal(CPU *c, int sig, int code, uint64_t addr) {
 // Gemini); libobjc then walks off the end of the chain (AutoreleasePoolPage::releaseUntil) and faults at address 0. Instead of dying, the fault is answered by unwinding the host stack
 // out of objc_autoreleasePoolPop and continuing in its caller as if the pop had returned: the pool's objects leak. Experimental and OFF by default: REBAR_POOL_GUARD=1 turns it on (the resumed job runner then returns to a bad address; the frame layout at the resume point is not understood).
 #include <libunwind.h>
+// The same mismatch in an existential's copy: the host's copy witness of an existential container (Any, AnyHashable) copies the metadata and witness table words and then calls the dynamic type's
+// initializeBufferWithCopyOfBuffer through that metadata: `mov rax, [rdx-8]; call [rax]` with rdx = the guest's extra inhabitant (1). Such a container is empty: the call is skipped and the first three words (the
+// buffer) are copied by hand (rbx = destination, rsi = source in this function; checked against the words it has just copied). The destroy witness reads the same way and calls [rax+8].
+static bool skip_vwt_call_on_xi(ucontext_t *uc) {
+    _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss; const uint8_t *ip = (const uint8_t *)ss->__rip;
+    if (!ip || (ss->__rip & 0xfff) > 0xff0) return false;
+    // mov rax, [rdx-8] = 48 8b 42 f8 (also rcx / rbx / rsi / rdi / r8.. forms differ in the modrm byte: only the rax <- [reg-8] shapes with disp8 -8 are accepted)
+    if (!(ip[0] == 0x48 || ip[0] == 0x49) || ip[1] != 0x8b || (ip[2] & 0xc0) != 0x40 || (ip[2] & 0x38) != 0 || ip[3] != 0xf8) return false;
+    int len = 4, callkind;
+    if (ip[len] == 0xff && ip[len + 1] == 0x10) { len += 2; callkind = 0; }          // call [rax]
+    else if (ip[len] == 0xff && ip[len + 1] == 0x50) { callkind = ip[len + 2]; len += 3; }   // call [rax+disp8]
+    else return false;
+    if (callkind == 0) {   // the buffer copy: finish what the witness began
+        uint64_t dst = ss->__rbx, src = ss->__rsi;
+        if (dst > 0x10000 && src > 0x10000 && !memcmp((void *)(dst + 0x18), (void *)(src + 0x18), 16)) memcpy((void *)dst, (void *)src, 0x18); else return false;
+    }
+    ss->__rip += len; ss->__rax = 0;
+    static int n; if (n++ < 3 && getenv("REBAR_TRACE_SIGNALS")) fprintf(stderr, "[a call through a guest extra inhabitant skipped (call kind %d)]\n", callkind);
+    return true;
+}
 // An extra inhabitant of a pointer (the "none" of an Optional<Optional<AnyHashable>>, say) is written by arm64 code as index, by the host's x86_64 runtime as index << 1 (bit 0 is reserved for Objective-C
 // tagged pointers). A host value witness that destroys such a value reads the guest's 1 as a live metadata pointer and faults at 1 - 8 = 0xfffffffffffffff9 (Xcode's SwiftUI canvas, IDECanvasUI,
 // destroying a (AnyHashable?, AnyHashable) tuple; Logic Pro's Jet). Destroying an extra inhabitant is nothing to do, so the fault is answered by unwinding out of the destroy witness (a host function
@@ -1943,7 +2036,7 @@ static bool jit_recover_state(ucontext_t *uc, const JReg *jb, uint64_t *ea) {
 }
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
-    { static int xg = -1; if (xg < 0) xg = getenv("REBAR_NO_XI_GUARD") == NULL; if (xg && sig == SIGSEGV && (uint64_t)si->si_addr >= 0xffffffffffffff00ull && unwind_out_of_xi_destroy(uc)) return; }
+    { static int xg = -1; if (xg < 0) xg = getenv("REBAR_NO_XI_GUARD") == NULL; if (xg && sig == SIGSEGV && (uint64_t)si->si_addr >= 0xffffffffffffff00ull && (skip_vwt_call_on_xi(uc) || unwind_out_of_xi_destroy(uc))) return; }
     { static int pg = -1; if (pg < 0) pg = getenv("REBAR_POOL_GUARD") != NULL; if (pg && sig == SIGSEGV && (uint64_t)si->si_addr == 0 && unwind_out_of_pool_pop(uc)) return; }   // (getenv is a linear scan of the environment under a lock: not on every fault)
     if (sig == SIGILL || sig == SIGTRAP || sig == SIGFPE) {  // never an instruction-fetch bridge: report without touching any state
         { const JReg *jb = g_jit_on ? jit_block_of(uc->uc_mcontext->__ss.__rip) : NULL; if (jb) { char bb[160]; int nn = snprintf(bb, sizeof bb, "rebar: trap in translated code of the block at guest pc 0x%llx (%u instructions)\n", (unsigned long long)jb->pc, jb->n); write(2, bb, nn); } }
