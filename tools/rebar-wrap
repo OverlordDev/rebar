@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""rebar-wrap: make arm64-only Mac apps start by themselves through rebar (double click, Dock, `open`, file associations).
+
+The kernel of an Intel Mac refuses an arm64-only executable ("Bad CPU type"), and nothing between a Finder double click and the kernel can be hooked. What can be changed is
+the executable: the main executable of the app (CFBundleExecutable) becomes a universal file, the original arm64 slice plus a tiny x86_64 program (tools/rebar_wrap_shim.c).
+The kernel runs the x86_64 slice, which replaces itself with `rebar <that same file>`; rebar reads the arm64 slice. The bundle, its Info.plist, its icon and its pid are unchanged.
+
+    rebar-wrap enable  <App.app|folder> ...   wrap the arm64-only apps (a folder: every .app directly inside it)
+    rebar-wrap disable <App.app|folder> ...   put the original executable back
+    rebar-wrap status  [<App.app|folder> ...] what is arm64-only / wrapped (default: the folders of `auto`)
+    rebar-wrap auto                           enable for the watched folders (what the agent runs)
+    rebar-wrap agent install | uninstall      a LaunchAgent that runs `auto` whenever a watched folder changes
+    rebar-wrap setup                          only record where rebar is (done by every command)
+
+The original executable is kept in ~/Library/Application Support/rebar/wrapped/ (disable restores it byte for byte, with its signature). The wrapped executable is signed ad hoc, which
+is all an unsigned-by-Apple program needs on this Mac. Apps that update themselves replace the file: `auto` (or the agent) wraps them again.
+Watched folders: /Applications, ~/Applications and any listed one per line in ~/Library/Application Support/rebar/autowrap-folders.
+"""
+import glob, hashlib, os, plistlib, shutil, struct, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+SUPPORT = os.path.expanduser("~/Library/Application Support/rebar")
+STORE = os.path.join(SUPPORT, "wrapped")
+LABEL = os.environ.get("REBAR_WRAP_LABEL", "com.rebar.autowrap")   # (another label: for tests)
+AGENT = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LABEL)
+MARK = b"REBAR-WRAPPED-1"   # (inside the shim: how a wrapped file is recognised)
+
+CPU_ARM64, CPU_X86_64 = 0x0100000C, 0x01000007
+
+
+def rebar_binary():
+    for c in (os.environ.get("REBAR_BIN"), os.path.join(ROOT, "rebar"), "/usr/local/bin/rebar"):
+        if c and os.access(c, os.X_OK):
+            return os.path.realpath(c)
+    sys.exit("rebar-wrap: rebar not found (build it with ./build.sh, or set REBAR_BIN)")
+
+
+def slices(path):
+    """The CPU types of a Mach-O file ([] for anything else)."""
+    try:
+        with open(path, "rb") as f:
+            b = f.read(4096)
+    except OSError:
+        return []
+    if len(b) < 32:
+        return []
+    if struct.unpack("<I", b[:4])[0] == 0xFEEDFACF:
+        return [struct.unpack("<I", b[4:8])[0]]
+    if b[:4] == b"\xca\xfe\xba\xbe":
+        n = struct.unpack(">I", b[4:8])[0]
+        return [struct.unpack(">I", b[8 + 20 * i:12 + 20 * i])[0] for i in range(min(n, 8))]
+    return []
+
+
+def is_wrapped(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(1 << 20)   # (the x86_64 slice comes first and is small)
+    except OSError:
+        return False
+    return MARK in data
+
+
+def main_executable(app):
+    try:
+        with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+            exe = plistlib.load(f).get("CFBundleExecutable")
+    except Exception:
+        return None
+    return os.path.join(app, "Contents", "MacOS", exe) if exe else None
+
+
+def arm64_only(path):
+    s = slices(path)
+    return CPU_ARM64 in s and CPU_X86_64 not in s
+
+
+def store_name(exe):
+    return hashlib.sha1(os.path.realpath(exe).encode()).hexdigest()[:16]
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def build_shim():
+    """The x86_64 shim, compiled once and cached next to the originals."""
+    os.makedirs(SUPPORT, exist_ok=True)
+    out = os.path.join(SUPPORT, "rebar_wrap_shim")
+    src = os.path.join(HERE, "rebar_wrap_shim.c")
+    if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(src):
+        r = run(["clang", "-arch", "x86_64", "-O2", "-Wall", src, "-o", out])
+        if r.returncode:
+            sys.exit("rebar-wrap: cannot build the shim:\n" + r.stderr)
+    return out
+
+
+def setup():
+    os.makedirs(SUPPORT, exist_ok=True)
+    with open(os.path.join(SUPPORT, "rebar-path"), "w") as f:
+        f.write(rebar_binary() + "\n")
+
+
+def enable(app, quiet=False):
+    app = app.rstrip("/")
+    exe = main_executable(app)
+    if not exe or not os.path.isfile(exe):
+        return "no main executable"
+    if is_wrapped(exe):
+        return "already wrapped"
+    if not arm64_only(exe):
+        return "not arm64-only (runs natively)"
+    shim = build_shim()
+    setup()
+    os.makedirs(STORE, exist_ok=True)
+    keep = os.path.join(STORE, store_name(exe))
+    os.makedirs(keep, exist_ok=True)
+    orig = os.path.join(keep, "original")
+    shutil.copy2(exe, orig)   # (kept as it was: disable puts exactly this back)
+    with open(os.path.join(keep, "path"), "w") as f:
+        f.write(os.path.realpath(exe) + "\n")
+    tmp = exe + ".rebar-wrap"
+    marked = os.path.join(keep, "shim")
+    with open(shim, "rb") as a, open(marked, "wb") as b:
+        b.write(a.read())   # (the marker is a string inside the shim itself, see below)
+    r = run(["lipo", "-create", "-arch", "x86_64", marked, "-arch", "arm64", orig, "-output", tmp])
+    if r.returncode:
+        os.path.exists(tmp) and os.remove(tmp)
+        return "lipo failed: " + r.stderr.strip()
+    os.chmod(tmp, 0o755)
+    r = run(["codesign", "--force", "-s", "-", tmp])
+    if r.returncode:
+        os.remove(tmp)
+        return "codesign failed: " + r.stderr.strip()
+    os.replace(tmp, exe)
+    return "wrapped"
+
+
+def disable(app):
+    app = app.rstrip("/")
+    exe = main_executable(app)
+    if not exe or not os.path.isfile(exe):
+        return "no main executable"
+    if not is_wrapped(exe):
+        return "not wrapped"
+    orig = os.path.join(STORE, store_name(exe), "original")
+    if os.path.exists(orig):
+        shutil.copy2(orig, exe + ".rebar-wrap")
+        os.replace(exe + ".rebar-wrap", exe)
+        return "restored from the saved original"
+    tmp = exe + ".rebar-wrap"
+    r = run(["lipo", "-thin", "arm64", exe, "-output", tmp])   # (no saved original: the arm64 slice is the app)
+    if r.returncode:
+        return "lipo failed: " + r.stderr.strip()
+    os.chmod(tmp, 0o755)
+    run(["codesign", "--force", "-s", "-", tmp])
+    os.replace(tmp, exe)
+    return "arm64 slice put back (signed ad hoc)"
+
+
+def apps_in(arg):
+    arg = os.path.expanduser(arg).rstrip("/")
+    if arg.endswith(".app"):
+        return [arg]
+    return sorted(glob.glob(arg + "/*.app"))
+
+
+def watched():
+    if os.environ.get("REBAR_WRAP_FOLDERS"):   # (colon-separated, instead of the usual ones: for tests)
+        return [x for x in os.environ["REBAR_WRAP_FOLDERS"].split(":") if os.path.isdir(x)]
+    d = ["/Applications", os.path.expanduser("~/Applications")]
+    try:
+        with open(os.path.join(SUPPORT, "autowrap-folders")) as f:
+            d += [os.path.expanduser(l.strip()) for l in f if l.strip() and not l.startswith("#")]
+    except OSError:
+        pass
+    return [x for x in d if os.path.isdir(x)]
+
+
+def cmd_status(args):
+    for a in [x for arg in (args or watched()) for x in apps_in(arg)]:
+        exe = main_executable(a)
+        if not exe or not os.path.isfile(exe):
+            continue
+        if is_wrapped(exe):
+            print("wrapped     ", a)
+        elif arm64_only(exe):
+            print("arm64-only  ", a)
+
+
+def agent_plist():
+    return {
+        "Label": LABEL,
+        "ProgramArguments": ["/usr/bin/python3", os.path.join(HERE, "rebar-wrap"), "auto"],
+        "WatchPaths": watched(),
+        "ThrottleInterval": 20,
+        "RunAtLoad": False,
+        "EnvironmentVariables": dict({"REBAR_BIN": rebar_binary(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                                     **({"REBAR_WRAP_FOLDERS": os.environ["REBAR_WRAP_FOLDERS"]} if os.environ.get("REBAR_WRAP_FOLDERS") else {})),
+        "StandardErrorPath": os.path.join(SUPPORT, "autowrap.log"),
+        "StandardOutPath": os.path.join(SUPPORT, "autowrap.log"),
+    }
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__); return
+    cmd, rest = a[0], a[1:]
+    if cmd == "setup":
+        setup(); print("rebar:", rebar_binary()); return
+    if cmd in ("enable", "disable"):
+        if not rest:
+            sys.exit("usage: rebar-wrap %s <App.app|folder> ..." % cmd)
+        fn = enable if cmd == "enable" else disable
+        for arg in rest:
+            for app in apps_in(arg):
+                exe = main_executable(app)
+                if cmd == "enable" and exe and os.path.isfile(exe) and not arm64_only(exe) and not is_wrapped(exe):
+                    continue   # (a folder: say nothing about the apps that run natively)
+                print("%s: %s" % (os.path.basename(app), fn(app)))
+        return
+    if cmd == "status":
+        cmd_status(rest); return
+    if cmd == "auto":
+        for d in watched():
+            for app in apps_in(d):
+                exe = main_executable(app)
+                if exe and os.path.isfile(exe) and arm64_only(exe) and not is_wrapped(exe):
+                    print("%s: %s" % (app, enable(app)), flush=True)
+        return
+    if cmd == "agent":
+        sub = rest[0] if rest else ""
+        uid = str(os.getuid())
+        if sub == "install":
+            os.makedirs(os.path.dirname(AGENT), exist_ok=True); os.makedirs(SUPPORT, exist_ok=True)
+            with open(AGENT, "wb") as f:
+                plistlib.dump(agent_plist(), f)
+            run(["launchctl", "bootout", "gui/" + uid + "/" + LABEL])
+            r = run(["launchctl", "bootstrap", "gui/" + uid, AGENT])
+            print(r.stderr.strip() or "agent installed: %s watches %s" % (LABEL, ", ".join(watched())))
+        elif sub == "uninstall":
+            run(["launchctl", "bootout", "gui/" + uid + "/" + LABEL])
+            os.path.exists(AGENT) and os.remove(AGENT)
+            print("agent removed (wrapped apps stay wrapped: rebar-wrap disable <folder> puts them back)")
+        else:
+            sys.exit("usage: rebar-wrap agent install|uninstall")
+        return
+    sys.exit("unknown command %r (rebar-wrap help)" % cmd)
+
+
+if __name__ == "__main__":
+    main()

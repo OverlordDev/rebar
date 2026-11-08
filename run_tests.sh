@@ -331,5 +331,19 @@ if xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
     fi
 else echo "SKIP iOS IPA tests (no iphoneos SDK)"; fi
 
+# rebar-wrap: an arm64-only app bundle starts by itself once its executable is wrapped (x86_64 shim + the arm64 slice), and disable puts the original back (HOME is a scratch one: the tool keeps files there)
+rw=$T/rw; rm -rf $rw; mkdir -p $rw/home $rw/Hello.app/Contents/MacOS
+if clang -arch arm64 -O1 rw_hello.c -o $rw/Hello.app/Contents/MacOS/Hello 2>/dev/null && printf '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>Hello</string><key>CFBundleIdentifier</key><string>com.rebar.test.hello</string><key>CFBundlePackageType</key><string>APPL</string><key>LSBackgroundOnly</key><true/></dict></plist>\n' > $rw/Hello.app/Contents/Info.plist && cp $rw/Hello.app/Contents/MacOS/Hello $rw/orig; then
+    export HOME_SAVE=$HOME
+    printf 'wrapped\nhello from arm64 app, argc=2 argv1=x\nrestored\n' > $T/a
+    {   HOME=$rw/home REBAR_BIN=$PWD/$R python3 -I ../tools/rebar-wrap enable $rw/Hello.app | sed 's/.*: //; s/ (.*//; s/ from the saved original//' | grep -v '^$'
+        HOME=$rw/home RW_OUT=$rw/out $rw/Hello.app/Contents/MacOS/Hello x; cat $rw/out
+        HOME=$rw/home python3 -I ../tools/rebar-wrap disable $rw/Hello.app >/dev/null; cmp -s $rw/orig $rw/Hello.app/Contents/MacOS/Hello && echo restored || echo "NOT restored"
+    } > $T/b 2>&1
+    check rebar_wrap_app $T/a $T/b
+    # (a status listing shows an app by what it is)
+    printf 'arm64-only   %s\n' "$rw/Hello.app" > $T/a; HOME=$rw/home python3 -I ../tools/rebar-wrap status $rw > $T/b; check rebar_wrap_status $T/a $T/b
+else echo "SKIP rebar-wrap test (cannot build an arm64 app)"; fi
+
 echo "passed $pass, failed $fail"
 [ $fail = 0 ]
